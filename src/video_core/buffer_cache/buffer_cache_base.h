@@ -38,6 +38,9 @@
 #include "common/spin_recursive_mutex.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/buffer_dependency_trace.h"
+#include "video_core/buffer_cache/list_copy_demand.h"
+#include "video_core/buffer_cache/list_writer_trace.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -47,6 +50,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/page_filter.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
 
@@ -63,7 +67,7 @@ constexpr u32 NUM_VERTEX_BUFFERS = 16;
 constexpr u32 NUM_VERTEX_BUFFERS = 32;
 #endif
 constexpr u32 VERTEX_BUFFER_MASK =
-    NUM_VERTEX_BUFFERS >= 32 ? ~0u : (1u << NUM_VERTEX_BUFFERS) - 1;
+    NUM_VERTEX_BUFFERS >= 32 ? ~0u : static_cast<u32>((1ULL << NUM_VERTEX_BUFFERS) - 1);
 constexpr u32 NUM_TRANSFORM_FEEDBACK_BUFFERS = 4;
 constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 18;
 constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
@@ -461,6 +465,7 @@ public:
     /// Commit asynchronous downloads
     void CommitAsyncFlushes();
     void CommitAsyncFlushesHigh();
+    bool CommitAsyncFlushesIfNeeded();
 
     /// Pop asynchronous downloads
     void PopAsyncFlushes();
@@ -479,6 +484,45 @@ public:
     [[nodiscard]] bool HasPendingNx2ListCopies() const noexcept {
         return !nx2_list_copy_requests.empty();
     }
+    void Nx2BeginWriterTrace(u64 shader) {
+        if (nx2_list_copy_demand) {
+            nx2_list_copy_shader = shader;
+        }
+        if (nx2_buffer_deps) {
+            nx2_buffer_deps->BeginDispatch(shader);
+        }
+        if (nx2_writer_trace) {
+            std::scoped_lock lock{nx2_list_mutex};
+            nx2_writer_trace->BeginDispatch(shader);
+        }
+    }
+    void Nx2EndWriterTrace() {
+        nx2_list_copy_shader = 0;
+        if (nx2_buffer_deps) {
+            nx2_buffer_deps->EndDispatch();
+        }
+        if (nx2_writer_trace) {
+            std::scoped_lock lock{nx2_list_mutex};
+            nx2_writer_trace->EndDispatch();
+        }
+    }
+    [[nodiscard]] bool Nx2WriterTraceHasWrites() const {
+        return nx2_writer_trace && nx2_writer_trace->HasScopeWrites();
+    }
+    void Nx2WriterTraceInput(bool recent) {
+        if (nx2_writer_trace) {
+            std::scoped_lock lock{nx2_list_mutex};
+            nx2_writer_trace->SetRecentInput(recent);
+        }
+    }
+    void Nx2CommitBufferDependencies() {
+        if (nx2_buffer_deps) {
+            nx2_buffer_deps->CommitWriter();
+        }
+    }
+    void Nx2TraceComputeBufferInputs();
+    bool Nx2TracingBufferDependencies() const { return nx2_buffer_deps.has_value(); }
+    void Nx2TraceBufferInput(DAddr addr, u64 size, BufferDependencyTrace::Input input);
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
     enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync };
@@ -493,6 +537,7 @@ public:
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
     /// no longer holds the page unless updated in place.
     void Nx2NoteListHostWrite(DAddr device_addr, u64 size, std::span<const u8> data = {});
+    bool CanSkipInlineMemory(DAddr device_addr, u64 size) const;
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
@@ -578,13 +623,26 @@ public:
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
-    struct NativeUniformBankShadow {
+    struct NativeUniformBankState {
         u64 last_draw_ticket{};
         u64 last_frame_tick{~u64{0}};
         u64 last_skipped_draw_ticket{~u64{0}}; ///< Profiler only: bank_once_per_frame skips
         u32 initialized_mask{};
+    };
+    struct NativeUniformBankShadow : NativeUniformBankState {
         std::array<u8, 0x10000> bytes{};
     };
+    struct CompactNativeUniformBankShadow : NativeUniformBankState {
+        std::vector<u8> bytes;
+    };
+    static bool CompactUniformBanksEnabled() {
+        static constexpr bool enabled = true;
+        return enabled;
+    }
+    std::unordered_map<DAddr, CompactNativeUniformBankShadow> compact_uniform_shadows;
+    std::array<std::pair<DAddr, CompactNativeUniformBankShadow*>, 1024> compact_uniform_cache{};
+    DAddr compact_uniform_last_bank = ~DAddr{0};
+    CompactNativeUniformBankShadow* compact_uniform_last_ptr = nullptr;
     std::unordered_map<DAddr, NativeUniformBankShadow> native_indirect_uniform_shadow;
     std::array<std::pair<DAddr, NativeUniformBankShadow*>, 8> native_indirect_uniform_cache{};
     DAddr native_indirect_uniform_last_bank = ~DAddr{0};
@@ -617,6 +675,13 @@ public:
     };
     std::array<std::array<BindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> uniform_bind_memo{};
     std::array<std::array<BindMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES> storage_bind_memo{};
+    struct GeometryMemo {
+        BindMemo binding;
+        size_t memory_id{};
+        u64 map_serial{};
+    };
+    std::array<GeometryMemo, NUM_VERTEX_BUFFERS> geometry_vertex_memo{};
+    GeometryMemo geometry_index_memo{};
     u64 bind_memo_mismatches = 0;
 
     static constexpr size_t ResolvedStorageAddrCacheSize = 4096;
@@ -668,6 +733,8 @@ private:
     }
 
     void RunGarbageCollector(bool aggressive_gc);
+
+    void SynchronizeGeometryBuffer(GeometryMemo& memo, Buffer& buffer, const Binding& binding);
 
     void BindHostIndexBuffer();
 
@@ -978,6 +1045,12 @@ private:
     Common::RangeSet<DAddr> cpu_read_ranges;
     bool download_cpu_read_ranges{};
     Common::RangeSet<DAddr> gpu_modified_ranges;
+    // Never cleared: a clear bit proves that InlineMemory has no GPU data on that page.
+    PageFilter inline_gpu_write_filter;
+    static bool InlineLockFilterEnabled() {
+        static constexpr bool enabled = true;
+        return enabled;
+    }
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
     // Async Buffers
@@ -1036,9 +1109,36 @@ private:
         /// the page's lists read guest memory once the back ran the work before the last such
         /// wait and no write came since the front flushed the page (Nx2ReadListCopy).
         bool draw_written{};
+        bool copy_read{};
+        ListCopyDemand demand;
         std::optional<Nx2Staging> copy;
     };
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
+    std::optional<ListWriterTrace> nx2_writer_trace = []() -> std::optional<ListWriterTrace> {
+        const char* value = std::getenv("EDEN_NX2_WRITER_DEPS");
+        if (value != nullptr && value[0] == '1') {
+            return std::optional<ListWriterTrace>{std::in_place};
+        }
+        return std::nullopt;
+    }();
+    std::optional<BufferDependencyTrace> nx2_buffer_deps = []()
+        -> std::optional<BufferDependencyTrace> {
+        const char* value = std::getenv("EDEN_NX2_BUFFER_DEPS");
+        if (value != nullptr && value[0] == '1') {
+            return std::optional<BufferDependencyTrace>{std::in_place};
+        }
+        return std::nullopt;
+    }();
+    const bool nx2_list_copy_log = [] {
+        const char* value = std::getenv("EDEN_NX2_LIST_COPY_LOG");
+        return value != nullptr && value[0] == '1';
+    }();
+    static constexpr bool nx2_list_copy_demand = true;
+    u64 nx2_list_copy_shader{}; ///< Back thread only; zero also covers DMA and inline writes.
+    struct Nx2ListCopyStats {
+        u64 copies{}, bytes{}, replaced_unread{}, copied{}, synced{}, misses{}, waits{};
+        u64 demand_skipped{}, demand_promoted{};
+    } nx2_list_copy_stats; ///< Protected by nx2_list_mutex.
     std::unordered_map<DAddr, Nx2ListPage> nx2_list_pages;
     /// Copies replaced while the GPU may still write them: freed once it is past their tick.
     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;

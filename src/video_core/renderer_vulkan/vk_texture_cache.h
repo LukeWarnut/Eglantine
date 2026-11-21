@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <chrono>
 #include <deque>
 #include <memory>
@@ -28,6 +29,7 @@
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/image_allocation_pool.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -72,6 +74,12 @@ public:
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
     void TickFrame();
+
+    [[nodiscard]] vk::Image AcquireImageAllocation(const VideoCommon::ImageInfo& info);
+    [[nodiscard]] vk::Image AcquireScaledImageAllocation(const VideoCommon::ImageInfo& scaled_info);
+    void RecycleImage(Image& image, u64 completed_tick);
+    bool CanGpuUnswizzle(const Image& image) const;
+    bool UploadGpuUnswizzle(Image& image, std::span<const u8> source);
 
     void FlushDeferredClear();
 
@@ -277,6 +285,8 @@ public:
         u64 tick;
         vk::Image image;
         std::vector<vk::ImageView> views;
+        /// Per level and layer (level * layers + layer), for layer-chunked decodes.
+        std::vector<vk::ImageView> layer_views;
         u32 width;
         u32 height;
         u32 levels;
@@ -286,8 +296,15 @@ public:
     std::deque<PendingTranscode> pending_transcodes;
     /// Decode images the GPU is done with, for the next texture of the same shape.
     std::vector<PendingTranscode> free_transcodes;
+    /// RGBA8 bytes of a decode image.
+    static u64 TranscodeDecodeBytes(const PendingTranscode& t);
+    /// Moves finished decode images to free_transcodes (within its limit) or destroys them.
+    void RecycleTranscodes();
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
+    std::optional<PlainUnswizzlePass> plain_unswizzle_pass;
+    VkBuffer DispatchPlainUnswizzle(const VideoCommon::PlainUnswizzleParameters& parameters,
+                                   const StagingBufferRef& source);
     const Settings::ResolutionScalingInfo& resolution;
     std::array<std::vector<VkFormat>, VideoCore::Surface::MaxPixelFormat> view_formats;
 
@@ -315,6 +332,11 @@ public:
     };
 
     std::vector<MsaaScratchImage> msaa_scratch_images;
+    VideoCommon::ImageAllocationPool<vk::Image> image_allocation_pool{
+        u64{256} << 20, 128, 3600};
+    u64 allocation_pool_frames{};
+    u32 allocation_pool_pressure_events{};
+    u32 allocation_pool_pressure_frames{};
     ::Common::unordered_map<VkImage, ResolveShadow> resolve_shadows;
     std::vector<std::pair<u64, ResolveShadow>> pending_resolve_shadows;
 };
@@ -520,6 +542,11 @@ public:
     /// gets memory of its own, all cleared (the caller loads the data again). False on failure.
     bool BackTilesWhole();
 
+    /// SparseTiles images sharing a zeroed block: every block with memory of its own goes back to
+    /// the zeroed block and the image is cleared, as if it had just been created. False when the
+    /// image has no zeroed block (the caller re-creates it).
+    bool ResetTiles();
+
     /// Device memory BindLayers has bound to the image's layers (an unbacked image has no other).
     u64 SparseBoundBytes() const noexcept {
         return sparse_layers.bound_bytes;
@@ -534,6 +561,7 @@ public:
     u64 allocation_tick;
 
     friend class BlockLinearUnswizzle3DPass;
+    friend class TextureCacheRuntime;
 
 private:
     bool BlitScaleHelper(bool scale_up);
@@ -569,6 +597,8 @@ private:
             other.level_tiles.clear();
             tail_level = other.tail_level;
             zero_block = std::exchange(other.zero_block, VK_NULL_HANDLE);
+            zero_memory = other.zero_memory;
+            zero_offset = other.zero_offset;
             tail_memory = std::exchange(other.tail_memory, VK_NULL_HANDLE);
             layer_tails = std::move(other.layer_tails);
             other.layer_tails.clear();
@@ -619,6 +649,8 @@ private:
         /// SparseTiles: the zeroed block every block without memory of its own is bound to, where
         /// the driver can't sample unbound memory
         VmaAllocation zero_block{};
+        VkDeviceMemory zero_memory{}; ///< zero_block's memory and offset, for ResetTiles
+        VkDeviceSize zero_offset{};
         VmaAllocation tail_memory{};             ///< The mip tail all layers share, if one
         std::vector<VmaAllocation> layer_tails;   ///< SparseTiles with separate mip tails
         VkDeviceSize bound_bytes{};
@@ -822,6 +854,19 @@ private:
 
         bool operator==(const VariantKey&) const noexcept = default;
 
+        [[nodiscard]] u32 Code() const noexcept {
+            static_assert(VK_COMPONENT_SWIZZLE_A == 6);
+            return static_cast<u32>(reduce_anisotropy) |
+                   (static_cast<u32>(force_nearest) << 1) |
+                   (static_cast<u32>(drop_reduction) << 2) |
+                   (static_cast<u32>(drop_custom_border) << 3) |
+                   (static_cast<u32>(srgb_border) << 4) |
+                   (static_cast<u32>(swizzle[0]) << 5) |
+                   (static_cast<u32>(swizzle[1]) << 8) |
+                   (static_cast<u32>(swizzle[2]) << 11) |
+                   (static_cast<u32>(swizzle[3]) << 14);
+        }
+
         [[nodiscard]] bool HasSwizzle() const noexcept {
             return swizzle != std::array<VkComponentSwizzle, 4>{};
         }
@@ -829,6 +874,7 @@ private:
 
     struct Variant {
         VariantKey key;
+        u32 code;
         vk::Sampler sampler;
     };
 
