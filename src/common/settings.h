@@ -522,6 +522,8 @@ struct Values {
                                                             Specialization::Default,
                                                             true,
                                                             true};
+    SwitchableSetting<bool> fullscreen_on_launch{linkage, false, "fullscreen_on_launch",
+                                                 Category::Renderer};
 
     SwitchableSetting<u8, false> bg_red{
                                         linkage, 0, "bg_red", Category::Renderer, Specialization::Default, true, true};
@@ -566,6 +568,15 @@ struct Values {
                                                            VramUsageMode::Conservative,
                                                            "vram_usage_mode",
                                                            Category::RendererAdvanced};
+    // Video memory kept free of the driver's budget, in MiB. -1: automatic (an eighth of the
+    // budget, at most 1 GiB). Used for the reported VRAM and the texture cache's margin.
+    SwitchableSetting<int, true> vram_reserve_mib{linkage,
+                                                  -1,
+                                                  -1,
+                                                  4096,
+                                                  "vram_reserve_mib",
+                                                  Category::RendererAdvanced,
+                                                  Specialization::Countable};
 
     SwitchableSetting<NvdecEmulation> nvdec_emulation{linkage, NvdecEmulation::Cpu,
                                                       "nvdec_emulation", Category::RendererAdvanced};
@@ -619,9 +630,13 @@ struct Values {
         linkage, true, "use_vulkan_driver_pipeline_cache", Category::RendererAdvanced,
         Specialization::Default};
 
-    // Off: task/mesh draws take the compute fallback even when the device has VK_EXT_mesh_shader.
-    SwitchableSetting<bool> use_mesh_shaders{linkage, true, "use_mesh_shaders",
-                                             Category::RendererAdvanced};
+    // How task/mesh draws run on a device with VK_EXT_mesh_shader: Native uses its task and mesh
+    // stages, ComputeFallback the compute path a device without it uses, Auto the fallback on AMD
+    // drivers and the native stages elsewhere (Vulkan::Device::RemoveUnsuitableExtensions).
+    // Replaces the use_mesh_shaders bool; Config::MigrateMeshShaderSetting maps its old value.
+    SwitchableSetting<MeshShaderMode> mesh_shader_mode{linkage, MeshShaderMode::Auto,
+                                                       "mesh_shader_mode",
+                                                       Category::RendererAdvanced};
 
     // Linux: the GPU driver's shader cache in a folder of our own (ConfigureDriverShaderCache),
     // with its size limit in GiB. Applied at startup, before anything loads a driver.
@@ -1056,6 +1071,10 @@ bool CurrentProgramIsSwitch2();
 // The ASTC recompression in effect: astc_recompression, unless the renderer picked another one
 // for the running program (the configuration is left as is). The core clears it on load.
 AstcRecompression GetAstcRecompression();
+
+// The video memory to keep free of a driver budget: vram_reserve_mib, or with -1 an eighth of
+// the budget, at most 1 GiB. Never more than the budget.
+u64 GetVramReserve(u64 budget);
 void SetAstcRecompressionOverride(std::optional<AstcRecompression> recompression);
 
 bool IsOpenGL();

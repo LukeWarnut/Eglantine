@@ -177,7 +177,6 @@ add_executable(yuzu
     install_dialog.h
     loading_screen.cpp
     loading_screen.h
-    loading_screen.ui
 
     main.cpp
 
@@ -234,6 +233,7 @@ add_executable(yuzu
     yuzu.rc
     migration_dialog.h migration_dialog.cpp
     nup_dialogs.h nup_dialogs.cpp
+    music_extract_dialog.h music_extract_dialog.cpp
     shader_warm_dialog.h shader_warm_dialog.cpp
     migration_worker.h migration_worker.cpp
     libqt_common.h libqt_common.cpp
@@ -250,10 +250,15 @@ add_executable(yuzu
     configuration/system/profile_avatar_dialog.h configuration/system/profile_avatar_dialog.cpp
     configuration/addon/mod_select_dialog.h configuration/addon/mod_select_dialog.cpp configuration/addon/mod_select_dialog.ui
 
-    render/performance_overlay.h render/performance_overlay.cpp render/performance_overlay.ui
+    render/performance_overlay.h render/performance_overlay.cpp
+    render/perf_sampler.h render/perf_sampler.cpp
     updater/update_dialog.h updater/update_dialog.cpp updater/update_dialog.ui
     game/common.h
     game/carousel.h game/carousel.cpp
+    game/home_background.h game/home_background.cpp
+    game/home_customize_panel.h game/home_customize_panel.cpp
+    game/home_side_panel.h game/home_side_panel.cpp
+    game/game_details_panel.h game/game_details_panel.cpp
 )
 
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eglantine")
@@ -479,7 +484,14 @@ if (WIN32 AND NOT YUZU_USE_BUNDLED_QT)
     endif()
     if (WINDEPLOYQT_EXECUTABLE)
         set(YUZU_EXE_DIR "$<TARGET_FILE_DIR:yuzu>")
-        add_custom_command(TARGET yuzu POST_BUILD COMMAND ${WINDEPLOYQT_EXECUTABLE} "$<TARGET_FILE:yuzu>" --dir "${YUZU_EXE_DIR}" --libdir "${YUZU_EXE_DIR}" --plugindir "${YUZU_EXE_DIR}/plugins" --no-compiler-runtime --no-opengl-sw --no-system-d3d-compiler --no-translations --verbose 0)
+        # MSYS2's Qt also has the GLib network information plugin. It pulls in GIO, which reads every
+        # app and mail client registration in the registry as soon as it loads, so malware sandboxes
+        # flag the package. Windows uses the Network List Manager plugin instead.
+        set(YUZU_WINDEPLOYQT_EXTRA_ARGS "")
+        if (MINGW)
+            set(YUZU_WINDEPLOYQT_EXTRA_ARGS --exclude-plugins qglib)
+        endif()
+        add_custom_command(TARGET yuzu POST_BUILD COMMAND ${WINDEPLOYQT_EXECUTABLE} "$<TARGET_FILE:yuzu>" --dir "${YUZU_EXE_DIR}" --libdir "${YUZU_EXE_DIR}" --plugindir "${YUZU_EXE_DIR}/plugins" --no-compiler-runtime --no-opengl-sw --no-system-d3d-compiler --no-translations --verbose 1 ${YUZU_WINDEPLOYQT_EXTRA_ARGS})
     else()
         message(WARNING "windeployqt not found: copy the Qt DLLs next to the executable yourself")
     endif()

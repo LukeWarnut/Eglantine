@@ -100,7 +100,8 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
 } // Anonymous namespace
 
 Buffer::Buffer(BufferCacheRuntime& runtime, VideoCommon::NullBufferParams null_params)
-    : VideoCommon::BufferBase(null_params), scheduler{&runtime.scheduler}, tracker{4096} {
+    : VideoCommon::BufferBase(null_params), scheduler{&runtime.scheduler}, tracker{4096},
+      pass_tracker{4096} {
     if (runtime.device.HasNullDescriptor()) {
         return;
     }
@@ -118,7 +119,7 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
       scheduler{&runtime.scheduler},
       buffer{CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
                           runtime.SparseAlignmentFor(sparse_compatible_))},
-      tracker{SizeBytes()} {
+      tracker{SizeBytes()}, pass_tracker{SizeBytes()} {
     sparse_compatible = sparse_compatible_;
     if (runtime.device.HasDebuggingToolAttached()) {
         buffer.SetObjectNameEXT(fmt::format("Buffer {:#x}", CpuAddr()).c_str());
@@ -142,6 +143,18 @@ void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
         last_usage_tick = current_tick;
     }
     tracker.Track(offset, size);
+    if (const u64 epoch = scheduler->PassEpoch(); epoch != pass_epoch) {
+        pass_tracker.Reset();
+        pass_epoch = epoch;
+    }
+    pass_tracker.Track(offset, size);
+}
+
+bool Buffer::IsRegionUsedInPass(u64 offset, u64 size) const noexcept {
+    if (scheduler->PassEpoch() != pass_epoch) {
+        return false;
+    }
+    return pass_tracker.IsUsed(offset, size);
 }
 
 VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format) {
@@ -383,7 +396,9 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                        ComputePassDescriptorQueue& compute_pass_descriptor_queue,
                                        DescriptorPool& descriptor_pool)
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
-      staging_pool{staging_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
+      staging_pool{staging_pool_},
+      host_importer{device_, scheduler_.GetMasterSemaphore().HostImportWarmup()},
+      guest_descriptor_queue{guest_descriptor_queue_},
       quad_index_pass(device, scheduler, descriptor_pool, staging_pool,
                       compute_pass_descriptor_queue),
       multi_range_buffers(device_) {
@@ -545,7 +560,18 @@ void BufferCacheRuntime::Finish() {
     scheduler.Finish();
 }
 
-bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
+namespace {
+// EDEN_NX2_UPLOAD_HOIST=0: in-order buffer uploads end the render pass, as before.
+bool UploadHoistEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_UPLOAD_HOIST");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // namespace
+
+bool BufferCacheRuntime::CanReorderUpload(Buffer& buffer,
                                           std::span<const VideoCommon::BufferCopy> copies) {
     if (Settings::values.disable_buffer_reorder) {
         return false;
@@ -554,6 +580,20 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
         std::ranges::all_of(copies, [&](const VideoCommon::BufferCopy& copy) {
             return !buffer.IsRegionUsed(copy.dst_offset, copy.size);
         });
+    // Used earlier in the submission: the upload must come after that use. If no draw of the
+    // held render pass used it yet, it can run just before that pass instead of ending it
+    // (CopyBuffer). Its destination then counts as used in the pass, so a second upload of the
+    // same bytes, or one after a draw read them, keeps its place.
+    hoist_next_upload = false;
+    if (!can_use_upload_cmdbuf && UploadHoistEnabled() && scheduler.CanHoistUpload() &&
+        std::ranges::none_of(copies, [&](const VideoCommon::BufferCopy& copy) {
+            return buffer.IsRegionUsedInPass(copy.dst_offset, copy.size);
+        })) {
+        hoist_next_upload = true;
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            buffer.MarkUsage(copy.dst_offset, copy.size);
+        }
+    }
     return can_use_upload_cmdbuf;
 }
 
@@ -586,11 +626,23 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         });
         return;
     }
+    if (std::exchange(hoist_next_upload, false) && src_buffer == staging_pool.StreamBuf() &&
+        scheduler.CanHoistUpload()) {
+        // Before the held render pass (CanReorderUpload); the scheduler puts the barriers
+        // around all of the pass's hoisted uploads.
+        scheduler.RecordBeforeRenderPass(
+            Scheduler::PrePassStage::Upload,
+            [src_buffer, dst_buffer, vk_copies](vk::CommandBuffer cmdbuf) {
+                cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
+            });
+        return;
+    }
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    if (barrier && src_buffer == staging_pool.StreamBuf() && !vk_copies.empty()) {
-        // Only in-order stream uploads share barriers. Dedicated staging buffers retain their
-        // normal recording path and tick-based reuse.
+    if (barrier && !vk_copies.empty() &&
+        (src_buffer == staging_pool.StreamBuf() ||
+         VideoCommon::Nx2GpuSide::On(VideoCommon::Nx2GpuSide::Opt::CopyBatch))) {
+        // Independent in-order copies share barriers; resource lifetime still follows the tick.
         scheduler.RecordUpload(src_buffer, dst_buffer,
                                std::span<const VkBufferCopy>{vk_copies.data(), vk_copies.size()});
         return;
@@ -737,7 +789,7 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
         bound_index_type = vk_index_type;
         bound_index_epoch = epoch;
     }
-    scheduler.Record([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
+    scheduler.RecordState([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
         cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
     });
 }
@@ -746,7 +798,7 @@ void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 fir
     bound_index_valid = false;
     if (count == 0) {
         ReserveNullBuffer();
-        scheduler.Record([this](vk::CommandBuffer cmdbuf) {
+        scheduler.RecordState([this](vk::CommandBuffer cmdbuf) {
             cmdbuf.BindIndexBuffer(*null_buffer, 0, VK_INDEX_TYPE_UINT32);
         });
         return;
@@ -777,7 +829,7 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset
         stride = 72;
     }
     if (device.IsExtExtendedDynamicStateSupported()) {
-        scheduler.Record([index, buffer, offset, size, stride](vk::CommandBuffer cmdbuf) {
+        scheduler.RecordState([index, buffer, offset, size, stride](vk::CommandBuffer cmdbuf) {
             const VkDeviceSize vk_offset = buffer != VK_NULL_HANDLE ? offset : 0;
             const VkDeviceSize vk_size = buffer != VK_NULL_HANDLE ? size : VK_WHOLE_SIZE;
             const VkDeviceSize vk_stride = stride;
@@ -789,7 +841,7 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset
             buffer = *null_buffer;
             offset = 0;
         }
-        scheduler.Record([index, buffer, offset](vk::CommandBuffer cmdbuf) {
+        scheduler.RecordState([index, buffer, offset](vk::CommandBuffer cmdbuf) {
             cmdbuf.BindVertexBuffer(index, buffer, offset);
         });
     }
@@ -835,12 +887,29 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     if (binding_count == 0) {
         return;
     }
+    static constexpr bool small_command = true;
+    if (small_command && binding_count == 1) {
+        const VkBuffer handle = buffer_handles.front();
+        const VkDeviceSize offset = bindings.offsets.front();
+        if (device.IsExtExtendedDynamicStateSupported()) {
+            const VkDeviceSize size = bindings.sizes.front();
+            const VkDeviceSize stride = bindings.strides.front();
+            scheduler.RecordState([min_binding, handle, offset, size, stride](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers2EXT(min_binding, 1, &handle, &offset, &size, &stride);
+            });
+        } else {
+            scheduler.RecordState([min_binding, handle, offset](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers(min_binding, 1, &handle, &offset);
+            });
+        }
+        return;
+    }
     if (device.IsExtExtendedDynamicStateSupported()) {
-        scheduler.Record([bindings_ = std::move(bindings), buffer_handles_ = std::move(buffer_handles), binding_count](vk::CommandBuffer cmdbuf) {
+        scheduler.RecordState([bindings_ = std::move(bindings), buffer_handles_ = std::move(buffer_handles), binding_count](vk::CommandBuffer cmdbuf) {
             cmdbuf.BindVertexBuffers2EXT(bindings_.min_index, binding_count, buffer_handles_.data(), bindings_.offsets.data(), bindings_.sizes.data(), bindings_.strides.data());
         });
     } else {
-        scheduler.Record([bindings_ = std::move(bindings), buffer_handles_ = std::move(buffer_handles), binding_count](vk::CommandBuffer cmdbuf) {
+        scheduler.RecordState([bindings_ = std::move(bindings), buffer_handles_ = std::move(buffer_handles), binding_count](vk::CommandBuffer cmdbuf) {
             cmdbuf.BindVertexBuffers(bindings_.min_index, binding_count, buffer_handles_.data(), bindings_.offsets.data());
         });
     }
@@ -860,7 +929,7 @@ void BufferCacheRuntime::BindTransformFeedbackBuffer(u32 index, VkBuffer buffer,
         offset = 0;
         size = 0;
     }
-    scheduler.Record([index, buffer, offset, size](vk::CommandBuffer cmdbuf) {
+    scheduler.RecordState([index, buffer, offset, size](vk::CommandBuffer cmdbuf) {
         const VkDeviceSize vk_offset = offset;
         const VkDeviceSize vk_size = size;
         cmdbuf.BindTransformFeedbackBuffersEXT(index, 1, &buffer, &vk_offset, &vk_size);
@@ -883,7 +952,7 @@ void BufferCacheRuntime::BindTransformFeedbackBuffers(VideoCommon::HostBindings<
         }
         buffer_handles[i] = handle;
     }
-    scheduler.Record([bindings_ = std::move(bindings), buffer_handles_ = std::move(buffer_handles)](vk::CommandBuffer cmdbuf) {
+    scheduler.RecordState([bindings_ = std::move(bindings), buffer_handles_ = std::move(buffer_handles)](vk::CommandBuffer cmdbuf) {
         cmdbuf.BindTransformFeedbackBuffersEXT(0, u32(buffer_handles_.size()), buffer_handles_.data(), bindings_.offsets.data(), bindings_.sizes.data());
     });
 }

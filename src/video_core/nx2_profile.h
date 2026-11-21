@@ -333,6 +333,11 @@ enum class Counter : u32 {
     CbWords,
     /// Of MethodWrites: writes the front dropped as a same-value state write before any other work
     DroppedSameFirst,
+    /// DrawIndexedIndirect calls the host GPU drew from their GPU-written records
+    /// (Maxwell3D::FrontTakeIndirectRecord)
+    IndirectRecords,
+    /// Of those, drawn after storage writes no barrier ordered yet (RasterizerVulkan::DrawIndirect)
+    IndirectRecordsUnordered,
     Count,
 };
 
@@ -353,8 +358,12 @@ inline std::unordered_set<u64>& DmaReadPages() {
 
 inline void Add(Counter counter, u64 amount) {
     if (Enabled()) {
-        t_data.counters[static_cast<size_t>(counter)] += amount;
-        t_totals.counters[static_cast<size_t>(counter)] += amount;
+        const size_t index = static_cast<size_t>(counter);
+        t_data.counters[index] += amount;
+        // Totals keeps only the first counters (nx2_spikes): the others would write past it.
+        if (index < t_totals.counters.size()) {
+            t_totals.counters[index] += amount;
+        }
     }
 }
 
@@ -515,6 +524,12 @@ inline void Report(const char* thread_name = "GPU thread") {
         line += fmt::format(" | front 3D writes: direct {:.0f}, from macros {:.0f}",
                             static_cast<double>(data.counters[static_cast<size_t>(Counter::DirectWrites)]) * 1e9 / window,
                             static_cast<double>(data.counters[static_cast<size_t>(Counter::MacroWrites)]) * 1e9 / window);
+    }
+    if (data.counters[static_cast<size_t>(Counter::IndirectRecords)] != 0 ||
+        data.counters[static_cast<size_t>(Counter::IndirectRecordsUnordered)] != 0) {
+        line += fmt::format(" | indirect records {:.0f} ({:.0f} after unordered stores)",
+                            per_second(Counter::IndirectRecords),
+                            per_second(Counter::IndirectRecordsUnordered));
     }
     if (data.counters[static_cast<size_t>(Counter::DrawBeginCoalesced)] != 0) {
         line += fmt::format(" | draw.begin coalesced {:.0f}",

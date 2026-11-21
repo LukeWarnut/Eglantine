@@ -101,6 +101,21 @@ public:
     std::unordered_map<TICEntry, ImageViewId> image_views;
     std::unordered_map<TSCEntry, SamplerId> samplers;
 
+    struct ValidImageEntry {
+        std::array<u64, 4> raw{};
+        size_t memory_id{};
+        u64 map_serial{};
+        bool valid{};
+    };
+    std::array<ValidImageEntry, 64> valid_image_entries{};
+    struct ResolvedImageEntry {
+        std::array<u64, 4> raw{};
+        size_t memory_id{};
+        u64 map_serial{};
+        ImageViewId id{};
+    };
+    std::array<ResolvedImageEntry, 256> resolved_image_entries{};
+
     TextureCacheGPUMap* gpu_page_table = nullptr;
     TextureCacheGPUMap* sparse_page_table = nullptr;
 };
@@ -201,6 +216,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
     /// SparseTiles images: binds and uploads the parts written since the last upload.
     void RefreshSparseTiles(Image& image);
+
+    /// Brings a SparseTilesUnmapped image up to date with the tiles mapped now (see the flag).
+    void RefreshUnmappedSparseTiles(Image& image, ImageId image_id);
 
     /// Image::BindTiles, counting what it binds in total_used_memory.
     bool BindSparseTiles(Image& image, std::span<const LevelRect> rects);
@@ -703,6 +721,7 @@ private:
     u64 modification_tick = 0;
     u64 frame_start_modification_tick = 0;
     u64 frame_tick = 0;
+    u64 sparse_tiles_refreshed = 0; ///< SparseTilesUnmapped images brought up to date
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

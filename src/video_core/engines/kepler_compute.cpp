@@ -1129,8 +1129,15 @@ bool KeplerCompute::ProcessOcarinaUpscale(u64 program_id, u64 native_key, u64 sh
                      rasterizer->UsesNvidiaDlss());
         }
     }
-    if (program_id != ProgramId || (!input_pass && !output_pass) ||
-        !rasterizer->UsesNvidiaDlss()) {
+    // Without DLSS the game's own anti-aliasing runs: 14.8 ms a frame on an RX 580 at 1440p
+    // (37% of the GPU's time in Ocarina of Time). EDEN_NX2_OOT_AA=0 (Performance > GPU) puts a
+    // bilinear copy of its input in its place.
+    const bool dlss = rasterizer->UsesNvidiaDlss();
+    static const bool copy_aa = [] {
+        const char* env = std::getenv("EDEN_NX2_OOT_AA");
+        return env != nullptr && env[0] == '0';
+    }();
+    if (program_id != ProgramId || (!input_pass && !output_pass) || (!dlss && !copy_aa)) {
         return false;
     }
     const auto& cbuf = launch_description.const_buffer_config[0];
@@ -1213,7 +1220,32 @@ bool KeplerCompute::ProcessOcarinaUpscale(u64 program_id, u64 native_key, u64 sh
         result.addr_lower = static_cast<u32>(tic.Address());
         return result;
     };
-    return rasterizer->AccelerateCameraMotionUpscale(surface(*input), surface(*output));
+    if (dlss) {
+        return rasterizer->AccelerateCameraMotionUpscale(surface(*input), surface(*output));
+    }
+    const Fermi2D::Config config{
+        .operation = Fermi2D::Operation::SrcCopy,
+        .filter = Fermi2D::Filter::Bilinear,
+        .must_accelerate = true,
+        .dst_x0 = 0,
+        .dst_y0 = 0,
+        .dst_x1 = static_cast<s32>(output->Width()),
+        .dst_y1 = static_cast<s32>(output->Height()),
+        .src_x0 = 0,
+        .src_y0 = 0,
+        .src_x1 = static_cast<s32>(input->Width()),
+        .src_y1 = static_cast<s32>(input->Height()),
+    };
+    const bool copied = rasterizer->AccelerateSurfaceCopy(surface(*input), surface(*output), config);
+    static bool reported{};
+    if (!reported) {
+        reported = true;
+        LOG_INFO(HW_GPU,
+                 "Ocarina of Time anti-aliasing {}x{} -> {}x{} replaced by a bilinear copy: {} "
+                 "(EDEN_NX2_OOT_AA=0)",
+                 input->Width(), input->Height(), output->Width(), output->Height(), copied);
+    }
+    return copied;
 }
 
 // Fortune's Weave's last DLSS network pass: it reads the input colour (the first pass's) through
@@ -2085,8 +2117,9 @@ VideoCommon::SplitWriteTracker::Effect KeplerCompute::FrontEffect(u32 method) co
     case 0xaf:
     case 0xb0:
     case 0x107:
-    case 0x6c3:
         return Effect::Gpu; // QMD launches and the semaphore releases after them
+    case 0x6c3:
+        return VideoCommon::GpuSplit::AcquireKnownReleaseEnabled() ? Effect::None : Effect::Gpu;
     default:
         return Effect::Unknown; // Inline uploads among them
     }
@@ -2096,11 +2129,22 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
     if (method == 0x107) {
         // An inline QMD is written to memory before it launches.
         const GPUVAddr qmd = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
-        split.NoteWrite(memory_manager, qmd, 256);
+        split.NoteWrite(memory_manager, qmd, 256, VideoCommon::GpuSplit::WriteKind::Other);
     } else if (method == 0x6c3) {
-        split.NoteWrite(memory_manager,
-                        (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1],
-                        16);
+        const GPUVAddr address =
+            (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+        const u32 control = fs.registers[0x6c3];
+        if (!VideoCommon::GpuSplit::AcquireKnownReleaseEnabled()) {
+            split.NoteWrite(memory_manager, address, 16, VideoCommon::GpuSplit::WriteKind::Other);
+            return;
+        }
+        const u32 operation = control & 3;
+        const bool payload = address != 0 && (operation == 0 || operation == 2) &&
+                             (control & (1U << 3)) == 0;
+        split.NoteRelease(memory_manager, address, (control & (1U << 28)) != 0 ? 4 : 16,
+                          fs.registers[0x6c2],
+                          payload && VideoCommon::GpuSplit::PayloadReleaseSynchronous(
+                                         (control & (1U << 28)) != 0));
     }
 }
 
@@ -2132,6 +2176,14 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
                       FrontEffect(method));
     FrontNoteWrites(split, fs, method);
+    if (method == 0x6c3 && amount > 1 &&
+        VideoCommon::GpuSplit::AcquireKnownReleaseEnabled()) {
+        const GPUVAddr address =
+            (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+            split.NoteAsyncWrite(*device, 16);
+        }
+    }
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -2160,9 +2212,14 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
     if (!macro.native_jit) {
         macro.native_jit = std::make_shared<TuringMacroJit>();
     }
-    macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
+    static constexpr bool batch_macros = true;
+    macro.native_jit->Prepare(macro.native_code, macro.native_code_generation, batch_macros);
+    // Buffered emits flush before register reads, DMA emits and return.
+    const TuringMacroJit::Options jit_options{.batch_emits = batch_macros,
+                                             .keep_state = batch_macros};
     const auto result = macro.native_jit->Execute(
-        start, fs.parameters, std::span<u32>{*macro.native_interpreter.active_dram}, read, emit);
+        start, fs.parameters, {}, std::span<u32>{*macro.native_interpreter.active_dram}, read, emit,
+        jit_options);
     if (!result.success) {
         macro.native_execution_failed = true;
         LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: compute start={:#x}, consumed={}, error={}",

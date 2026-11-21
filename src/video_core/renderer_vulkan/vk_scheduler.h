@@ -9,9 +9,11 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -25,6 +27,7 @@
 #include "common/progress_counter.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_gpu_side.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -49,6 +52,7 @@ struct QueryCacheParams;
 /// OpenGL-like operations on Vulkan command buffers.
 class Scheduler {
 public:
+
     explicit Scheduler(const Device& device, StateTracker& state_tracker);
     ~Scheduler();
 
@@ -63,6 +67,8 @@ public:
     /// once); otherwise it goes with the next one. The back submits deferred work before it
     /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
     bool DeferFlush();
+    /// Coalesce short list-copy bursts; demanded copies are submitted by WaitSubmitted.
+    bool DeferListCopyFlush();
     /// Submits deferred work (the split's back, from its idle hook).
     void FlushDeferred();
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
@@ -126,6 +132,28 @@ public:
 
     void NoteRenderPassStores() {
         render_pass_has_stores = true;
+        storage_writes_unordered = true;
+    }
+
+    /// A draw wrote storage since the last memory barrier after all graphics stages: a host
+    /// indirect draw reading GPU-written arguments needs one first (ReadyIndirectRecord).
+    bool StorageWritesUnordered() const {
+        return storage_writes_unordered;
+    }
+
+    void NoteStorageWritesOrdered() {
+        storage_writes_unordered = false;
+    }
+
+    /// A draw or clear of the active render pass may write its depth/stencil attachment.
+    void NoteDepthStencilWrite() {
+        render_pass_depth_written = true;
+    }
+
+    /// Whether the active render pass may have written its depth/stencil attachment (a clear
+    /// when it began, or a draw or clear since).
+    [[nodiscard]] bool RenderPassWroteDepthStencil() const {
+        return render_pass_depth_written;
     }
 
     bool RenderPassHasStores() const {
@@ -135,6 +163,13 @@ public:
     /// A dispatch was recorded: the next render pass must see what it wrote.
     void NoteComputeWrites() {
         compute_writes_pending = true;
+    }
+
+    /// A guest wait-for-idle while the render pass is active: its barrier is recorded when the
+    /// pass ends instead of ending it now. Draws of the pass are ordered with each other by
+    /// rasterization order already; only work outside the pass needs the barrier.
+    void DeferWaitForIdle(VkPipelineStageFlags stages) {
+        deferred_wfi_stages |= stages;
     }
 
     /// Returns true when a render pass is currently active in the scheduler state.
@@ -208,6 +243,7 @@ public:
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command) {
+        commands_pending = true;
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
@@ -218,17 +254,103 @@ public:
         if (chunk->Record(command)) {
             return;
         }
+        if (pass_held && HoldFullPassChunk()) {
+            (void)chunk->Record(command);
+            return;
+        }
         DispatchWork();
         (void)chunk->Record(command);
+    }
+
+    /// Whether a buffer upload can run before the active render pass (RecordBeforeRenderPass,
+    /// Upload stage) instead of ending it. The caller checks that no draw of the pass used the
+    /// destination (Buffer::IsRegionUsedInPass).
+    [[nodiscard]] bool CanHoistUpload() const {
+        return pass_held && state.renderpass != VK_NULL_HANDLE &&
+               deferred_clear.framebuffer == nullptr;
+    }
+
+    /// Changes when a render pass ends: usage marked since then is usage by the current (or
+    /// next) render pass, including the bindings of its first draw, made before it begins.
+    [[nodiscard]] u64 PassEpoch() const noexcept {
+        return pass_epoch;
+    }
+
+    /// Whether work recorded with RecordBeforeRenderPass runs before the render pass that is
+    /// active on `framebuffer` (mesh emulation dispatches then do not end it).
+    [[nodiscard]] bool CanRecordBeforeRenderPass(VkFramebuffer framebuffer) const {
+        return pass_held && state.renderpass != VK_NULL_HANDLE &&
+               state.framebuffer == framebuffer && !render_pass_has_stores &&
+               deferred_clear.framebuffer == nullptr;
+    }
+
+    /// Stages of the work recorded before a render pass. The work of all a pass's emulated mesh
+    /// draws runs stage by stage, with one barrier between stages (not 2-4 per draw).
+    enum class PrePassStage : u32 {
+        Upload = 0,       ///< buffer uploads no draw of the pass has used yet (upload-hoist)
+        Task = 1,         ///< task program dispatches
+        Distribution = 2, ///< task -> mesh distribution dispatches (read the task output)
+        Mesh = 3,         ///< mesh program dispatches (read the distribution output)
+    };
+
+    /// Records work that runs before the active render pass begins (CanRecordBeforeRenderPass),
+    /// in the given stage. Barriers: before the first stage (everything earlier written ->
+    /// compute), between the stages (compute -> compute, indirect, host) and after the last
+    /// (compute -> vertex input, vertex shader, indirect).
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void RecordBeforeRenderPass(PrePassStage stage, T&& c) {
+        auto command = [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
+            command(cmdbuf);
+        };
+        auto& chunks = pre_pass_chunks[static_cast<size_t>(stage)];
+        if (chunks.empty() || !chunks.back()->Record(command)) {
+            chunks.push_back(TakeReserveChunk());
+            (void)chunks.back()->Record(command);
+        }
     }
 
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer>
     void Record(T&& c) {
+        commands_pending = true;
+        static constexpr bool direct_command = true;
+        if (direct_command) {
+            if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
+                VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
+            }
+            if (uploads_pending) {
+                FlushUploads();
+            }
+            if (chunk->Record<true>(c)) {
+                return;
+            }
+            DispatchWork();
+            (void)chunk->Record<true>(c);
+            return;
+        }
         this->RecordWithUploadBuffer(
             [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
                 command(cmdbuf);
             });
+    }
+
+    /// State commands do not access buffer contents; pending copies may follow them.
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void RecordState(T&& command) {
+        commands_pending = true;
+        if (!VideoCommon::Nx2GpuSide::On(VideoCommon::Nx2GpuSide::Opt::CopyBatch)) {
+            Record(std::forward<T>(command));
+            return;
+        }
+        if (VideoCommon::GpuSplit::check_owner) {
+            VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordState");
+        }
+        if (!chunk->Record<true>(command)) {
+            DispatchWork();
+            (void)chunk->Record<true>(command);
+        }
     }
 
     /// Whether the recording thread submitted `tick` within 20 ms.
@@ -308,6 +430,7 @@ public:
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
+    bool commands_pending{};
     /// The master semaphore's current tick as of the last submission (WaitSubmitted waits on it).
     Common::ProgressCounter submitted_ticks;
 
@@ -329,7 +452,7 @@ private:
         Command* next = nullptr;
     };
 
-    template <typename T>
+    template <typename T, bool SingleBuffer>
     class TypedCommand final : public Command {
     public:
         explicit TypedCommand(T&& command_) : command{std::move(command_)} {}
@@ -340,7 +463,11 @@ private:
 
         void Execute(vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) const override {
 
-            command(cmdbuf, upload_cmdbuf);
+            if constexpr (SingleBuffer) {
+                command(cmdbuf);
+            } else {
+                command(cmdbuf, upload_cmdbuf);
+            }
         }
 
     private:
@@ -351,9 +478,9 @@ private:
     public:
         void ExecuteAll(vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf);
 
-        template <typename T>
+        template <bool SingleBuffer = false, typename T>
         bool Record(T& command) {
-            using FuncType = TypedCommand<T>;
+            using FuncType = TypedCommand<T, SingleBuffer>;
             static_assert(sizeof(FuncType) < sizeof(data), "Lambda is too large");
 
             command_offset = Common::AlignUp(command_offset, alignof(FuncType));
@@ -436,12 +563,39 @@ private:
 
     void AcquireNewChunk();
 
+    /// A chunk from the reserve (or a new one).
+    std::unique_ptr<CommandChunk> TakeReserveChunk();
+
+    // Held render passes: the work before a render pass, the pass itself and the work recorded
+    // before it (RecordBeforeRenderPass) go to the worker together when the pass ends, in the
+    // order: work before the pass, work before the pass recorded during it, the pass. Mesh
+    // emulation dispatches then run before the pass instead of ending it at every emulated draw
+    // (Ocarina of Time: 150-300 of them a frame, each one a load and store of the 2560x1440
+    // targets on an RX 580).
+    bool pass_held{};
+    std::vector<std::unique_ptr<CommandChunk>> before_pass_chunks;
+    std::array<std::vector<std::unique_ptr<CommandChunk>>, 4> pre_pass_chunks;
+    u64 pass_epoch{1};
+    std::vector<std::unique_ptr<CommandChunk>> pass_chunks;
+    /// Holds the render pass about to begin (BeginRenderPassImpl).
+    void HoldPass();
+    /// The current chunk is full while a pass is held: keep it in the pass. False (and the pass
+    /// is released) when the pass has grown too large to keep holding.
+    bool HoldFullPassChunk();
+    /// Sends the held work to the worker in order; the rest of the pass is not held.
+    void ReleasePass();
+
     const Device& device;
     StateTracker& state_tracker;
 
     std::unique_ptr<MasterSemaphore> master_semaphore;
+
+private:
     FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
+    bool storage_writes_unordered{};
+    bool render_pass_depth_written{};
+    VkPipelineStageFlags deferred_wfi_stages{}; ///< DeferWaitForIdle: barrier due at the pass end
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
