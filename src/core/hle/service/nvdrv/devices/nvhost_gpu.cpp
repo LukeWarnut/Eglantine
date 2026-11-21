@@ -113,6 +113,18 @@ NvResult nvhost_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> inpu
         }
         break;
     }
+    if (g_nx2_driver && command.group == 'H' && command.cmd == 0x1e &&
+        output.size() >= sizeof(u64)) {
+        // 0x1E (16 bytes): ouncevk needs a nonzero u64 back, which it keys its channel objects
+        // by. SDK titles don't send it. Hand out a unique id per call.
+        static std::atomic<u64> next_id{1};
+        const u64 id = next_id.fetch_add(1, std::memory_order_relaxed);
+        std::fill(output.begin(), output.end(), u8{0});
+        std::copy_n(input.begin(), std::min(input.size(), output.size()), output.begin());
+        std::memcpy(output.data(), &id, sizeof(id));
+        LOG_WARNING(Service_NVDRV, "(STUBBED) Switch 2 nvhost-gpu ioctl 0x1E, returning id {}", id);
+        return NvResult::Success;
+    }
     if (g_nx2_driver) {
         return Nx2UnknownIoctl("nvhost-gpu", command, input, output);
     }
@@ -527,8 +539,11 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                  "nx2 SubmitGPFIFO entries={} flags={:#x} fence_out=({}, {}) guest_value={}",
                  params.num_entries, flags.raw, params.fence.id, params.fence.value,
                  system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(params.fence.id));
+    } else {
+        // Switch 2 nvgpu returns the flags as passed: ouncevk treats changed flags as a failed
+        // submit (VK_ERROR_DEVICE_LOST).
+        flags.raw = 0;
     }
-    flags.raw = 0;
 
     return NvResult::Success;
 }

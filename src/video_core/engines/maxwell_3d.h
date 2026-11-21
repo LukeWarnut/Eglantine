@@ -2559,6 +2559,17 @@ public:
             return (reg_array[MeshControl] & 1) != 0;
         }
 
+        // Turing+ single-method draws (NVC597_SET_DRAW_CONTROL_A/B and
+        // DRAW_INDEX_BUFFER/VERTEX_ARRAY_BEGIN_END_A/B), which NVK draws with: control A holds
+        // the topology (bits 3:0) and ignore-global-base-instance/vertex (bits 9, 10), control B
+        // the instance count, each A the first index or vertex. Writing a B draws.
+        static constexpr std::size_t DrawControlA = 0x260 / 4;
+        static constexpr std::size_t DrawControlB = 0x264 / 4;
+        static constexpr std::size_t DrawIndexBeginEndA = 0x268 / 4;
+        static constexpr std::size_t DrawIndexBeginEndB = 0x26c / 4;
+        static constexpr std::size_t DrawVertexBeginEndA = 0x270 / 4;
+        static constexpr std::size_t DrawVertexBeginEndB = 0x274 / 4;
+
         struct ConstantBuffer {
             u32 size;
             u32 address_high;
@@ -3203,6 +3214,7 @@ public:
         u32 selected{};
         u32 offset{};
         bool loaded{};
+        u32 loaded_mask{}; ///< Tables written so far.
     } root_tables;
 
     /// Write the value to the register identified by method.

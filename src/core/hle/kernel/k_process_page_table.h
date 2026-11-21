@@ -425,6 +425,9 @@ public:
     size_t GetNormalMemorySize() const {
         return m_page_table.GetNormalMemorySize();
     }
+    size_t GetCurrentHeapSize() const {
+        return m_page_table.GetCurrentHeapSize();
+    }
 
     size_t GetCodeSize() const {
         return m_page_table.GetCodeSize();

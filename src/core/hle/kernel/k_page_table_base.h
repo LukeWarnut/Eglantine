@@ -709,6 +709,11 @@ public:
         return (m_current_heap_end - m_heap_region_start) + m_mapped_physical_memory_size;
     }
 
+    size_t GetCurrentHeapSize() const {
+        KScopedLightLock lk(m_general_lock);
+        return m_current_heap_end - m_heap_region_start;
+    }
+
     size_t GetCodeSize() const;
     size_t GetCodeDataSize() const;
     size_t GetAliasCodeSize() const;

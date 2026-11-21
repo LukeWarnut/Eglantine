@@ -140,6 +140,16 @@ Result NPad::ActivateNpadResource(u64 aruid) {
 }
 
 void NPad::FreeAppletResourceId(u64 aruid) {
+    // The shared memory goes with the applet resource: a new one for the same aruid (homebrew
+    // loading the next NRO) must set the controllers up again in its memory.
+    if (const auto aruid_index = npad_resource.GetIndexFromAruid(aruid);
+        aruid_index < AruidIndexMax) {
+        for (auto& controller : controller_data[aruid_index]) {
+            controller.is_active = false;
+            controller.is_connected = false;
+            controller.shared_memory = nullptr;
+        }
+    }
     return npad_resource.FreeAppletResourceId(aruid);
 }
 

@@ -535,4 +535,31 @@ TEST_CASE("Ampere three-input IADD3 retains register source negation", "[video_c
     CHECK(((adds[0] >> 49) & 1) == 1);
     CHECK(((adds[1] >> 48) & 1) == 1);
 }
+
+TEST_CASE("Ampere F2F widens a half to a float", "[video_core][ampere]") {
+    // Logged from a homebrew (NVK) fragment shader: F2F.F32.F16 R4, R2.
+    const std::array<Instruction, 2> code{{
+        {{0x00027304, 0x00000002, 0x00101000, 0x000e0200}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    const u64 convert = FindMaxwell(lowered, 0x5ca, 52);
+    REQUIRE(convert != 0);
+    CHECK(((convert >> 8) & 3) == 2);  // F32 destination
+    CHECK(((convert >> 10) & 3) == 1); // F16 source
+    CHECK(((convert >> 20) & 0xff) == 2);
+    CHECK(((convert >> 41) & 1) == 0); // low half
+
+    // F2F.F32.F16 R4, R1.H1: the high half of the register.
+    const std::array<Instruction, 2> high_code{{
+        {{0x00017304, 0x10000001, 0x00101000, 0x001e0200}},
+        EXIT,
+    }};
+    const auto high = LowerToMaxwell(high_code);
+    REQUIRE(static_cast<bool>(high));
+    const u64 high_convert = FindMaxwell(high, 0x5ca, 52);
+    CHECK(((high_convert >> 20) & 0xff) == 1);
+    CHECK(((high_convert >> 41) & 1) == 1);
+}
 } // namespace

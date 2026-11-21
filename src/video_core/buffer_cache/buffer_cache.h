@@ -1613,10 +1613,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                                                    bool needs_bind) {
     ++channel_state->uniform_cache_shots[0];
     // Bank 24 (root table 0, NVN2's push constants) is read from bank 17, which such games do not
-    // bind: stream the table's current words as that buffer.
-    if (index == 17 && maxwell3d->root_tables.loaded &&
+    // bind, and bank 31 (root table 7, NVK's per-draw constants) from bank 16: stream the table's
+    // current words as that buffer.
+    const u32 root_table = index == 17 ? 0U : index == 16 ? 7U : ~0U;
+    if (root_table != ~0U && (maxwell3d->root_tables.loaded_mask >> root_table) & 1 &&
         channel_state->uniform_buffers[stage][index].size == 0) {
-        const auto& words = maxwell3d->root_tables.tables[0];
+        const auto& words = maxwell3d->root_tables.tables[root_table];
         const u32 size = (*channel_state->uniform_buffer_sizes)[stage][index];
         const u32 copied = (std::min)(size, static_cast<u32>(sizeof(words)));
         if constexpr (IS_OPENGL) {

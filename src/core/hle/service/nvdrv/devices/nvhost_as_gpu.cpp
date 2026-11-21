@@ -46,6 +46,12 @@ nvhost_as_gpu::~nvhost_as_gpu() {
             Nx2GpuMemoryRegistry::Get().ReleaseDeviceRange(range.asid, key.first, key.second);
         }
     }
+    // GPU thread work queued by this address space (its unmaps) still uses the memory manager:
+    // free it after that work.
+    if (gmmu) {
+        system.GPU().RunInOrder(
+            [memory = std::shared_ptr<Tegra::MemoryManager>(std::move(gmmu))] {});
+    }
 }
 
 NvResult nvhost_as_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> input,
@@ -330,13 +336,17 @@ NvResult nvhost_as_gpu::GetSyncRoMap(IoctlGetSyncRoMap& params) {
     if (!vm.initialised || !gmmu) {
         return NvResult::NotSupported;
     }
-    const u64 address = vm.va_range_end - VM::YUZU_PAGESIZE;
+    // Switch 2 nvgpu maps the shim right past the user range, one page per syncpoint (ouncevk
+    // requires that). Without a VA split that is the region AllocAsEx keeps past the end.
+    const u64 address = vm.absolute_big_page_limit
+                            ? vm.va_range_split
+                            : vm.va_range_end - Tegra::MemoryManager::ShimSize;
     if (!nx2_syncpoint_shim) {
         nx2_syncpoint_shim = true;
         gmmu->SetNativeSyncpointShim(address);
     }
     params.base_gpuva = address;
-    params.sync_size = sizeof(u32);
+    params.sync_size = static_cast<u32>(Tegra::MemoryManager::ShimSyncpointStride);
     params.num_syncpoints = Tegra::MemoryManager::NumShimSyncpoints;
     LOG_INFO(Service_NVDRV, "Switch 2 syncpoint shim at {:#x} ({} syncpoints)", address,
              params.num_syncpoints);
@@ -682,7 +692,10 @@ NvResult nvhost_as_gpu::BindChannel(IoctlBindChannel& params) {
 }
 
 void nvhost_as_gpu::GetVARegionsImpl(IoctlGetVaRegions& params) {
-    params.buf_size = 2 * sizeof(VaRegion);
+    // Without a VA split (Switch 2) the big-page region AllocAsEx keeps past the end is Eden's
+    // own: report the small-page region only. ouncevk rejects a region past 0xC000000000.
+    const size_t num_regions = vm.absolute_big_page_limit ? 1 : 2;
+    params.buf_size = static_cast<u32>(num_regions * sizeof(VaRegion));
 
     params.regions = std::array<VaRegion, 2>{
         VaRegion{
@@ -698,6 +711,9 @@ void nvhost_as_gpu::GetVARegionsImpl(IoctlGetVaRegions& params) {
             .pages = vm.big_page_allocator->GetVALimit() - vm.big_page_allocator->GetVAStart(),
         },
     };
+    if (num_regions == 1) {
+        params.regions[1] = {};
+    }
 }
 
 NvResult nvhost_as_gpu::GetVARegions1(IoctlGetVaRegions& params) {
@@ -726,7 +742,8 @@ NvResult nvhost_as_gpu::GetVARegions3(IoctlGetVaRegions& params, std::span<VaReg
 
     GetVARegionsImpl(params);
 
-    const size_t num_regions = (std::min)(params.regions.size(), regions.size());
+    const size_t num_regions =
+        (std::min)(params.buf_size / sizeof(VaRegion), regions.size());
     for (size_t i = 0; i < num_regions; i++) {
         regions[i] = params.regions[i];
     }

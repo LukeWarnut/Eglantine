@@ -47,9 +47,12 @@ public:
                            u64 big_page_bits_ = 16, u64 page_bits_ = 12);
     ~MemoryManager();
 
-    // Switch 2: GPU address of the read-only syncpoint shim (u32 per syncpoint); 0 = none.
+    // Switch 2: GPU address of the read-only syncpoint shim, a 4 KiB page per syncpoint with its
+    // value at the start (nvgpu's sync_size); 0 = none.
     void SetNativeSyncpointShim(GPUVAddr address);
     static constexpr u32 NumShimSyncpoints = 192; // Tegra::Host1x::SyncpointManager
+    static constexpr u64 ShimSyncpointStride = 0x1000;
+    static constexpr u64 ShimSize = NumShimSyncpoints * ShimSyncpointStride;
 
     /// Switch 2 lays out block-linear surfaces with the console's GOB swizzle.
     void EnableNativeTiling() {

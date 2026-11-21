@@ -13,6 +13,7 @@
 #include <boost/container/static_vector.hpp>
 
 #include "common/assert.h"
+#include "common/common_funcs.h"
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/swap.h"
@@ -156,6 +157,7 @@ IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const ch
         {2100, &IPlatformServiceManager::RequestLoadNxFont, "RequestLoadNxFont"},
         {2000, &IPlatformServiceManager::GetBuiltInFontSharedMemory, "GetBuiltInFontSharedMemory (Switch 2)"},
         {2010, &IPlatformServiceManager::GetBuiltInFontData, "GetBuiltInFontData (Switch 2)"},
+        {2020, &IPlatformServiceManager::GetBuiltInFontsInOrderOfPriority, "GetBuiltInFontsInOrderOfPriority (Switch 2, guessed)"},
     };
     // clang-format on
     RegisterHandlers(functions);
@@ -316,6 +318,43 @@ void IPlatformServiceManager::GetBuiltInFontData(HLERequestContext& ctx) {
     rb.Push<u32>(region.offset);
     rb.Push<u32>(region.size);
     rb.Push<u32>(0);
+}
+
+// Switch 2, as libounce's pl calls it: u64 (language code), u8; in buffer of font types in the
+// order wanted; out buffer of 12-byte records {u8 type, u32 offset, u32 size} into the
+// GetBuiltInFontSharedMemory memory. Replies u8 loaded, s32 record count. The order is the one
+// asked for, like GetSharedFontInOrderOfPriority ignores the language.
+void IPlatformServiceManager::GetBuiltInFontsInOrderOfPriority(HLERequestContext& ctx) {
+    struct Record {
+        u8 type;
+        INSERT_PADDING_BYTES(3);
+        u32_le offset;
+        u32_le size;
+    };
+    static_assert(sizeof(Record) == 12);
+
+    const auto types = ctx.ReadBuffer(0);
+    const size_t capacity = ctx.GetWriteBufferSize(0) / sizeof(Record);
+    const auto& regions = impl->builtin_font_regions;
+    std::vector<Record> records;
+    for (const u8 type : types) {
+        if (records.size() == capacity) {
+            break;
+        }
+        if (type < regions.size() && regions[type].size != 0) {
+            records.push_back({.type = type, .offset = regions[type].offset, .size = regions[type].size});
+        }
+    }
+    LOG_DEBUG(Service_NS, "Switch 2 fonts in order of priority: {} asked, {} found", types.size(),
+              records.size());
+    if (!records.empty()) {
+        ctx.WriteBuffer(records);
+    }
+
+    IPC::ResponseBuilder rb{ctx, 4};
+    rb.Push(ResultSuccess);
+    rb.Push<u32>(1);
+    rb.Push<u32>(static_cast<u32>(records.size()));
 }
 
 IPlatformServiceManager::~IPlatformServiceManager() {

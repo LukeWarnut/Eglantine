@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 #include "common/common_types.h"
@@ -60,5 +61,11 @@ private:
     std::unique_ptr<FileSys::NACP> nacp;
     FileSys::VirtualFile romfs;
 };
+
+/// At svcExitProcess: if an NRO started with the homebrew loader ABI returned, load the next one
+/// (its NextLoadPath, else the first NRO again) in its place, point the calling thread at its entry
+/// and return true. The menu returning without a request still exits.
+bool ContinueHomebrewChain(Core::System& system, Kernel::KProcess& process,
+                           std::span<u64, 8> args);
 
 } // namespace Loader

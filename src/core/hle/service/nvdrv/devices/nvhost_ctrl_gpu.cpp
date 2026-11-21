@@ -139,10 +139,12 @@ NvResult nvhost_ctrl_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8>
     default:
         break;
     }
-    if (nx2_caller && command.group == 'G' && command.cmd == 0x1F) {
+    // A Switch 2 driver may ask for the characteristics on another fd (ouncevk closes that one).
+    const bool nx2 = nx2_caller || g_nx2_driver;
+    if (nx2 && command.group == 'G' && command.cmd == 0x1F) {
         return Nx2GetEngineInfo(input, output, inline_output);
     }
-    if (nx2_caller) {
+    if (nx2) {
         // Switch 2 NvRm uses ioctls Switch 1 never had; answer them with a zeroed success so
         // device setup can continue, and log each one.
         LOG_WARNING(Service_NVDRV, "(STUBBED) Switch 2 ioctl={:08X} group={:01X} command={:01X}",
@@ -180,7 +182,10 @@ NvResult nvhost_ctrl_gpu::Nx2GetEngineInfo(std::span<const u8> input, std::span<
     }
     LOG_WARNING(Service_NVDRV, "(STUBBED) Switch 2 GetEngineInfo buf_size={:#x} inline_out={:#x}",
                 buf_size, inline_output.size());
-    if (buf_size >= needed && inline_output.size() >= needed) {
+    // Fill the inline buffer whenever it fits: ouncevk passes buf_size 0 with a 0x400-byte buffer
+    // and reads the items from it (leftover bytes there made it miss the graphics engine).
+    if (inline_output.size() >= needed) {
+        std::fill(inline_output.begin(), inline_output.end(), u8{0});
         std::memcpy(inline_output.data(), items.data(), needed);
     }
     std::fill(output.begin(), output.end(), u8{0});
@@ -200,17 +205,25 @@ namespace {
 // accepts chip ids 0x17E, 0x12B and 0x12E and its NVN path rejects the Maxwell ones, so report the
 // Switch 2 Ampere chip. Fields past the Switch 1 layout are left zero. Values are best guesses.
 constexpr u64 Nx2CharacteristicsSize = 0xD0;
+// The whole Switch 2 block. ouncevk asks for this much and wants it reported back.
+constexpr u64 Nx2CharacteristicsFullSize = 0xD8;
 
 template <typename GC>
 void ApplyNx2Characteristics(GC& gc) {
     gc.arch = 0x170;               // Ampere
     gc.impl = 0xE;                 // chip id 0x17E as listed in the Switch 2 NvRm chip table
     gc.num_tpc_per_gpc = 0x6;
+    // No big pages: Switch 2 address spaces map small pages only (AllocAsEx gets no VA split).
+    gc.big_page_size = 0;
+    gc.available_big_page_sizes = 0;
+    // ouncevk (the homebrew Vulkan driver) only takes the GPU when these match the console's:
+    // SPA 0x806, 0x60 warps, GPFIFO class 0xC76F and one GPC at 0x98 (set below).
     gc.sm_arch_sm_version = 0x808; // NVN2 only accepts SM 0x808 (its class table lookup)
-    gc.sm_arch_spa_version = 0x808;
+    gc.sm_arch_spa_version = 0x806;
+    gc.sm_arch_warp_count = 0x60;
     gc.threed_class = 0xC797;      // AMPERE_B
     gc.compute_class = 0xC7C0;     // AMPERE_COMPUTE_B
-    gc.gpfifo_class = 0xC56F;      // AMPERE_CHANNEL_GPFIFO_A
+    gc.gpfifo_class = 0xC76F;
     gc.dma_copy_class = 0xC7B5;    // AMPERE_DMA_COPY_B
     gc.chipname = 0x6631306167;    // "ga10f"
     gc.flags |= 0x100;             // NVGPU_GPU_FLAGS_SUPPORT_TSG: NvRm binds channels to a TSG
@@ -245,6 +258,9 @@ void ApplyNx2Characteristics(GC& gc) {
         const s16 version = 0x40;
         std::memcpy(raw + off, &version, sizeof(version));
     }
+    // GPC count in the Switch 2 layout (gr_compbit_store_base_hw in the Switch 1 one).
+    const u32 gpc_count = gc.num_gpc;
+    std::memcpy(raw + 0x98, &gpc_count, sizeof(gpc_count));
 }
 
 // Fields of the Switch 2 block past the Switch 1 layout. NvRm sizes each TSG's subcontext (VEID)
@@ -306,7 +322,8 @@ NvResult nvhost_ctrl_gpu::GetCharacteristics1(IoctlCharacteristics& params) {
 NvResult nvhost_ctrl_gpu::GetCharacteristics3(
     IoctlCharacteristics& params, std::span<IoctlGpuCharacteristics> gpu_characteristics) {
     LOG_DEBUG(Service_NVDRV, "called, buf_size={:#x}", params.gpu_characteristics_buf_size);
-    const bool nx2 = params.gpu_characteristics_buf_size >= Nx2CharacteristicsSize;
+    const u64 requested_size = params.gpu_characteristics_buf_size;
+    const bool nx2 = requested_size >= Nx2CharacteristicsSize;
 
     params.gc.arch = 0x120;
     params.gc.impl = 0xb;
@@ -350,7 +367,8 @@ NvResult nvhost_ctrl_gpu::GetCharacteristics3(
         g_nx2_driver = true;
         Tegra::g_nx2_ampere = true;
         ApplyNx2Characteristics(params.gc);
-        params.gpu_characteristics_buf_size = Nx2CharacteristicsSize;
+        params.gpu_characteristics_buf_size =
+            std::clamp(requested_size, Nx2CharacteristicsSize, Nx2CharacteristicsFullSize);
         LOG_WARNING(Service_NVDRV, "Switch 2 caller, reporting Ampere chip 0x17E");
     }
     if (!gpu_characteristics.empty()) {

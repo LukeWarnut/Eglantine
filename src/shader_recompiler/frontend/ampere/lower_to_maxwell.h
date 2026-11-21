@@ -436,9 +436,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         const auto base = [&](u64 opcode_bits) { return opcode_bits | predicate | dest; };
         // NVN2 fullscreen vertex shaders read bank 24, which the game never binds (the console reads
         // zeros from an unbound bank); Maxwell has 18, so read it from bank 17, also never bound.
+        // Banks 24-31 are the root tables. NVK (homebrew Vulkan) keeps its per-draw constants in
+        // table 7 (bank 31): read it from bank 16, past NVK's 16 constant buffers. The buffer
+        // cache streams table 0 into bank 17 and table 7 into bank 16 when they are unbound.
         const auto bank = [&]() -> u32 {
             const u32 value = insn.Bits(54, 5);
-            return value == 24 ? 17U : value;
+            return value == 24 ? 17U : value == 31 ? 16U : value;
         };
         const auto cbuf = [&]() -> u64 {
             return (u64{insn.Bits(38, 16) / 4} << 20) | (u64{bank()} << 34);
@@ -612,11 +615,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{251} << 20) | (u64{1} << 41) | (u64{7} << 48));
         };
         switch (opcode) {
-        case 0x304: { // F2F.F16.F32, scalar round-to-nearest conversion.
-            if (insn.words[2] != 0x00200800 || insn.Bits(24, 8) ||
-                (insn.words[1] & ~0xc00000ffU))
+        case 0x304: { // F2F.F16.F32 / F2F.F32.F16, scalar round-to-nearest conversion.
+            // A half source may be the register's high half (swizzle 1, as Mesa NAK encodes Yy).
+            const bool widen = insn.words[2] == 0x00101000;
+            const u32 swizzle = insn.Bits(60, 2);
+            if ((insn.words[2] != 0x00200800 && !widen) || insn.Bits(24, 8) ||
+                (insn.words[1] & ~0xf00000ffU) || swizzle > (widen ? 1U : 0U))
                 return fail(index, "native scalar float conversion mode");
-            emit(base(0x5ca8000000000000ULL) | (u64{1} << 8) | (u64{2} << 10) |
+            emit(base(0x5ca8000000000000ULL) | (u64{widen ? 2U : 1U} << 8) |
+                 (u64{widen ? 1U : 2U} << 10) | (u64{swizzle} << 41) |
                  (u64{insn.Bits(32, 8)} << 20) | (u64{insn.Bits(62, 1)} << 49) |
                  (u64{insn.Bits(63, 1)} << 45));
             break;

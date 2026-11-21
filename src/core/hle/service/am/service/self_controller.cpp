@@ -106,7 +106,7 @@ ISelfController::ISelfController(Core::System& system_, std::shared_ptr<Applet> 
 void ISelfController::GetGraphicsSupervisor(HLERequestContext& ctx) {
     // nn::gsv::BootWithRemoteMemory sends TIPC on the handle this returns.
     LOG_WARNING(Service_AM, "(STUBBED) GetGraphicsSupervisor, returning a nx2:gsv session");
-    ReturnRawSession(system, ctx, std::make_shared<INx2GraphicsSystemSession>(system));
+    ReturnCopiedRawSession(system, ctx, std::make_shared<INx2GraphicsSystemSession>(system));
 }
 
 ISelfController::~ISelfController() {

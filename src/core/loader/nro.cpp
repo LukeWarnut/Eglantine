@@ -7,29 +7,42 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
+#include <future>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "common/alignment.h"
 #include "common/common_funcs.h"
 #include "common/common_types.h"
+#include "common/fs/fs_util.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/random.h"
 #include "common/swap.h"
+#include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/romfs_factory.h"
+#include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_offset.h"
 #include "core/hle/kernel/code_set.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/svc_results.h"
+#include "core/hle/kernel/svc_types.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/nro.h"
 #include "core/memory.h"
+#include "video_core/gpu.h"
 
 #ifdef HAS_NCE
 #include "core/arm/nce/patcher.h"
@@ -152,27 +165,94 @@ static constexpr u32 PageAlignSize(u32 size) {
     return static_cast<u32>((size + Core::Memory::YUZU_PAGEMASK) & ~Core::Memory::YUZU_PAGEMASK);
 }
 
-static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
-                        const std::vector<u8>& data) {
+// The NRO's path on the emulated SD card ("sdmc:/switch/app.nro") when it is stored there. Homebrew
+// loaders pass it as argv[0], and libnx mounts the NRO's RomFS from that file.
+static std::optional<std::string> SdmcPathOf(const std::string& host_path) {
+    if (host_path.empty()) {
+        return std::nullopt;
+    }
+    std::error_code ec;
+    const auto sdmc = std::filesystem::weakly_canonical(
+        Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir), ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    const auto file = std::filesystem::weakly_canonical(Common::FS::ToU8String(host_path), ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    const auto relative = file.lexically_relative(sdmc);
+    if (relative.empty() || *relative.begin() == "..") {
+        return std::nullopt;
+    }
+    return "sdmc:/" + Common::FS::PathToUTF8String(relative.generic_u8string());
+}
+
+namespace {
+
+struct ConfigEntry {
+    u32_le key;
+    u32_le flags;
+    u64_le value[2];
+};
+static_assert(sizeof(ConfigEntry) == 0x18);
+
+constexpr u32 kEntryEndOfList = 0;
+constexpr u32 kEntryMainThreadHandle = 1;
+constexpr u32 kEntryNextLoadPath = 2;
+constexpr u32 kEntryOverrideHeap = 3;
+constexpr u32 kEntryArgv = 5;
+constexpr u32 kEntryAppletType = 7;
+constexpr u32 kAppletTypeApplication = 0;
+constexpr u32 kEntryFlagMandatory = 1;
+// AArch64 encoding for svc #0x7 (ExitProcess).
+constexpr u32 kSvcExitProcessInstruction = 0xD40000E1;
+// MainThreadHandle, AppletType, NextLoadPath, Argv, OverrideHeap (NROs after the first), EndOfList
+constexpr size_t kNumEntries = 6;
+constexpr size_t kConfigTableSize = kNumEntries * sizeof(ConfigEntry);
+// NextLoadPath buffers, sized like libnx's (hbmenu needs the entry to launch anything).
+constexpr size_t kNextLoadPathSize = 0x200;
+constexpr size_t kNextLoadArgvSize = 0x800;
+
+struct HomebrewImage {
+    Kernel::CodeSet codeset;
+    std::vector<u8> memory;
+    std::string argv; ///< NUL-terminated; empty when the image has no loader data.
+    size_t config_offset{};
+    std::optional<size_t> exit_process_offset;
+
+    size_t ArgvOffset() const {
+        return config_offset + kConfigTableSize;
+    }
+    size_t NextPathOffset() const {
+        return config_offset + Common::AlignUp(kConfigTableSize + argv.size(), 0x10);
+    }
+    size_t NextArgvOffset() const {
+        return NextPathOffset() + kNextLoadPathSize;
+    }
+};
+
+// The NRO with its .bss and, when argv is set, the homebrew loader data (config table, argv and
+// NextLoadPath buffers) after it.
+std::optional<HomebrewImage> BuildHomebrewImage(const std::vector<u8>& data, std::string argv) {
     if (data.size() < sizeof(NroHeader)) {
-        return {};
+        return std::nullopt;
     }
 
     // Read NSO header
     NroHeader nro_header{};
     std::memcpy(&nro_header, data.data(), sizeof(NroHeader));
     if (nro_header.magic != Common::MakeMagic('N', 'R', 'O', '0')) {
-        return {};
+        return std::nullopt;
     }
 
     // Build program image
-    std::vector<u8> program_image(PageAlignSize(nro_header.file_size));
-    std::memcpy(program_image.data(), data.data(), program_image.size());
-    if (program_image.size() != PageAlignSize(nro_header.file_size)) {
-        return {};
-    }
+    HomebrewImage image;
+    auto& program_image = image.memory;
+    program_image.resize(PageAlignSize(nro_header.file_size));
+    std::memcpy(program_image.data(), data.data(), (std::min)(program_image.size(), data.size()));
 
-    Kernel::CodeSet codeset;
+    auto& codeset = image.codeset;
     for (std::size_t i = 0; i < nro_header.segments.size(); ++i) {
         codeset.segments[i].addr = nro_header.segments[i].offset;
         codeset.segments[i].offset = nro_header.segments[i].offset;
@@ -184,8 +264,10 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
 
     // Read MOD header
     ModHeader mod_header{};
-    std::memcpy(&mod_header, program_image.data() + nro_header.module_header_offset,
-                sizeof(ModHeader));
+    if (nro_header.module_header_offset + sizeof(ModHeader) <= program_image.size()) {
+        std::memcpy(&mod_header, program_image.data() + nro_header.module_header_offset,
+                    sizeof(ModHeader));
+    }
 
     const bool has_mod_header{mod_header.magic == Common::MakeMagic('M', 'O', 'D', '0')};
     if (has_mod_header) {
@@ -195,47 +277,124 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
 
     codeset.DataSegment().size += bss_size;
     program_image.resize(static_cast<u32>(program_image.size()) + bss_size);
-    struct ConfigEntry {
-        u32_le key;
-        u32_le flags;
-        u64_le value[2];
-    };
-    static_assert(sizeof(ConfigEntry) == 0x18);
-    // AArch64 encoding for svc #0x7 (ExitProcess).
-    constexpr u32 kSvcExitProcessInstruction = 0xD40000E1;
-    constexpr size_t kNumEntries = 4; // MainThreadHandle, AppletType, Argv, EndOfList
-    constexpr size_t kConfigTableSize = kNumEntries * sizeof(ConfigEntry);
-    std::string argv_string;
-    size_t args_offset_in_image = 0;
-    std::optional<size_t> exit_process_offset_in_image;
-    const auto& program_args = Settings::values.program_args.GetValue();
-    if (!program_args.empty()) {
-        argv_string = "homebrew ";
-        argv_string += program_args;
-        argv_string.push_back('\0');
-
-        const auto& code = codeset.CodeSegment();
-        const size_t code_end = (std::min)(program_image.size(), code.offset + code.size);
-        for (size_t offset = code.offset; offset + sizeof(u32) <= code_end; offset += sizeof(u32)) {
-            u32 instruction{};
-            std::memcpy(&instruction, program_image.data() + offset, sizeof(instruction));
-            if (instruction == kSvcExitProcessInstruction) {
-                exit_process_offset_in_image = offset;
-                break;
-            }
-        }
-        if (!exit_process_offset_in_image) {
-            LOG_WARNING(Loader,
-                        "Unable to find svcExitProcess in NRO; returning from main may fault");
-        }
-
-        const size_t entries_and_argv =
-            Common::AlignUp(kConfigTableSize + argv_string.size(), Core::Memory::YUZU_PAGESIZE);
-
-        args_offset_in_image = program_image.size();
-        codeset.DataSegment().size += static_cast<u32>(entries_and_argv);
-        program_image.resize(args_offset_in_image + entries_and_argv);
+    if (argv.empty()) {
+        return image;
     }
+
+    image.argv = std::move(argv);
+    image.argv.push_back('\0');
+
+    const auto& code = codeset.CodeSegment();
+    const size_t code_end = (std::min)(program_image.size(), code.offset + code.size);
+    for (size_t offset = code.offset; offset + sizeof(u32) <= code_end; offset += sizeof(u32)) {
+        u32 instruction{};
+        std::memcpy(&instruction, program_image.data() + offset, sizeof(instruction));
+        if (instruction == kSvcExitProcessInstruction) {
+            image.exit_process_offset = offset;
+            break;
+        }
+    }
+    if (!image.exit_process_offset) {
+        LOG_WARNING(Loader, "Unable to find svcExitProcess in NRO; returning from main may fault");
+    }
+
+    image.config_offset = program_image.size();
+    const size_t loader_data_size =
+        Common::AlignUp(image.NextArgvOffset() + kNextLoadArgvSize - image.config_offset,
+                        Core::Memory::YUZU_PAGESIZE);
+    codeset.DataSegment().size += static_cast<u32>(loader_data_size);
+    program_image.resize(image.config_offset + loader_data_size);
+    return image;
+}
+
+void WriteLoaderConfig(Kernel::KProcess& process, const HomebrewImage& image, u64 base,
+                       u32 main_thread_handle, u64 heap_address = 0, u64 heap_size = 0) {
+    ConfigEntry entries[kNumEntries] = {
+        {kEntryMainThreadHandle, 0, {main_thread_handle, 0}},
+        {kEntryAppletType, 0, {kAppletTypeApplication, 0}},
+        {kEntryNextLoadPath, 0, {base + image.NextPathOffset(), base + image.NextArgvOffset()}},
+        {kEntryArgv, 0, {0, base + image.ArgvOffset()}},
+        {kEntryEndOfList, 0, {0, 0}},
+        {kEntryEndOfList, 0, {0, 0}},
+    };
+    if (heap_size != 0) {
+        entries[4] = {kEntryOverrideHeap, kEntryFlagMandatory, {heap_address, heap_size}};
+    }
+    auto& memory = process.GetMemory();
+    memory.WriteBlock(Common::ProcessAddress{base + image.ArgvOffset()}, image.argv.data(),
+                      image.argv.size());
+    memory.WriteBlock(Common::ProcessAddress{base + image.config_offset}, entries,
+                      sizeof(entries));
+}
+
+std::string QuoteArgument(const std::string& argument) {
+    return argument.find(' ') != std::string::npos ? '"' + argument + '"' : argument;
+}
+
+// The host file for "sdmc:/switch/app.nro", or empty when it is not on the SD card.
+std::string HostPathOfSdmc(std::string_view path) {
+    constexpr std::string_view prefix = "sdmc:/";
+    if (!path.starts_with(prefix)) {
+        return {};
+    }
+    const std::filesystem::path relative{Common::FS::ToU8String(path.substr(prefix.size()))};
+    for (const auto& part : relative) {
+        if (part == "..") {
+            return {};
+        }
+    }
+    return Common::FS::PathToUTF8String(
+        Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir) / relative.relative_path());
+}
+
+// What ounce-hbloader keeps between the NROs it runs in one process: the first one (the menu) and
+// the one running now, with its mapping and NextLoadPath buffers.
+struct HomebrewChain {
+    u64 process_id{};
+    std::string menu_path;
+    std::string menu_argv;
+    std::string current_path;
+    u64 base{};
+    size_t image_size{};
+    u64 alias_source{}; ///< Heap pages the running NRO is aliased from; 0 for the first.
+    u64 config_addr{};
+    u64 next_path_addr{};
+    u64 next_argv_addr{};
+};
+
+std::mutex g_chain_mutex;
+std::optional<HomebrewChain> g_chain;
+
+void SetChainImage(HomebrewChain& chain, const HomebrewImage& image, u64 base, size_t image_size) {
+    chain.base = base;
+    chain.image_size = image_size;
+    chain.config_addr = base + image.config_offset;
+    chain.next_path_addr = base + image.NextPathOffset();
+    chain.next_argv_addr = base + image.NextArgvOffset();
+}
+
+} // Anonymous namespace
+
+static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
+                        const std::vector<u8>& data, const std::string& host_path) {
+    // Without an SD card path or arguments, the NRO runs like an NSO and its RomFS comes from the
+    // process.
+    const auto sdmc_path = SdmcPathOf(host_path);
+    const auto& program_args = Settings::values.program_args.GetValue();
+    std::string argv;
+    if (sdmc_path || !program_args.empty()) {
+        argv = sdmc_path ? QuoteArgument(*sdmc_path) : "homebrew";
+        if (!program_args.empty()) {
+            argv += ' ';
+            argv += program_args;
+        }
+    }
+    auto image = BuildHomebrewImage(data, argv);
+    if (!image) {
+        return false;
+    }
+    auto& codeset = image->codeset;
+    auto& program_image = image->memory;
     size_t image_size = program_image.size();
 
 #ifdef HAS_NCE
@@ -295,41 +454,176 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
 #endif
 
     // Load codeset for current process
+    const u64 base = GetInteger(process.GetEntryPoint());
+    {
+        std::scoped_lock lock{g_chain_mutex};
+        g_chain.reset();
+        if (!image->argv.empty()) {
+            g_chain = HomebrewChain{
+                .process_id = process.GetProcessId(),
+                .menu_path = host_path,
+                .menu_argv = argv,
+                .current_path = host_path,
+            };
+            SetChainImage(*g_chain, *image, base, image_size);
+        }
+    }
     codeset.memory = std::move(program_image);
     process.LoadModule(system.Kernel(), std::move(codeset), process.GetEntryPoint());
-    if (!argv_string.empty()) {
-        constexpr u32 kEntryEndOfList = 0;
-        constexpr u32 kEntryMainThreadHandle = 1;
-        constexpr u32 kEntryArgv = 5;
-        constexpr u32 kEntryAppletType = 7;
-        constexpr u32 kAppletTypeApplication = 0;
-
-        const u64 base = GetInteger(process.GetEntryPoint());
-        const u64 config_addr = base + args_offset_in_image;
-        const u64 argv_addr = config_addr + kConfigTableSize;
-
-        const ConfigEntry entries[kNumEntries] = {
-            {kEntryMainThreadHandle, 0, {0, 0}}, // Value[0] patched in Run()
-            {kEntryAppletType,       0, {kAppletTypeApplication, 0}},
-            {kEntryArgv,             0, {0, argv_addr}},
-            {kEntryEndOfList,        0, {0, 0}},
-        };
-        process.GetMemory().WriteBlock(Common::ProcessAddress{config_addr}, entries, sizeof(entries));
-        process.GetMemory().WriteBlock(Common::ProcessAddress{argv_addr}, argv_string.data(), argv_string.size());
-        constexpr size_t kMainThreadHandleValueOffset = offsetof(ConfigEntry, value);
+    if (!image->argv.empty()) {
+        // The main thread handle is patched in Run().
+        WriteLoaderConfig(process, *image, base, 0);
+        const u64 config_addr = base + image->config_offset;
         process.SetArgPointer(Kernel::KProcessAddress{config_addr});
-        if (exit_process_offset_in_image) {
-            process.SetArgReturnAddress(Kernel::KProcessAddress{base + *exit_process_offset_in_image});
+        if (image->exit_process_offset) {
+            process.SetArgReturnAddress(Kernel::KProcessAddress{base + *image->exit_process_offset});
         }
-        process.SetMainThreadHandleAddr(Kernel::KProcessAddress{config_addr + kMainThreadHandleValueOffset});
+        process.SetMainThreadHandleAddr(
+            Kernel::KProcessAddress{config_addr + offsetof(ConfigEntry, value)});
     }
 
     return true;
 }
 
+bool ContinueHomebrewChain(Core::System& system, Kernel::KProcess& process,
+                           std::span<u64, 8> args) {
+    std::scoped_lock lock{g_chain_mutex};
+    if (!g_chain || g_chain->process_id != process.GetProcessId()) {
+        return false;
+    }
+    auto& chain = *g_chain;
+    auto& memory = process.GetMemory();
+
+    // As ounce-hbloader: run the NRO the last one asked for, else the menu again; the menu
+    // returning without a request ends the process.
+    std::vector<std::pair<std::string, std::string>> candidates;
+    const std::string next_path = memory.ReadCString(chain.next_path_addr, kNextLoadPathSize);
+    if (!next_path.empty()) {
+        const std::string next_argv = memory.ReadCString(chain.next_argv_addr, kNextLoadArgvSize);
+        const std::string host_path = HostPathOfSdmc(next_path);
+        if (host_path.empty()) {
+            LOG_ERROR(Loader, "Homebrew asked to load {}, which is not on the SD card", next_path);
+        } else {
+            candidates.emplace_back(host_path,
+                                    next_argv.empty() ? QuoteArgument(next_path) : next_argv);
+        }
+    }
+    if (chain.current_path != chain.menu_path) {
+        candidates.emplace_back(chain.menu_path, chain.menu_argv);
+    }
+    if (candidates.empty()) {
+        return false;
+    }
+    if (Settings::IsNceEnabled()) {
+        LOG_WARNING(Loader, "Loading the next NRO in place is not supported with NCE");
+        return false;
+    }
+
+    std::optional<HomebrewImage> image;
+    std::string path;
+    for (const auto& [candidate, candidate_argv] : candidates) {
+        const auto file = system.GetFilesystem()->OpenFile(candidate, FileSys::OpenMode::Read);
+        image = file ? BuildHomebrewImage(file->ReadAllBytes(), candidate_argv) : std::nullopt;
+        if (image) {
+            path = candidate;
+            break;
+        }
+        LOG_ERROR(Loader, "Unable to load the homebrew NRO {}", candidate);
+    }
+    if (!image) {
+        return false;
+    }
+    LOG_INFO(Loader, "Homebrew loader: running {} with argv {}", path,
+             std::string_view{image->argv}.substr(0, image->argv.size() - 1));
+
+    const u32 main_thread_handle =
+        memory.Read32(chain.config_addr + offsetof(ConfigEntry, value));
+    auto& page_table = process.GetPageTable();
+
+    // Let the GPU thread run what the previous NRO queued: its unmaps flush GPU data back into
+    // the memory it used.
+    std::promise<void> gpu_done;
+    system.GPU().RunInOrder([&gpu_done] { gpu_done.set_value(); });
+    gpu_done.get_future().wait();
+
+    // Unmap the previous NRO, unless it is the one the process started with.
+    if (chain.alias_source != 0) {
+        const Result result =
+            page_table.UnmapCodeMemory(chain.base, chain.alias_source, chain.image_size);
+        if (R_FAILED(result)) {
+            LOG_WARNING(Loader, "Unable to unmap the previous NRO at {:#x}+{:#x}: {:#x}",
+                        chain.base, chain.image_size, result.raw);
+        }
+    }
+    for (size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+        if (auto* const arm = process.GetArmInterface(core); arm != nullptr) {
+            arm->InvalidateCacheRange(chain.base, chain.image_size);
+        }
+    }
+
+    // As ounce-hbloader: load the NRO into the top of the heap, alias that as code and give the
+    // rest of the heap to it. The process has no memory left for new pages once libnx has sized
+    // its heap, and the first mapping cannot be reused: crt0 locks its RELRO read-only.
+    const u64 heap_address = GetInteger(page_table.GetHeapRegionStart());
+    const u64 heap_size = page_table.GetCurrentHeapSize();
+    const size_t image_size = image->memory.size();
+    const auto find_free = [&]() -> u64 {
+        const u64 region = GetInteger(page_table.GetAliasCodeRegionStart());
+        const u64 region_end = region + page_table.GetAliasCodeRegionSize();
+        for (u64 address = region; address < region_end;) {
+            Kernel::KMemoryInfo info{};
+            Kernel::Svc::PageInfo page_info{};
+            if (R_FAILED(page_table.QueryInfo(std::addressof(info), std::addressof(page_info),
+                                              address))) {
+                break;
+            }
+            const u64 end = (std::min)(region_end, info.m_address + info.m_size);
+            if (info.m_state == Kernel::KMemoryState::Free && end - address >= image_size) {
+                return address;
+            }
+            address = end;
+        }
+        return 0;
+    };
+    const u64 base = heap_size > image_size ? find_free() : 0;
+    const u64 alias_source = heap_address + heap_size - image_size;
+    const Result result = base == 0 ? Kernel::ResultOutOfMemory
+                                    : page_table.MapCodeMemory(base, alias_source, image_size);
+    if (R_FAILED(result)) {
+        LOG_ERROR(Loader, "Unable to map {:#x} bytes for {} (heap {:#x}): {:#x}", image_size, path,
+                  heap_size, result.raw);
+        g_chain.reset();
+        return false;
+    }
+    chain.current_path = path;
+    chain.alias_source = alias_source;
+    SetChainImage(chain, *image, base, image_size);
+    image->codeset.memory = std::move(image->memory);
+    process.LoadModule(system.Kernel(), std::move(image->codeset), Kernel::KProcessAddress{base});
+    for (size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+        if (auto* const arm = process.GetArmInterface(core); arm != nullptr) {
+            arm->InvalidateCacheRange(base, image_size);
+        }
+    }
+    WriteLoaderConfig(process, *image, base, main_thread_handle, heap_address,
+                      heap_size - image_size);
+
+    // Enter it on this thread, with the stack libnx restored before returning to the loader.
+    auto* const arm = process.GetArmInterface(system.Kernel().CurrentPhysicalCoreIndex());
+    Kernel::Svc::ThreadContext context{};
+    arm->GetContext(context);
+    context.pc = base;
+    context.lr = image->exit_process_offset ? base + *image->exit_process_offset : 0;
+    context.sp &= ~u64{0xF};
+    arm->SetContext(context);
+    args[0] = chain.config_addr;
+    args[1] = UINT64_MAX;
+    return true;
+}
+
 bool AppLoader_NRO::LoadNro(Core::System& system, Kernel::KProcess& process,
                             const FileSys::VfsFile& nro_file) {
-    return LoadNroImpl(system, process, nro_file.ReadAllBytes());
+    return LoadNroImpl(system, process, nro_file.ReadAllBytes(), nro_file.GetFullPath());
 }
 
 AppLoader_NRO::LoadResult AppLoader_NRO::Load(Kernel::KProcess& process, Core::System& system) {

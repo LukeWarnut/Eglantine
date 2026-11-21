@@ -334,11 +334,14 @@ ALLOC_MEMBER(VaType)::Allocate(VaType size) {
 
     if (alloc_start != UnmappedVa) {
         current_linear_alloc_end = alloc_start + size;
-    } else { // If linear allocation overflows the AS then find a gap
-        if (this->blocks.size() <= 2) {
-            ASSERT_MSG(false, "Unexpected allocator state!");
+    } else if (this->blocks.size() <= 2) {
+        // Everything was freed (only the sentinel blocks are left): start again at the bottom.
+        if (size > this->va_limit - virt_start) {
+            return {};
         }
-
+        alloc_start = virt_start;
+        current_linear_alloc_end = alloc_start + size;
+    } else { // If linear allocation overflows the AS then find a gap
         auto search_predecessor{std::next(this->blocks.begin())};
         auto search_successor{std::next(search_predecessor)};
 

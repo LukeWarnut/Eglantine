@@ -25,6 +25,7 @@
 #include <atomic>
 #include <deque>
 #include <map>
+#include <unordered_map>
 #include <optional>
 #include <memory>
 #include <mutex>
@@ -137,13 +138,56 @@ inline void TipcHandshake(HLERequestContext& ctx, std::string_view session) {
     TipcReplyWords(ctx, {w[2], w[3]});
 }
 
-// Replies with success and a copied handle to a new session served by `iface`.
+// Replies with success and a moved handle to a new session served by `iface`. The handle lands at
+// word 3 and the result at word 4 either way, but clients that parse the special header (libounce)
+// look for a move handle.
 template <class T>
 inline void ReturnRawSession(Core::System& system, HLERequestContext& ctx, std::shared_ptr<T> iface) {
+    auto* client = CreateRawSession(system, ctx, std::move(iface));
+    IPC::ResponseBuilder rb{ctx, 2, 0, 1, IPC::ResponseBuilder::Flags::AlwaysMoveHandles};
+    rb.Push(ResultSuccess);
+    rb.PushMoveObjects(ctx, *client);
+}
+
+// The same with a copied handle, for CMIF commands whose callers expect one
+// (ISelfController::GetGraphicsSupervisor: SDK titles abort with 2162-0001 on a moved handle).
+template <class T>
+inline void ReturnCopiedRawSession(Core::System& system, HLERequestContext& ctx,
+                                   std::shared_ptr<T> iface) {
     auto* client = CreateRawSession(system, ctx, std::move(iface));
     IPC::ResponseBuilder rb{ctx, 2, 1, 0};
     rb.Push(ResultSuccess);
     rb.PushCopyObjects(ctx, *client);
+}
+
+// Replies with success and moved handles to objects the service keeps, the way the Switch 2
+// servers return events (handles from word 3, then the result).
+inline void ReplyMovedHandles(Core::System& system, HLERequestContext& ctx,
+                              std::initializer_list<Kernel::KAutoObject*> objects) {
+    IPC::ResponseBuilder rb{ctx, 2, 0, static_cast<u32>(objects.size()),
+                            IPC::ResponseBuilder::Flags::AlwaysMoveHandles};
+    rb.Push(ResultSuccess);
+    for (auto* object : objects) {
+        // Moving drops a reference: give the client its own.
+        object->Open(system.Kernel());
+        ctx.AddMoveObject(object);
+    }
+}
+
+// Syncpoints behind 64-bit counters (vi2 buffer releases): nx2:syncpt 103 reports them in mode 1,
+// like the NativeSyncHandle the present hands out. GPU syncpoints are 32-bit (mode 0).
+inline std::array<std::atomic<bool>, 192> g_nx2_wide_counters{};
+
+// libounce's GPU runtime (ouncevk) only accepts present releases on display counters, SyncCounterIds
+// 0xC0-0x11F past the GPU syncpoints. A vi2 session that creates its layer itself (TIPC 201, which
+// SDK titles never send) gets release id 0xC0 + its host syncpoint; the syncpt service maps it back.
+constexpr u32 Nx2DisplayCounterBase = 0xC0;
+constexpr u32 Nx2DisplayCounterCount = 0x60;
+inline u32 Nx2HostSyncpointOf(u32 counter) {
+    const u32 host = counter - Nx2DisplayCounterBase;
+    return counter >= Nx2DisplayCounterBase && host < Nx2DisplayCounterCount && g_nx2_wide_counters[host]
+               ? host
+               : counter;
 }
 
 // Placeholder for the Switch 2 NVIDIA driver server (nn::nvsrv). It has no handlers, so every
@@ -207,12 +251,13 @@ private:
 
     // From changes.patch: the counter is the bitwise NOT of the host1x syncpoint id.
     void QueryCounter(HLERequestContext& ctx) {
-        const u32 syncpoint = ~ctx.CommandBuffer()[2];
+        const u32 syncpoint = Nx2HostSyncpointOf(~ctx.CommandBuffer()[2]);
         const u64 value = syncpoint < HostSyncpoints
                               ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(syncpoint)
                               : 0;
         LOG_DEBUG(Service, "nx2:syncpt 103 syncpoint={} value={:#x}", syncpoint, value);
-        TipcReplyWords(ctx, {static_cast<u32>(value), static_cast<u32>(value >> 32), 0});
+        const u32 mode = syncpoint < HostSyncpoints && g_nx2_wide_counters[syncpoint] ? 1 : 0;
+        TipcReplyWords(ctx, {static_cast<u32>(value), static_cast<u32>(value >> 32), mode});
     }
 
     void GetSlotEvent(HLERequestContext& ctx) {
@@ -222,9 +267,7 @@ private:
         if (event == nullptr) {
             event = m_context.CreateEvent(fmt::format("nx2:syncpt:Slot{:x}", slot));
         }
-        IPC::ResponseBuilder rb{ctx, 2, 1, 0};
-        rb.Push(ResultSuccess);
-        rb.PushCopyObjects(ctx, event->GetReadableEvent());
+        ReplyMovedHandles(system, ctx, {&event->GetReadableEvent()});
     }
 
     // Map nodes are stable, so a registered action can hold a reference to its request.
@@ -244,7 +287,7 @@ private:
     void RequestSlotEvent(HLERequestContext& ctx) {
         const auto* cmd_buf = ctx.CommandBuffer();
         const u32 slot = cmd_buf[2];
-        const u32 syncpoint = ~cmd_buf[3];
+        const u32 syncpoint = Nx2HostSyncpointOf(~cmd_buf[3]);
         const u64 value = u64{cmd_buf[4]} | (u64{cmd_buf[5]} << 32);
         const u32 mode = cmd_buf[6];
         LOG_DEBUG(Service, "nx2:syncpt TIPC 201 slot={:#x} syncpoint={} value={:#x} mode={}", slot,
@@ -406,9 +449,7 @@ private:
     void GetIdEvent(HLERequestContext& ctx) {
         const u32 id = ctx.CommandBuffer()[2];
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 12 id={}", id);
-        IPC::ResponseBuilder rb{ctx, 2, 1, 0};
-        rb.Push(ResultSuccess);
-        rb.PushCopyObjects(ctx, EventFor(id)->GetReadableEvent());
+        ReplyMovedHandles(system, ctx, {&EventFor(id)->GetReadableEvent()});
     }
 
     void Start(HLERequestContext& ctx) {
@@ -428,14 +469,15 @@ private:
     // none) and the GPU VA range of the in-process VirtualMachine that serves AllocSpace
     // (nn::gpu::sdk::util::ExecuteVirtualMachineAllocSpace). NVN reserves fixed VA from 0x8000000
     // up to 512 GiB, so report the same range NvRm gives AllocAsEx: [0x8000000, 0xC000000000).
+    // The range is first and last address: libounce's GPU runtime only accepts 0xBFFFFFFFFF.
     void GetVaRange(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 203 [2]={:#x}", ctx.CommandBuffer()[2]);
         constexpr u64 kind = 1;
-        constexpr u64 start = 0x8000000ULL;
-        constexpr u64 size = 0xC000000000ULL - start;
+        constexpr u64 first = 0x8000000ULL;
+        constexpr u64 last = 0xC000000000ULL - 1;
         TipcReplyWords(ctx, {static_cast<u32>(kind), static_cast<u32>(kind >> 32),
-                             static_cast<u32>(start), static_cast<u32>(start >> 32),
-                             static_cast<u32>(size), static_cast<u32>(size >> 32)});
+                             static_cast<u32>(first), static_cast<u32>(first >> 32),
+                             static_cast<u32>(last), static_cast<u32>(last >> 32)});
     }
 
     // Newer SDKs (title 1) query the address space's user and gsv partitions with 201/202(id):
@@ -549,8 +591,8 @@ private:
             LOG_WARNING(Service, "nx2:gpu 211 map of unknown handle {}", handle);
         }
         EventFor(slot)->Signal(system.Kernel());
-        IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(ResultSuccess);
+        // Word 12 is the wanted kind; reply the kind applied, like 212 (libounce checks it).
+        TipcReplyWords(ctx, {cmd_buf[12] & 0xff});
     }
 
     // Sub 212 (nn::gpu::sdk::NormalModifyMemoryKind4K, behind NvRmGpuMappingModify): word 2 the
@@ -1612,9 +1654,7 @@ private:
         if (event == nullptr) {
             event = m_context.CreateEvent(fmt::format("nx2:chat:gsv:Event{}", id));
         }
-        IPC::ResponseBuilder rb{ctx, 2, 1, 0};
-        rb.Push(ResultSuccess);
-        rb.PushCopyObjects(ctx, event->GetReadableEvent());
+        ReplyMovedHandles(system, ctx, {&event->GetReadableEvent()});
     }
 
     KernelHelpers::ServiceContext m_context;
@@ -1735,10 +1775,11 @@ public:
           m_objects{std::move(objects_)} {
         RegisterHandlersTipc({
             {0, &INx2Vi2Session::Handshake, "Handshake"},
-            {1, &INx2Vi2Session::ReturnOne, "Unknown1"},
+            {1, &INx2Vi2Session::GetNotificationCapacity, "GetNotificationCapacity (guessed)"},
             {3, &INx2Vi2Session::ReturnOne, "GetDisplayCount (guessed)"},
             {5, &INx2Vi2Session::GetTimestampRecorderCount, "GetTimestampRecorderCount (guessed)"},
             {11, &INx2Vi2Session::ReturnEvent, "Unknown11"},
+            {21, &INx2Vi2Session::CollectNotifications, "CollectNotifications (libounce)"},
             {31, &INx2Vi2Session::AcquireNativeEvent, "AcquireNativeEvent"},
             {32, &INx2Vi2Session::DuplicateNativeEvent, "DuplicateNativeEvent"},
             {261, &INx2Vi2Session::BindVsync, "BindDisplayVsyncEvent"},
@@ -1766,14 +1807,15 @@ public:
             // Firmware commands without a known meaning: zeroed replies.
             {13, &INx2Vi2Session::StubReplyZeroed, "Unknown13"},
             {51, &INx2Vi2Session::StubReplyZeroed, "Unknown51"},
-            {101, &INx2Vi2Session::StubReplyZeroed, "Unknown101"},
-            {102, &INx2Vi2Session::StubReplyZeroed, "Unknown102"},
+            {101, &INx2Vi2Session::OpenDisplay, "OpenDisplay (libounce)"},
+            {102, &INx2Vi2Session::CloseDisplay, "CloseDisplay (libounce)"},
             {107, &INx2Vi2Session::StubReplyZeroed, "Unknown107"},
             {108, &INx2Vi2Session::StubReplyZeroed, "Unknown108"},
             {111, &INx2Vi2Session::StubReplyZeroed, "Unknown111"},
             {112, &INx2Vi2Session::StubReplyZeroed, "Unknown112"},
             {113, &INx2Vi2Session::StubReplyZeroed, "Unknown113"},
-            {202, &INx2Vi2Session::StubReplyZeroed, "Unknown202"},
+            {201, &INx2Vi2Session::CreateLayer, "CreateLayer (libounce)"},
+            {202, &INx2Vi2Session::CloseLayer, "CloseLayer (libounce)"},
             {230, &INx2Vi2Session::StubReplyZeroed, "Unknown230"},
             {231, &INx2Vi2Session::StubReplyZeroed, "Unknown231"},
             {232, &INx2Vi2Session::StubReplyZeroed, "Unknown232"},
@@ -1810,6 +1852,9 @@ public:
             auto& syncpoints = system.Host1x().GetSyncpointManager();
             while (syncpoints.GetGuestSyncpointValue(m_release_syncpoint) != m_release_value) {
                 syncpoints.IncrementGuest(m_release_syncpoint);
+            }
+            if (m_release_syncpoint < g_nx2_wide_counters.size()) {
+                g_nx2_wide_counters[m_release_syncpoint] = false;
             }
             NvdrvSyncpoints().FreeSyncpoint(m_release_syncpoint);
         }
@@ -2049,11 +2094,14 @@ private:
             .GetSyncpointManager();
     }
 
-    /// Returns the NativeSyncHandle {~syncpoint, 0, value, 0} of a fence signalled when this frame's
+    /// Returns the NativeSyncHandle {~syncpoint, 1, value, 0} of a fence signalled when this frame's
     /// swap interval has passed after the previous one (at once when the game is slower).
     std::array<u32, 4> QueueRelease(u32 timing) {
         if (m_release_syncpoint == ~0U) {
             m_release_syncpoint = NvdrvSyncpoints().AllocateSyncpoint(true);
+            if (m_release_syncpoint < g_nx2_wide_counters.size()) {
+                g_nx2_wide_counters[m_release_syncpoint] = true;
+            }
             m_release_value = system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(
                 m_release_syncpoint);
             m_release_timer = Core::Timing::CreateEvent(
@@ -2082,10 +2130,18 @@ private:
         m_release_time = interval.count() == 0 ? now : (std::max)(now, m_release_time);
         system.CoreTiming().ScheduleEvent(m_release_time, m_release_timer, true);
         m_release_time += interval;
-        return {~m_release_syncpoint, 0, ++m_release_value, 0};
+        // Mode 1 (64-bit compare): libounce's CPU window refuses a release in any other mode.
+        const u32 counter = m_display_counter_ids && m_release_syncpoint < Nx2DisplayCounterCount
+                                ? Nx2DisplayCounterBase + m_release_syncpoint
+                                : m_release_syncpoint;
+        return {~counter, 1, ++m_release_value, 0};
     }
 
     u32 m_release_syncpoint{~0U};
+    bool m_display_counter_ids{};
+    static constexpr u32 Nx2Vi2NotificationCount = 0x400;
+    std::array<u32, Nx2Vi2NotificationCount / 32> m_notifications{};
+    std::unordered_map<u64, u32> m_notification_of; ///< Display name or layer token -> index
     u32 m_release_value{};
     std::chrono::nanoseconds m_release_time{};
     std::shared_ptr<Core::Timing::EventType> m_release_timer;
@@ -2780,6 +2836,83 @@ private:
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots), static_cast<u32>(AvailableSlots >> 32)});
     }
 
+    bool IsHomebrewCaller() const {
+        const auto* const process = system.ApplicationProcess();
+        return process == nullptr || !process->IsSwitch2();
+    }
+
+    // libounce completes 101/102/201/202 through notification indexes: the service sets the
+    // command's index in a bitmap, signals the event from 11 and hands the bitmap out with 21.
+    // Closing a display or layer waits for its index. Kept to homebrew (SDK titles send these
+    // commands too, with unverified layouts).
+    void PostNotification(u32 index) {
+        if (index >= Nx2Vi2NotificationCount) {
+            return;
+        }
+        m_notifications[index / 32] |= 1U << (index % 32);
+        for (auto* const event : m_events) {
+            event->Signal(system.Kernel());
+        }
+    }
+
+    // 101(u64 name, u32 index)
+    void OpenDisplay(HLERequestContext& ctx) {
+        if (IsHomebrewCaller()) {
+            const auto* w = ctx.CommandBuffer();
+            m_notification_of[w[2] | (u64{w[3]} << 32)] = w[4];
+        }
+        StubReplyZeroed(ctx);
+    }
+
+    // 102(u64 name)
+    void CloseDisplay(HLERequestContext& ctx) {
+        CloseNotified(ctx);
+    }
+
+    // 201(u64 token, u32 destroy index, u32 availability index). SDK titles send 201 as well; only
+    // homebrew gets the display counter ids.
+    void CreateLayer(HLERequestContext& ctx) {
+        m_display_counter_ids = IsHomebrewCaller();
+        if (m_display_counter_ids) {
+            const auto* w = ctx.CommandBuffer();
+            m_notification_of[w[2] | (u64{w[3]} << 32)] = w[4];
+        }
+        StubReplyZeroed(ctx);
+    }
+
+    // 202(u64 token)
+    void CloseLayer(HLERequestContext& ctx) {
+        CloseNotified(ctx);
+    }
+
+    void CloseNotified(HLERequestContext& ctx) {
+        if (IsHomebrewCaller()) {
+            const auto* w = ctx.CommandBuffer();
+            if (const auto it = m_notification_of.find(w[2] | (u64{w[3]} << 32));
+                it != m_notification_of.end()) {
+                const u32 index = it->second;
+                m_notification_of.erase(it);
+                StubReplyZeroed(ctx);
+                PostNotification(index);
+                return;
+            }
+        }
+        StubReplyZeroed(ctx);
+    }
+
+    // 21(out buffer 0x80): the completed notification indexes as a bitmap, cleared on read.
+    void CollectNotifications(HLERequestContext& ctx) {
+        ctx.WriteBufferB(m_notifications.data(), sizeof(m_notifications), 0);
+        m_notifications.fill(0);
+        TipcReplyWords(ctx, std::span<const u32>{});
+    }
+
+    // How many notification indexes commands may name (the SDK requires < 0x400). libounce numbers
+    // its outstanding commands with them and a display plus a layer hold three, so 1 stalled it.
+    void GetNotificationCapacity(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {0x3ff});
+    }
+
     void ReturnOne(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:vi2 TIPC {}, returning 1", ctx.GetCommand());
         TipcReplyWords(ctx, {1});
@@ -2819,9 +2952,7 @@ private:
                     ctx.GetCommand(), ctx.CommandBuffer()[2], ctx.CommandBuffer()[3]);
         auto* event = m_context.CreateEvent(fmt::format("nx2:vi2:Event{}", m_events.size()));
         m_events.push_back(event);
-        IPC::ResponseBuilder rb{ctx, 2, 1, 0};
-        rb.Push(ResultSuccess);
-        rb.PushCopyObjects(ctx, event->GetReadableEvent());
+        ReplyMovedHandles(system, ctx, {&event->GetReadableEvent()});
     }
 
     // 31(u32 index < 8): the session's event for that slot (the sdk picks a free index). The
@@ -2905,9 +3036,7 @@ private:
             SetVsyncSlot(index, true);
             StartVsyncTimer();
         }
-        IPC::ResponseBuilder rb{ctx, 2, 1, 0};
-        rb.Push(ResultSuccess);
-        rb.PushCopyObjects(ctx, event->GetReadableEvent());
+        ReplyMovedHandles(system, ctx, {&event->GetReadableEvent()});
     }
 
     void SetVsyncSlot(u32 index, bool on) {
@@ -3221,9 +3350,7 @@ private:
             system.CoreTiming().ScheduleLoopingEvent(ReadyInterval, ReadyInterval, m_ready_timer);
         }
         m_event->Signal(system.Kernel());
-        IPC::ResponseBuilder rb{ctx, 2, 1, 0};
-        rb.Push(ResultSuccess);
-        rb.PushCopyObjects(ctx, m_event->GetReadableEvent());
+        ReplyMovedHandles(system, ctx, {&m_event->GetReadableEvent()});
     }
 
     // Queues an output image for the next decoded frame; returns the NativeSyncHandle words that
@@ -4067,10 +4194,8 @@ private:
             m_syncpt_events[0] = m_context.CreateEvent("nx2:gsv:SyncptRequest");
             m_syncpt_events[1] = m_context.CreateEvent("nx2:gsv:SyncptNotify");
         }
-        IPC::ResponseBuilder rb{ctx, 2, 2, 0};
-        rb.Push(ResultSuccess);
-        rb.PushCopyObjects(ctx, *m_syncpt_events[0]); // signalled by the client
-        rb.PushCopyObjects(ctx, m_syncpt_events[1]->GetReadableEvent());
+        // The first is signalled by the client.
+        ReplyMovedHandles(system, ctx, {m_syncpt_events[0], &m_syncpt_events[1]->GetReadableEvent()});
     }
 
     // Mirrors Eden's guest syncpoint values into the shared RO page. Returns true if any changed.
@@ -4529,6 +4654,10 @@ private:
         // 13 = SetGraphicsFirmwareMemoryMarginEnabled), so serve it with Eden's nvdrv on the shared
         // module. The nx2: name keeps unknown commands auto-stubbed and logged.
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 1402, returning an nvdrv-backed nx2:nvsrv session");
+        // Only Switch 2 drivers open nvsrv. NVN also reports itself through GetCharacteristics,
+        // but libounce's CPU window never asks, and its address space must still follow the
+        // native memory it maps (presents look images up by device address).
+        Nvidia::Devices::g_nx2_driver = true;
         auto module = system.ServiceManager().GetService<Nvidia::NVDRV>("nvdrv", true)->GetModule();
         auto nvsrv = std::make_shared<Nvidia::NVDRV>(system, module, "nx2:nvsrv");
         nvsrv->InitializeForProcess(ctx.GetThread().GetOwnerProcess());

@@ -64,6 +64,24 @@ void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method,
         DrawTexture(maxwell3d);
         break;
     }
+    case Maxwell3D::Regs::DrawIndexBeginEndB:
+    case Maxwell3D::Regs::DrawVertexBeginEndB: {
+        const auto& reg = maxwell3d.regs;
+        const u32 control = reg.reg_array[Maxwell3D::Regs::DrawControlA];
+        const auto topology = static_cast<Maxwell3D::Regs::PrimitiveTopology>(control & 0xf);
+        const u32 base_instance = (control & (1U << 9)) != 0 ? 0 : reg.global_base_instance_index;
+        const u32 instances = reg.reg_array[Maxwell3D::Regs::DrawControlB];
+        if (method == Maxwell3D::Regs::DrawIndexBeginEndB) {
+            const u32 base_vertex = (control & (1U << 10)) != 0 ? 0 : reg.global_base_vertex_index;
+            maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+            DrawIndex(maxwell3d, topology, reg.reg_array[Maxwell3D::Regs::DrawIndexBeginEndA],
+                      argument, base_vertex, base_instance, instances);
+        } else {
+            DrawArray(maxwell3d, topology, reg.reg_array[Maxwell3D::Regs::DrawVertexBeginEndA],
+                      argument, base_instance, instances);
+        }
+        break;
+    }
     default:
         break;
     }

@@ -20,6 +20,7 @@
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/kernel_helpers.h"
+#include "core/loader/nro.h"
 #include "video_core/nx2_spikes.h"
 
 namespace Kernel::Svc {
@@ -2554,7 +2555,10 @@ void Call(Core::System& system, u32 imm) {
             LOG_INFO(Kernel_SVC, "svc 0x18 t{} waits on{}", GetCurrentThread(kernel).GetThreadId(), list);
         }
     }
-    if (imm == 0x80) {
+    if (imm == static_cast<u32>(SvcId::ExitProcess) && process.Is64Bit() &&
+        Loader::ContinueHomebrewChain(system, process, args)) {
+        // A homebrew NRO returned to the loader, which started the next one on this thread.
+    } else if (imm == 0x80) {
         // Switch 2 only: svcSetGpuMemoryAttribute(address, size, mask, attr). nn::gpu::sdk and
         // nn::gs native memory set the new "GPU accessible" attribute (0x20) before registering
         // memory with the GPU and clear it on destruction; NVN can see it through QueryMemory.

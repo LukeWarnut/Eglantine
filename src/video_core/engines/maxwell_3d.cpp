@@ -178,6 +178,8 @@ bool Maxwell3D::IsMethodExecutable(u32 method) {
     case MAXWELL3D_REG_INDEX(vertex_array_instance_first):
     case MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent):
     case MAXWELL3D_REG_INDEX(draw_texture.src_y0):
+    case Regs::DrawIndexBeginEndB:
+    case Regs::DrawVertexBeginEndB:
     case RootTables::SelectMethod:
     case RootTables::LoadMethod:
     case MAXWELL3D_REG_INDEX(wait_for_idle):
@@ -391,6 +393,7 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
         if (root_tables.offset < 256 && root_tables.offset % 4 == 0) {
             root_tables.tables[root_tables.selected][root_tables.offset / 4] = argument;
             root_tables.loaded = true;
+            root_tables.loaded_mask |= 1U << root_tables.selected;
         }
         root_tables.offset += 4;
         return;
@@ -1405,6 +1408,8 @@ bool FrontSkipSame() {
     case MAXWELL3D_REG_INDEX(vertex_array_instance_first):
     case MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent):
     case MAXWELL3D_REG_INDEX(draw_texture.src_y0):
+    case Maxwell3D::Regs::DrawIndexBeginEndB:
+    case Maxwell3D::Regs::DrawVertexBeginEndB:
         return true;
     default:
         return false;

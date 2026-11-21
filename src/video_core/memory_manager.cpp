@@ -401,10 +401,12 @@ template <typename T>
 T MemoryManager::Read(GPUVAddr addr) const {
     if constexpr (sizeof(T) == sizeof(u32)) {
         const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
-        if (shim && addr >= shim && addr - shim < NumShimSyncpoints * sizeof(u32) &&
-            Common::IsAligned(addr - shim, sizeof(u32))) {
+        if (shim && addr >= shim && addr - shim < ShimSize) {
+            if ((addr - shim) % ShimSyncpointStride != 0) {
+                return {};
+            }
             return static_cast<T>(system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(
-                static_cast<u32>((addr - shim) / sizeof(u32))));
+                static_cast<u32>((addr - shim) / ShimSyncpointStride)));
         }
     }
 
@@ -425,7 +427,7 @@ T MemoryManager::Read(GPUVAddr addr) const {
 
 u32 MemoryManager::ReadU32(GPUVAddr addr, ReadPageCache& cache) const {
     const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
-    if (shim && addr >= shim && addr - shim < NumShimSyncpoints * sizeof(u32)) {
+    if (shim && addr >= shim && addr - shim < ShimSize) {
         return Read<u32>(addr);
     }
     const GPUVAddr offset = addr & (page_size - 1);
@@ -642,8 +644,7 @@ void MemoryManager::ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer,
 void MemoryManager::ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_t count) const {
     const std::size_t size = count * sizeof(u32);
     const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
-    if (shim && gpu_src_addr < shim + NumShimSyncpoints * sizeof(u32) &&
-        gpu_src_addr + size > shim) {
+    if (shim && gpu_src_addr < shim + ShimSize && gpu_src_addr + size > shim) {
         for (std::size_t i = 0; i < count; ++i) {
             dest[i] = Read<u32>(gpu_src_addr + i * sizeof(u32));
         }
