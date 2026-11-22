@@ -326,7 +326,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             // RET, BRA, NOP and ISETP/FSETP (predicate outputs) have no destination GPR; bits 16..23
             // are not a write to R0. IMAD.WIDE writes a register pair.
-            const bool no_destination = opcode == 0x950 || opcode == 0x947 || opcode == 0x918 ||
+            const bool no_destination = opcode == 0x950 || opcode == 0x947 || opcode == 0x547 ||
+                                        opcode == 0x918 ||
                                         (opcode & 0x1ff) == 0x00c || (opcode & 0x1ff) == 0x00b;
             const bool pair = opcode == 0x225 || opcode == 0x625 || opcode == 0x825;
             if (active_link && !no_destination &&
@@ -1181,6 +1182,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             break;
         }
         case 0x899: { // USHF.L.U32; accept a zero word outside the selected half.
+            // .W (bit 75, Mesa NAK) changes nothing for an immediate below 32: match without it.
+            if (insn.Bits(75, 1) && insn.words[1] < 32) insn.words[2] &= ~0x800U;
             const u32 dst = insn.Bits(16, 8), low = insn.Bits(24, 8), high = insn.Bits(64, 8);
             const u32 dst_reg = uniform_register(dst), low_reg = uniform_register(low);
             const u32 high_reg = uniform_register(high);
@@ -2135,7 +2138,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             opcode = 0x305;
             [[fallthrough]];
         case 0x305: case 0xb05: case 0xd05: { // F2I NTZ, register/constant-buffer/uniform source
-            const u32 mode = insn.words[2] & ~(opcode == 0xd05 ? 0x08000000U : 0U);
+            // .NTZ (bit 77, NaN to zero) is set by NVN and left clear by Mesa NAK; the forms below
+            // are matched with it set, and the lowering converts NaN the same either way.
+            const u32 mode = (insn.words[2] & ~(opcode == 0xd05 ? 0x08000000U : 0U)) | 0x2000U;
             // F16 source: bit 72 signs the result as in the other forms, bits 60-61 pick H0/H1.
             const bool half = opcode == 0x305 && (mode & ~0x100U) == 0x0010f000;
             const bool small = mode == 0x00212800;
@@ -2539,7 +2544,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                         if (op == 0x94d || op == 0x950 || op == 0x944 || op == 0x943) {
                             break;
                         }
-                        if (op == 0x947 || op == 0x945 || op == 0x918 || op == 0x91a ||
+                        if (op == 0x947 || op == 0x547 || op == 0x945 || op == 0x918 || op == 0x91a ||
                             (op & 0x1ff) == 0x00c || (op & 0x1ff) == 0x00b) {
                             continue;
                         }
@@ -2902,21 +2907,25 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             break;
         }
         case 0x223: case 0x423: case 0x623: case 0x823: case 0xa23: case 0xc23: case 0xe23: { // FFMA
-            if (insn.Bits(76, 1) || (insn.Bits(81, 11) & ~(opcode == 0xe23 || opcode == 0xc23 ? 0x400U : 0U))) return fail(index, "native FFMA denormal/source mode");
+            // .DNZ (bit 76) as Maxwell's .FMZ (2 at 53-54), like FMUL's.
+            if (insn.Bits(81, 11) & ~(opcode == 0xe23 || opcode == 0xc23 ? 0x400U : 0U)) return fail(index, "native FFMA denormal/source mode");
             const u32 a = operand(0), b = operand(1), c = operand(2);
             emit(base(0x5980000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) | (u64{c} << 39) |
-                (u64{insn.Bits(77, 1)} << 50) | (u64{insn.Bits(78, 2)} << 51) | (u64{insn.Bits(80, 1)} << 53));
+                (u64{insn.Bits(77, 1)} << 50) | (u64{insn.Bits(78, 2)} << 51) |
+                (u64{insn.Bits(76, 1) ? 2U : insn.Bits(80, 1)} << 53));
             break;
         }
         case 0x220: case 0x820: case 0xa20: case 0xc20: { // FMUL
+            // .DNZ (bit 76, Mesa NAK): anything times zero is zero, Maxwell's .FMZ (2 at 44-45).
             const u32 scale = insn.Bits(84, 3);
-            if (insn.Bits(76, 1) || scale == 0 || insn.Bits(81, 3) ||
+            if ((insn.Bits(76, 1) && scale != 4) || scale == 0 || insn.Bits(81, 3) ||
                 insn.Bits(87, 4) || insn.Bits(91, 1) != static_cast<u32>(opcode == 0xc20) ||
                 (scale != 4 && (!insn.Bits(80, 1) || insn.Bits(78, 2))))
                 return fail(index, "native FMUL scale/mode");
             const u32 a = operand(0), b = operand(1);
             emit(base(0x5c68000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
-                (u64{insn.Bits(78, 2)} << 39) | (u64{std::array<u32, 8>{0, 3, 2, 1, 0, 6, 5, 4}[scale]} << 41) | (u64{insn.Bits(80, 1)} << 44) | (u64{insn.Bits(77, 1)} << 50));
+                (u64{insn.Bits(78, 2)} << 39) | (u64{std::array<u32, 8>{0, 3, 2, 1, 0, 6, 5, 4}[scale]} << 41) |
+                (u64{insn.Bits(76, 1) ? 2U : insn.Bits(80, 1)} << 44) | (u64{insn.Bits(77, 1)} << 50));
             break;
         }
         case 0x221: case 0x421: case 0x621: case 0x821: case 0xa21: case 0xe21: { // FADD
@@ -3066,6 +3075,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 // I2F.{U,S}16 Rd, Rs(.H1): Maxwell's 16-bit source format, byte selector 0 or 2.
                 emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{1} << 10) | (is_signed << 13) |
                      (u64{source} << 20) | (u64{insn.Bits(60, 2) * 2} << 41));
+                break;
+            }
+            // I2F.F32.{U,S}32 Rd, Rs (Mesa NAK): rounding (78-79) as Maxwell's (39-40).
+            if (opcode == 0x306 && (insn.words[2] & ~0xc400U) == 0x00201000U &&
+                !(insn.words[1] & 0xffffff00U)) {
+                emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{2} << 10) | (is_signed << 13) |
+                     (u64{source} << 20) | (u64{insn.Bits(78, 2)} << 39));
                 break;
             }
             // I2F.{U,S}8 Rd, Rs.B0-B3: the byte selector (bits 60-61) as Maxwell's (41-42), for a
@@ -3251,26 +3267,30 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x819: { // SHF.HI, immediate shift
             const bool is_signed = insn.Bits(73, 2) == 2;
+            // .W (bit 75) takes the shift modulo the width: nothing for an immediate below 32
+            // (Mesa NAK emits SHF.R.W.U32.HI for a plain right shift).
+            const bool wrap_ok = !insn.Bits(75, 1) || insn.words[1] < 32;
             if (!insn.Bits(80, 1) && insn.Bits(76, 1) && insn.Bits(73, 2) == 1 &&
-                !insn.Bits(75, 1) && insn.words[1] <= 32) {
+                wrap_ok && insn.words[1] <= 32) {
                 // SHF.R.U64 funnel: the translator reads bits 20-38 as the immediate, so the U64
                 // clamp (bit 38) would turn every shift into 63; shifts up to 32 need no clamp.
                 emit(base(0x38f8000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
                      (u64{insn.words[1]} << 20) | (u64{insn.Bits(64, 8)} << 39));
                 break;
             }
+            // SHF.L low word with a zero high word: a left shift, the same for either signedness.
             if (!insn.Bits(80, 1) && !insn.Bits(76, 1) && insn.Bits(64, 8) == 255 &&
-                insn.Bits(73, 2) == 3 && !insn.Bits(75, 1) && insn.words[1] <= 32) {
+                (insn.Bits(73, 2) == 3 || is_signed) && wrap_ok && insn.words[1] <= 32) {
                 emit(base(0x3848000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) | (u64{insn.words[1]} << 20));
                 break;
             }
             if (!insn.Bits(80, 1) && insn.Bits(76, 1) && insn.Bits(64, 8) == 255 &&
-                (insn.Bits(73, 2) == 3 || is_signed) && !insn.Bits(75, 1) && insn.words[1] <= 32) {
+                (insn.Bits(73, 2) == 3 || is_signed) && wrap_ok && insn.words[1] <= 32) {
                 // SHF.R low word with a zero high word: a logical right shift.
                 emit(base(0x3828000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) | (u64{insn.words[1]} << 20));
                 break;
             }
-            if ((insn.Bits(73, 2) != 3 && !is_signed) || insn.Bits(75, 1) || !insn.Bits(80, 1) || insn.words[1] > 32) return fail(index, "native funnel-shift mode");
+            if ((insn.Bits(73, 2) != 3 && !is_signed) || !wrap_ok || !insn.Bits(80, 1) || insn.words[1] > 32) return fail(index, "native funnel-shift mode");
             const u32 low = insn.Bits(24, 8), high = insn.Bits(64, 8), shift = insn.words[1];
             if (insn.Bits(76, 1)) {
                 if (low != 255) return fail(index, "native nonzero low right-shift word");
@@ -3595,7 +3615,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     link = candidate.Bits(16, 8);
                     break;
                 }
-                if (prior_opcode == 0x947 || prior_opcode == 0x949 || prior_opcode == 0x958 ||
+                if (prior_opcode == 0x947 || prior_opcode == 0x547 || prior_opcode == 0x949 ||
+                    prior_opcode == 0x958 ||
                     prior_opcode == 0x944 || prior_opcode == 0x950 || prior_opcode == 0x94d ||
                     prior_opcode == 0x945 || prior_opcode == 0x941 || prior_opcode == 0x942)
                     break;
@@ -3658,7 +3679,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // independently, so all three are no-ops (a SYNC would wrongly jump, and a branch
             // out of a lowered SSY region would leave its token on Eden's flow stack).
             break;
-        case 0x947: { // BRA
+        case 0x355: // BMOV.32.CLEAR RZ, B: resets a convergence barrier (Mesa NAK's BCLEAR)
+            if (insn.Bits(16, 8) != 255 || !insn.Bits(84, 1))
+                return fail(index, "native barrier register move");
+            break;
+        case 0x947:   // BRA
+        case 0x547: { // BRA on a uniform predicate (@[!]UPn BRA.U; UPn at 24-26, negated by 27)
             // The offset's two low bits: .DIV (2) branches when the warp has diverged, .CONV (3)
             // when its active threads are the mask in the uniform register at 24-31 (bit 91;
             // URZ without it). The compiler puts warp-synchronous fast paths behind them (shuffles
@@ -3670,6 +3696,20 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 return fail(index, "native branch convergence mode");
             if (mode == 2) break;
             u64 branch_predicate = predicate;
+            u64 flow_test = 15; // T
+            if (opcode == 0x547) {
+                // UPn lives in R239 bit 6-n: test it into the condition code (LOP32I.AND.CC RZ)
+                // and branch on that, leaving P0-P6 alone on both paths.
+                const u32 uniform = insn.Bits(24, 3);
+                const bool negated = insn.Bits(27, 1) != 0;
+                if (uniform == 7) {
+                    if (negated) break; // !UPT: never
+                } else {
+                    emit(0x0410000000070000ULL | 255 | (u64{239} << 8) |
+                         (u64{1U << (6 - uniform)} << 20));
+                    flow_test = negated ? 2 : 5; // EQ (bit clear) or NE (bit set)
+                }
+            }
             if (opcode == 0x947 && insn.Bits(87, 4) != 7) {
                 if (insn.Bits(12, 4) != 7) {
                     relocations.push_back({static_cast<u32>(result.instructions.size()), index + 1});
@@ -3684,8 +3724,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const s64 target = s64{index} * 16 + 16 + relative;
             if (target < 0 || target % 16) return fail(index, "native branch destination alignment");
             relocations.push_back({static_cast<u32>(result.instructions.size()), target / 16});
-            emit(0xe24000000000000fULL | branch_predicate);
-            if (computed_branch && target == s64{index} * 16 && branch_predicate == (u64{7} << 16))
+            emit(0xe240000000000000ULL | flow_test | branch_predicate);
+            if (computed_branch && target == s64{index} * 16 && branch_predicate == (u64{7} << 16) &&
+                flow_test == 15)
                 return finish(index); // the closing self-branch
             break;
         }

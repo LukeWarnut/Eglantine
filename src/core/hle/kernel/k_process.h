@@ -293,6 +293,10 @@ public:
         return m_is_switch2;
     }
 
+    /// Keeps `size` of the physical memory limit out of the reported total memory, so a heap
+    /// sized from it leaves that much for svcMapPhysicalMemory.
+    void ReservePhysicalMemoryOutsideTotal(size_t size);
+
     bool IsDefaultApplicationSystemResource() const {
         return m_is_default_application_system_resource;
     }

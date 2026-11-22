@@ -855,6 +855,12 @@ void KProcess::UnregisterThread(KernelCore& kernel, KThread* thread) {
     m_thread_list.erase(m_thread_list.iterator_to(*thread));
 }
 
+void KProcess::ReservePhysicalMemoryOutsideTotal(size_t size) {
+    const size_t limit =
+        m_resource_limit->GetLimitValue(Svc::LimitableResource::PhysicalMemoryMax);
+    m_max_process_memory = (std::min)(m_max_process_memory, limit - (std::min)(size, limit / 2));
+}
+
 size_t KProcess::GetUsedUserPhysicalMemorySize(KernelCore& kernel) const {
     const size_t norm_size = m_page_table.GetNormalMemorySize();
     const size_t other_size = m_code_size + m_main_thread_stack_size;

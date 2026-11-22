@@ -84,7 +84,7 @@ public:
 
     void SignalFence(std::function<void()>&& func, bool force_completion = false) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
-        const bool delay_fence = force_completion || (Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate());
+        const bool delay_fence = force_completion || DelaysFenceOperations();
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
@@ -144,6 +144,17 @@ public:
         // action list; command words read wrong carry any id (Splatoon Raiders on Linux).
         if (value >= Tegra::Host1x::SyncpointManager::NUM_MAX_SYNCPOINTS) {
             LOG_ERROR(HW_GPU, "Signal of syncpoint {} past the table, ignored", value);
+            return;
+        }
+        // Fence operations queued before this increment (semaphore releases among them) wait for
+        // the host GPU when they are delayed: the guest must not see the increment first. NVK
+        // checks its submission's release as soon as the syncpoint passes, and took the
+        // still-unwritten word for a lost device (Cemu running a Wii U game).
+        if (DelaysFenceOperations()) {
+            SignalFence([this, value] {
+                syncpoint_manager.IncrementGuest(value);
+                syncpoint_manager.IncrementHost(value);
+            });
             return;
         }
         syncpoint_manager.IncrementGuest(value);
@@ -216,6 +227,13 @@ protected:
     TQueryCache& query_cache;
 
 private:
+    /// Whether fence operations run once their host fence is done, rather than at once.
+    static bool DelaysFenceOperations() {
+        return Settings::IsGPUFenceBehaviorDefault()
+                   ? Settings::IsGPULevelHigh()
+                   : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+    }
+
     template <bool force_wait>
     void TryReleasePendingFences() {
         while (!fences.empty()) {

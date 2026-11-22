@@ -63,7 +63,7 @@ public:
 
     /// Gets a default ProgramMetadata configuration, should only be used for homebrew formats where
     /// we do not have an NPDM file
-    static ProgramMetadata GetDefault();
+    static ProgramMetadata GetDefault(u32 system_resource_size = 0);
 
     Loader::ResultStatus Load(VirtualFile file);
     Loader::ResultStatus Reload(VirtualFile file);

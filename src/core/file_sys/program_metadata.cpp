@@ -129,7 +129,7 @@ Loader::ResultStatus ProgramMetadata::Reload(VirtualFile file) {
     return this->Load(file);
 }
 
-/*static*/ ProgramMetadata ProgramMetadata::GetDefault() {
+/*static*/ ProgramMetadata ProgramMetadata::GetDefault(u32 system_resource_size) {
     // Allow use of cores 0~3 and thread priorities 16~63.
     constexpr u32 default_thread_info_capability = 0x30043F7;
 
@@ -138,7 +138,7 @@ Loader::ResultStatus ProgramMetadata::Reload(VirtualFile file) {
     result.LoadManual(
         true /*is_64_bit*/, FileSys::ProgramAddressSpaceType::Is39Bit /*address_space*/,
         0x2c /*main_thread_prio*/, 0 /*main_thread_core*/, 0x100000 /*main_thread_stack_size*/,
-        0 /*title_id*/, 0xFFFFFFFFFFFFFFFF /*filesystem_permissions*/, 0 /*system_resource_size*/,
+        0 /*title_id*/, 0xFFFFFFFFFFFFFFFF /*filesystem_permissions*/, system_resource_size,
         {default_thread_info_capability} /*capabilities*/);
 
     return result;

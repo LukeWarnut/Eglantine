@@ -562,4 +562,109 @@ TEST_CASE("Ampere F2F widens a half to a float", "[video_core][ampere]") {
     CHECK(((high_convert >> 20) & 0xff) == 1);
     CHECK(((high_convert >> 41) & 1) == 1);
 }
+
+TEST_CASE("Ampere SHF.R.W.U32.HI lowers to a right shift", "[video_core][ampere]") {
+    // Logged from a homebrew (NVK) vertex shader: SHF.R.W.U32.HI R3, RZ, 8, R1.
+    const std::array<Instruction, 2> code{{
+        {{0xff037819, 0x00000008, 0x00011e01, 0x000fc200}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    const u64 shift = FindMaxwell(lowered, 0x382, 52);
+    REQUIRE(shift != 0);
+    CHECK((shift & 0xff) == 3);
+    CHECK(((shift >> 8) & 0xff) == 1);
+    CHECK(((shift >> 20) & 0x7ffff) == 8);
+    CHECK(((shift >> 48) & 1) == 0); // logical
+
+    // SHF.L.W.S32 R3, R1, 8, RZ: a left shift of the low word.
+    const std::array<Instruction, 2> left_code{{
+        {{0x01037819, 0x00000008, 0x00000cff, 0x000fc200}},
+        EXIT,
+    }};
+    const auto left = LowerToMaxwell(left_code);
+    REQUIRE(static_cast<bool>(left));
+    const u64 left_shift = FindMaxwell(left, 0x384, 52);
+    REQUIRE(left_shift != 0);
+    CHECK((left_shift & 0xff) == 3);
+    CHECK(((left_shift >> 8) & 0xff) == 1);
+    CHECK(((left_shift >> 20) & 0x7ffff) == 8);
+}
+
+TEST_CASE("Ampere BRA on a uniform predicate branches on the condition code", "[video_core][ampere]") {
+    // Logged from a homebrew (NVK) fragment shader: @!UP0 BRA.U to the second EXIT.
+    const std::array<Instruction, 3> code{{
+        {{0x08007547, 0x00000011, 0x0b800000, 0x001fc200}},
+        EXIT,
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    const u64 test = FindMaxwell(lowered, 0x041, 52); // LOP32I.AND.CC RZ, R239, 1 << 6
+    REQUIRE(test != 0);
+    CHECK((test & 0xff) == 255);
+    CHECK(((test >> 8) & 0xff) == 239);
+    CHECK(((test >> 20) & 0xffffffff) == (1U << 6));
+    const u64 branch = FindMaxwell(lowered, 0xe24, 52);
+    REQUIRE(branch != 0);
+    CHECK((branch & 0x1f) == 2); // EQ: taken while UP0 is clear
+    CHECK(((branch >> 16) & 0xf) == 7);
+}
+
+TEST_CASE("Ampere Mesa NAK conversion and multiply forms lower", "[video_core][ampere]") {
+    // Logged from homebrew (NVK) shaders. F2I.FTZ.TRUNC.S32 R1, R1 without .NTZ (bit 77).
+    const std::array<Instruction, 2> f2i{{
+        {{0x00017305, 0x00000001, 0x0021d100, 0x000e0200}},
+        EXIT,
+    }};
+    CHECK(static_cast<bool>(LowerToMaxwell(f2i)));
+
+    // I2F.F32.U32 R4, R4: Maxwell I2F with a 32-bit unsigned source.
+    const std::array<Instruction, 2> i2f{{
+        {{0x00047306, 0x00000004, 0x00201000, 0x002e0200}},
+        EXIT,
+    }};
+    const auto lowered_i2f = LowerToMaxwell(i2f);
+    REQUIRE(static_cast<bool>(lowered_i2f));
+    const u64 convert = FindMaxwell(lowered_i2f, 0x5cb, 52);
+    REQUIRE(convert != 0);
+    CHECK(((convert >> 10) & 3) == 2); // 32-bit source
+    CHECK(((convert >> 13) & 1) == 0); // unsigned
+    CHECK(((convert >> 20) & 0xff) == 4);
+
+    // FMUL.DNZ R1, R1, R3: Maxwell's FMUL.FMZ.
+    const std::array<Instruction, 2> fmul{{
+        {{0x01017220, 0x00000003, 0x004010ff, 0x000fc200}},
+        EXIT,
+    }};
+    const auto lowered_fmul = LowerToMaxwell(fmul);
+    REQUIRE(static_cast<bool>(lowered_fmul));
+    const u64 multiply = FindMaxwell(lowered_fmul, 0x5c6, 52);
+    REQUIRE(multiply != 0);
+    CHECK(((multiply >> 44) & 3) == 2);
+
+    // USHF.R.W.S32.HI UR1, URZ, 8, UR0: an arithmetic right shift.
+    const std::array<Instruction, 2> ushf{{
+        {{0x3f017899, 0x00000008, 0x08011c00, 0x000fc200}},
+        EXIT,
+    }};
+    CHECK(static_cast<bool>(LowerToMaxwell(ushf)));
+}
+
+TEST_CASE("Ampere BMOV.CLEAR of a convergence barrier is dropped", "[video_core][ampere]") {
+    // Logged from a homebrew (NVK) vertex shader: BMOV.32.CLEAR RZ, B0.
+    const std::array<Instruction, 2> code{{
+        {{0x00ff7355, 0x00000000, 0x00100000, 0x000fc200}},
+        EXIT,
+    }};
+    CHECK(static_cast<bool>(LowerToMaxwell(code)));
+
+    // Reading the barrier into a register stays rejected.
+    const std::array<Instruction, 2> read{{
+        {{0x00037355, 0x00000000, 0x00000000, 0x000fc200}},
+        EXIT,
+    }};
+    CHECK_FALSE(static_cast<bool>(LowerToMaxwell(read)));
+}
 } // namespace

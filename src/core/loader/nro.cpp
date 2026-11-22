@@ -22,6 +22,7 @@
 #include "common/common_types.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/literals.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/random.h"
@@ -437,12 +438,23 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
     std::uintptr_t aslr_offset = ((::Settings::values.rng_seed_enabled.GetValue()
         ? ::Settings::values.rng_seed.GetValue() : Common::Random::Random64(0)) << 12) & 0xfff000;
 
+    // Homebrew runs in the application hbloader took over, with its system resource: without one
+    // svcMapPhysicalMemory fails (Cemu maps its guest memory with it). 16 MiB, as Suika's NPDM.
+    constexpr u32 HomebrewSystemResourceSize = 0x1000000;
+
     // Setup the process code layout
     if (process
-            .LoadFromMetadata(system.Kernel(), FileSys::ProgramMetadata::GetDefault(), image_size, fastmem_base, aslr_offset)
+            .LoadFromMetadata(system.Kernel(),
+                              FileSys::ProgramMetadata::GetDefault(HomebrewSystemResourceSize),
+                              image_size, fastmem_base, aslr_offset)
             .IsError()) {
         return false;
     }
+    // hbloader hands homebrew a heap of all the reported total memory, and Cemu maps its guest
+    // memory past that with svcMapPhysicalMemory (1.34 GiB for NES Remix): keep 2 GiB of the
+    // limit out of the total, at most half of it.
+    using namespace Common::Literals;
+    process.ReservePhysicalMemoryOutsideTotal(2_GiB);
 
     // Relocate code patch and copy to the program_image if running under NCE.
     // This needs to be after LoadFromMetadata so we can use the process entry point.

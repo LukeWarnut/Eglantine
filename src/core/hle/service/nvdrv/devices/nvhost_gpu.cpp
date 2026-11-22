@@ -113,6 +113,12 @@ NvResult nvhost_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> inpu
         }
         break;
     }
+    if (g_nx2_driver && command.group == 'H' && command.cmd == 0x17) {
+        // GetErrorNotification (16 bytes: timestamp, info32, info16, status): the channel has no
+        // error, rather than an echo of whatever the caller's buffer held. Homebrew NVK polls it.
+        std::fill(output.begin(), output.end(), u8{0});
+        return NvResult::Success;
+    }
     if (g_nx2_driver && command.group == 'H' && command.cmd == 0x1e &&
         output.size() >= sizeof(u64)) {
         // 0x1E (16 bytes): ouncevk needs a nonzero u64 back, which it keys its channel objects

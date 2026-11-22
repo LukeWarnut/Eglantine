@@ -270,6 +270,13 @@ public:
     bool IsNativeMode() const {
         return native_mode;
     }
+    /// See Maxwell3D::SetNativeHomebrew.
+    void SetNativeHomebrew(bool enabled) {
+        native_homebrew = enabled;
+    }
+    bool IsNativeHomebrew() const {
+        return native_homebrew;
+    }
     bool CanBatchInlineData(size_t words) const {
         return upload_state.CanBatchLinearData(words);
     }
@@ -406,6 +413,7 @@ private:
     bool native_mme_dumped{};
     std::optional<u32> native_executing_macro_logged;
     bool native_mode{};
+    bool native_homebrew{};
 
 public:
     /// Whether this method may write guest memory: dispatches, uploads and reports. Plain native

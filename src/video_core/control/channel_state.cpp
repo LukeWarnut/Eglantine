@@ -86,6 +86,9 @@ void ChannelState::Init(Core::System& system, u64 program_id_) {
         payload->kepler_compute.SetNativeMacroMode(&macros->engine, macros->positions,
                                                    macros.get());
         payload->kepler_compute.SetNativeDataRam(&payload->maxwell_3d.GetNativeDataRam());
+        // Homebrew runs without a program id; retail titles draw with NVN.
+        payload->maxwell_3d.SetNativeHomebrew(program_id_ == 0);
+        payload->kepler_compute.SetNativeHomebrew(program_id_ == 0);
     }
     initialized = true;
 }

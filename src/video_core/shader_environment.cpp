@@ -802,7 +802,10 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     const u64 local_size{sph.LocalMemorySize()};
     ASSERT(local_size <= (std::numeric_limits<u32>::max)());
     local_memory_size = static_cast<u32>(local_size) + sph.common3.shader_local_memory_crs_size;
-    is_proprietary_driver = maxwell3d->GetNativeMacroEngine().native_turing || texture_bound == 2;
+    // Constant buffer 1 is folded as NVN's driver constants; NVK's changes between draws.
+    is_proprietary_driver =
+        !maxwell3d->IsNativeHomebrew() &&
+        (maxwell3d->GetNativeMacroEngine().native_turing || texture_bound == 2);
     has_hle_engine_state =
         maxwell3d->engine_state == Tegra::Engines::Maxwell3D::EngineHint::OnHLEMacro;
 }
@@ -1027,7 +1030,7 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
     workgroup_size = {qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z};
     if (kepler_compute->IsNativeMode()) {
         initial_offset = sizeof(sph);
-        is_proprietary_driver = true;
+        is_proprietary_driver = !kepler_compute->IsNativeHomebrew();
         native_tensor = kepler_compute->EmulatesNativeTensorPrograms();
         native_compact_tensor = kepler_compute->UsesCompactTensorPrograms();
         InitializeNativeCode(std::move(lowered_native_), 0);

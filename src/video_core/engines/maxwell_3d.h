@@ -3199,6 +3199,14 @@ public:
     void SetNativeMacroContext(std::shared_ptr<NativeMacroContext> context) {
         native_macro_context = std::move(context);
     }
+    /// Switch 2 homebrew draws with Mesa's NVK, which keeps per-draw data (texture handles
+    /// among it) in constant buffer 1, where NVN keeps constant driver values.
+    void SetNativeHomebrew(bool enabled) {
+        native_homebrew = enabled;
+    }
+    bool IsNativeHomebrew() const {
+        return native_homebrew;
+    }
     MacroEngine& GetNativeMacroEngine() { return native_macro_context ? native_macro_context->engine : macro_engine; }
     /// This channel's MME data RAM (shared with its compute engine).
     std::array<u32, 0xc00>& GetNativeDataRam() { return native_data_ram; }
@@ -3439,6 +3447,7 @@ private:
 
     /// Interpreter for the macro codes uploaded to the GPU.
     std::shared_ptr<NativeMacroContext> native_macro_context;
+    bool native_homebrew{};
     std::array<u32, 0xc00> native_data_ram{};
     MacroEngine macro_engine;
 
