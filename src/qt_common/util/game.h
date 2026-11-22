@@ -52,7 +52,6 @@ void RemoveUpdateContent(u64 program_id, InstalledEntryType type);
 void RemoveAddOnContent(u64 program_id, InstalledEntryType type);
 
 void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target);
-void RemoveVulkanDriverPipelineCache(u64 program_id);
 void RemoveAllTransferableShaderCaches(u64 program_id);
 void RemoveCustomConfiguration(u64 program_id, const std::string& game_path);
 void RemoveCacheStorage(u64 program_id);

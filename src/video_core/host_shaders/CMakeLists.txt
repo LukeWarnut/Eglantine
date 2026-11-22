@@ -20,6 +20,8 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_vertex_repack.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/astc_decoder.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/bc_encoder.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_bc_copy.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bc7_encoder.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_float.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_srgb_to_linear.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_square.frag
@@ -49,6 +51,12 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/full_screen_triangle.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/fxaa.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/fxaa.vert
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_alias_transfer.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_counter.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_mesh_indirect.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_quad_indirect.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_vertex_stage.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_wb_merge.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/opengl_convert_s8d24.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/opengl_copy_bc4.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/opengl_fidelityfx_fsr.frag

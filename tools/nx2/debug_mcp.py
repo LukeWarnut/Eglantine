@@ -118,7 +118,8 @@ TOOLS = [
         "description": "EDEN_NX2_REJECT_HASH at runtime: rejects (or with reject=false restores) "
                        "native programs by native program key (shader dump names) or shader hash "
                        "(frame dump 'shaders'); their cached pipelines are dropped at the next "
-                       "frame end. With no hashes, lists the rejected ones.",
+                       "frame end. With no hashes, lists the rejected ones. Emulated GPU path "
+                       "only: under VTX-HLE it changes nothing and says so; use nvn_draw_skip.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -255,6 +256,92 @@ TOOLS = [
             "required": ["steps"],
         },
     },
+    {
+        "name": "nvn_draws",
+        "description": "VTX-HLE only. Distinct pipelines of the last recorded present: stage hashes "
+                       "(vertex/fragment/task/mesh/..., the 16-hex-digit keys of shader dumps and "
+                       "EDEN_NX2_NVN_ONLY_VS), draw count, summed vertex/index count, primitive "
+                       "mode, indexed/indirect/mesh, and for the first draw its vertex streams "
+                       "(guest address, pool and offset, staged copy) and index range. Most draws "
+                       "first, 'limit' rows (default 40); 'hash' keeps rows having that hash. Also "
+                       "'dispatches': one row per compute program hash (the hash the gpuprof "
+                       "report prints) with count, groups (summed x*y*z of the direct ones), "
+                       "indirect (indirect dispatches) and skipped (dropped by nvn_draw_skip), "
+                       "most dispatches first, same 'limit' and 'hash'. The first call arms the "
+                       "census for 'arm_presents' presents (default 600) and waits up to 3 s for a "
+                       "full frame.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                "hash": {"type": "string", "maxLength": 18},
+                "arm_presents": {"type": "integer", "minimum": 1, "maximum": 100000},
+            },
+        },
+    },
+    {
+        "name": "nvn_draw_skip",
+        "description": "VTX-HLE only. Draws whose stage hashes (any stage) match the set are not "
+                       "recorded, from the next draw on; no relaunch. 'action': get (default), "
+                       "set, add, remove, clear (also resets mode to skip). 'hashes': stage hashes "
+                       "as nvn_draws lists them. 'mode': skip (default: skip listed) or only (skip "
+                       "every draw except those having a listed hash; an empty list in only mode "
+                       "skips every draw). Compute dispatches whose compute hash (nvn_draws "
+                       "'dispatches', gpuprof) is listed are skipped in both modes; only mode "
+                       "never skips an unlisted dispatch. A skipped direct dispatch is recorded "
+                       "with zero workgroups (its barriers stay), a skipped indirect one is not "
+                       "recorded. Returns the mode and set. Clear it when done; it is also cleared "
+                       "when the game stops.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["get", "set", "add", "remove", "clear"]},
+                "hashes": {"type": "array", "items": {"type": "string", "maxLength": 18},
+                           "maxItems": 256},
+                "mode": {"type": "string", "enum": ["skip", "only"]},
+            },
+        },
+    },
+    {
+        "name": "nvn_draw_dump",
+        "description": "VTX-HLE only. Arms a dump of the next 'count' (default 1, max 8) recorded "
+                       "draws having 'hash' in any stage, or dispatches of the compute program "
+                       "'hash' (nvn_draws 'dispatches', gpuprof cs=), into one text file. A "
+                       "dispatch section: group counts (indirect: the argument address and its "
+                       "guest bytes), thread-group size, push constants. A draw section: vertex "
+                       "input layout, each vertex stream's first 256 vertices (hex, and 32-bit "
+                       "float attributes of the first 32), the index range's min/max. Both then "
+                       "list every descriptor binding: constant buffers (cN = uniform slot N-3; c0 "
+                       "driver bank of a dispatch and c1 program constants as built by the replay, "
+                       "game buffers up to 4 KiB), storage buffers (first 256 bytes, written flag) "
+                       "with guest address, size and where the GPU reads them (imported, mirror "
+                       "pool, VRAM mirror, device shadow, uniform snapshot, private copy with "
+                       "inline updates), as 16-byte rows of hex, f32 and u32 the CPU sees when the "
+                       "call is recorded (bytes of a VRAM copy the GPU wrote are not read back); "
+                       "textures and images (handle, texture, guest address, format, size, view "
+                       "type, sampler); raw global table state. Written to the dump directory; "
+                       "waits up to wait_ms (default 3000) and returns the path and how many "
+                       "sections were written. Without 'hash': the state of the last dump.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hash": {"type": "string", "maxLength": 18},
+                "count": {"type": "integer", "minimum": 1, "maximum": 8},
+                "wait_ms": {"type": "integer", "minimum": 0, "maximum": 10000},
+            },
+        },
+    },
+    {
+        "name": "nvn_stats",
+        "description": "VTX-HLE health in one call, from the log: the latest '[nvn] memory:', "
+                       "'[nvn] status:' and 'replay stage' heartbeat lines, the latest 'gpuprof 10 "
+                       "s window' report and the latest storage census (its first census_lines "
+                       "lines, default 12), as raw log lines.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"census_lines": {"type": "integer", "minimum": 0, "maximum": 200}},
+        },
+    },
 ]
 
 TOOL_NAMES = {tool["name"] for tool in TOOLS}
@@ -325,6 +412,8 @@ def default_timeout(name, params):
     if name in ("input", "input_sequence"):
         steps = params.get("steps", []) if name == "input_sequence" else [params]
         return sum(int(step.get("frames", 0)) for step in steps) // 20 + 10
+    if name == "nvn_draw_dump":
+        return int(params.get("wait_ms", 3000)) // 1000 + 5
     return 5
 
 

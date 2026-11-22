@@ -22,6 +22,10 @@ class EmuWindow;
 class GraphicsContext;
 } // namespace Core::Frontend
 
+namespace VideoCommon::Nvn {
+class Sink;
+} // namespace VideoCommon::Nvn
+
 namespace VideoCore {
 
 struct RendererSettings {
@@ -31,6 +35,34 @@ struct RendererSettings {
     std::function<void(bool)> screenshot_complete_callback;
     Layout::FramebufferLayout screenshot_framebuffer_layout;
     Service::Nvnflinger::LayerStackId screenshot_layer_stack{Service::Nvnflinger::LayerStackId::Default};
+    /// A renderer is rendering the pending request (see ClaimScreenshot).
+    std::atomic<bool> screenshot_claimed{false};
+
+    /// Called by a renderer about to render the pending screenshot request, from any thread: true
+    /// for exactly one caller per request. The Vulkan Composite path and the VTX-HLE replay both
+    /// present frames, so both ask before they touch screenshot_bits.
+    [[nodiscard]] bool ClaimScreenshot() {
+        if (!screenshot_requested.load() || screenshot_claimed.exchange(true)) {
+            return false;
+        }
+        // The request may have been finished between the two steps above.
+        if (!screenshot_requested.load()) {
+            screenshot_claimed.store(false);
+            return false;
+        }
+        return true;
+    }
+
+    /// The claimant could not render the request: it stays pending for the next frame.
+    void ReleaseScreenshotClaim() {
+        screenshot_claimed.store(false);
+    }
+
+    /// The request is answered (the callback has been called): a new one may be made.
+    void FinishScreenshot() {
+        screenshot_requested.store(false);
+        screenshot_claimed.store(false);
+    }
 };
 
 class RendererBase {
@@ -51,6 +83,12 @@ public:
     [[nodiscard]] virtual RasterizerInterface* ReadRasterizer() = 0;
 
     [[nodiscard]] virtual std::string GetDeviceVendor() const = 0;
+
+    /// VTX-HLE (NVN high-level emulation) sink. Only the Vulkan renderer provides one, and only
+    /// while the game runs on VTX-HLE (nullptr otherwise).
+    [[nodiscard]] virtual VideoCommon::Nvn::Sink* NvnSink() {
+        return nullptr;
+    }
 
     struct DeviceMemory {
         u64 used;  ///< what this process uses

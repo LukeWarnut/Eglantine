@@ -85,8 +85,11 @@ auto BreadthFirstSearch(Value value, Pred&& pred, Resolve&& resolve = {})
 /// BreadthFirstSearch's: skipped instructions and all they reach never match, and an instruction
 /// not reachable from them is only queued by instructions that are not either, so those are
 /// visited in the same order.
-template <typename Pred, typename Resolve = std::identity>
+/// `expand(inst)` returns false for instructions whose arguments are not searched (the NVN raw
+/// global memory search does not walk through memory loads); the default searches everything.
+template <typename Pred, typename Expand = bool (*)(const Inst*), typename Resolve = std::identity>
 auto BreadthFirstSearchPruned(Value value, Pred&& pred, std::unordered_set<const Inst*>& exhausted,
+                              Expand&& expand = [](const Inst*) { return true; },
                               Resolve&& resolve = {})
     -> std::invoke_result_t<Pred, const Inst*> {
     value = resolve(value);
@@ -106,6 +109,9 @@ auto BreadthFirstSearchPruned(Value value, Pred&& pred, std::unordered_set<const
         queue.pop();
         if (const std::optional result = pred(inst)) {
             return result;
+        }
+        if (!expand(inst)) {
+            continue;
         }
         // Visit the right most arguments first
         for (size_t arg = inst->NumArgs(); arg--;) {

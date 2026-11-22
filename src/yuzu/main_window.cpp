@@ -79,6 +79,16 @@
 #include "util/overlay_dialog.h"
 
 #include "multiplayer/state.h"
+#ifdef YUZU_ENABLE_MCP
+#include <atomic>
+#include <thread>
+#include <QClipboard>
+#include <QCoreApplication>
+#include <QGuiApplication>
+#include <QSignalBlocker>
+#include "mcp/server.h"
+#include "yuzu/mcp_host_qt.h"
+#endif
 
 // Qt Stuff //
 #define QT_NO_OPENGL
@@ -967,6 +977,8 @@ void MainWindow::UpdateMcpStatusLabel() {
         tip += QStringLiteral("\n") + QString::fromStdString(a.route_detail);
     }
     tip += tr("\nDashboard: %1").arg(QString::fromStdString(s.url.substr(0, s.url.size() - 3)));
+    // Tooltips auto-detect rich text; the agent/route/tool names in here come from MCP clients.
+    tip.replace(QLatin1Char('<'), QStringLiteral("\u2039"));
     mcp_status_label->setToolTip(tip);
 }
 #endif
@@ -1427,6 +1439,9 @@ void MainWindow::InitializeWidgets() {
     // (after TAS, volume and the other toggles).
     mcp_status_label = new QLabel();
     mcp_status_label->setObjectName(QStringLiteral("McpStatusLabel"));
+    // Agent names, route names and tool names are client-supplied: never interpret them as rich
+    // text (an <img src="\\host\share"> in a QLabel would be fetched).
+    mcp_status_label->setTextFormat(Qt::PlainText);
     mcp_status_label->setFocusPolicy(Qt::NoFocus);
     mcp_status_label->setContentsMargins(4, 0, 4, 0);
     statusBar()->insertPermanentWidget(0, mcp_status_label);
@@ -3149,8 +3164,6 @@ void MainWindow::OnGameListRemoveFile(u64 program_id, QtCommon::Game::GameListRe
 
     switch (target) {
     case QtCommon::Game::GameListRemoveTarget::VkShaderCache:
-        QtCommon::Game::RemoveVulkanDriverPipelineCache(program_id);
-        [[fallthrough]];
     case QtCommon::Game::GameListRemoveTarget::GlShaderCache:
         QtCommon::Game::RemoveTransferableShaderCache(program_id, target);
         break;

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 
@@ -19,6 +20,7 @@
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/frame_gen.h"
 #endif
+#include "video_core/renderer_vulkan/nvn/nvn_context.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -60,6 +62,10 @@ public:
 
     [[nodiscard]] std::string GetDeviceVendor() const override {
         return device.GetDriverName();
+    }
+
+    [[nodiscard]] VideoCommon::Nvn::Sink* NvnSink() override {
+        return nvn_context ? &*nvn_context : nullptr;
     }
 
     [[nodiscard]] std::optional<DeviceMemory> GetDeviceMemory() const override {
@@ -120,6 +126,10 @@ private:
     std::optional<TurboMode> turbo_mode;
 
     Frame applet_frame;
+
+    /// VTX-HLE's replay; only constructed while the game runs on it. Declared last: it waits for
+    /// the device to go idle when it is destroyed.
+    std::optional<Nvn::Context> nvn_context;
 };
 
 } // namespace Vulkan

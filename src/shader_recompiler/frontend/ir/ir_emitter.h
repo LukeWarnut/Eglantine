@@ -92,6 +92,8 @@ public:
     void SetPatch(Patch patch, const F32& value);
 
     [[nodiscard]] U32 IsbeRead(const U32& address);
+    /// ISBERD.O: the program's own output region read back (a task's payload, a mesh's attributes).
+    [[nodiscard]] U32 IsbeReadOutput(const U32& address);
     void IsbeWriteAttribute(const U32& address, const U32& value);
     void IsbeWriteMapU8(const U32& address, const U32& value);
     void IsbeWriteMapU32(const U32& address, const U32& value);

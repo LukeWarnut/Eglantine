@@ -45,6 +45,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/native_tensor_programs.h"
 
 namespace Tegra::Engines {
 
@@ -940,13 +941,12 @@ bool KeplerCompute::EmulatesNativeTensorPrograms() const {
         return dlss_chain.failure == VideoCore::GameDlssReason::None &&
                GameDlssBlocker() == VideoCore::GameDlssReason::None;
     }
-    // Donkey Kong Bananza's programs are emulated: rejected, they write nothing and the screen is
-    // purple from its mode select on. Ocarina of Time's end-of-frame network is emulated in the
-    // compact form (UsesCompactTensorPrograms). Other titles keep the upscale stand-in (emulating
-    // title 4's network takes the host driver minutes to compile). Chosen per title, not per
-    // dispatch: the shader cache keeps the result of a program's first dispatch.
-    constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
-    return Settings::GetCurrentProgramID() == DonkeyKongBananzaProgramId ||
+    // The titles VideoCommon::LowersNativeTensorPrograms names; the compact ones only in the
+    // compact form (UsesCompactTensorPrograms). Other titles keep the upscale stand-in. Chosen per
+    // title, not per dispatch: the shader cache keeps the result of a program's first dispatch.
+    const u64 program_id = Settings::GetCurrentProgramID();
+    return (VideoCommon::LowersNativeTensorPrograms(program_id) &&
+            !VideoCommon::UsesCompactNativeTensorPrograms(program_id)) ||
            UsesCompactTensorPrograms();
 }
 
@@ -955,8 +955,8 @@ bool KeplerCompute::UsesCompactTensorPrograms() const {
     // stand-in blits the network's input instead, which leaves the frame flat and far too bright
     // (Kokiri Forest median luma ~0.29 against ~0.10 with the network). The compact form calls a
     // helper that shuffles across 32 lanes, so it needs compute shaders created 32 threads wide.
-    constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
-    return !dlss_chain.active && Settings::GetCurrentProgramID() == OcarinaOfTimeProgramId &&
+    return !dlss_chain.active &&
+           VideoCommon::UsesCompactNativeTensorPrograms(Settings::GetCurrentProgramID()) &&
            rasterizer != nullptr && rasterizer->SupportsGameDlssNetwork();
 }
 

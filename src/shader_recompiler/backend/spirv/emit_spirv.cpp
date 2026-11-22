@@ -470,6 +470,13 @@ void SetupTransformFeedbackCapabilities(EmitContext& ctx, Id main_func) {
 }
 
 void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ctx) {
+    if (profile.support_raw_global_memory && profile.support_int64 &&
+        info.uses_raw_global_memory) {
+        ctx.AddExtension("SPV_KHR_physical_storage_buffer");
+        ctx.AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
+        ctx.SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64,
+                           spv::MemoryModel::GLSL450);
+    }
     if (info.uses_sampled_1d) {
         ctx.AddCapability(spv::Capability::Sampled1D);
     }

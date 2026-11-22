@@ -137,7 +137,6 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , surface{surface_}
     , blit_supported{CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())}
     , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
-    , use_present_thread{Settings::values.async_presentation.GetValue()}
 {
     SetImageCount();
 
@@ -170,12 +169,19 @@ PresentManager::PresentManager(const vk::Instance& instance_,
         free_queue.push_back(&frame);
     }
 
-    if (use_present_thread) {
-        present_thread = std::jthread([this](std::stop_token token) { PresentThread(token); });
+    if (Settings::values.async_presentation.GetValue()) {
+        EnablePresentThread();
     }
 }
 
 PresentManager::~PresentManager() = default;
+
+void PresentManager::EnablePresentThread() {
+    if (!use_present_thread) {
+        present_thread = std::jthread([this](std::stop_token token) { PresentThread(token); });
+        use_present_thread = true;
+    }
+}
 
 Frame* PresentManager::GetRenderFrame() {
 
@@ -212,6 +218,7 @@ Frame* PresentManager::TryGetRenderFrame() {
 }
 
 void PresentManager::Present(Frame* frame) {
+    frame->renderer_paced = true;
     if (use_present_thread) {
         scheduler.Record([this, frame](vk::CommandBuffer) {
             std::unique_lock lock{queue_mutex};
@@ -225,6 +232,43 @@ void PresentManager::Present(Frame* frame) {
     }
 }
 
+void PresentManager::PresentSubmitted(Frame* frame) {
+    frame->renderer_paced = false;
+    if (use_present_thread) {
+        std::unique_lock lock{queue_mutex};
+        present_queue.push_back(frame);
+        frame_cv.notify_one();
+    } else {
+        CopyToSwapchain(frame);
+        std::scoped_lock lock{free_mutex};
+        free_queue.push_back(frame);
+        free_cv.notify_one();
+    }
+}
+
+void PresentManager::ReturnFrame(Frame* frame) {
+    // GetRenderFrame reset the frame's fence; an empty submission signals it again so the next
+    // GetRenderFrame of this frame does not wait forever.
+    const VkSubmitInfo submit_info{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = nullptr,
+        .waitSemaphoreCount = 0U,
+        .pWaitSemaphores = nullptr,
+        .pWaitDstStageMask = nullptr,
+        .commandBufferCount = 0U,
+        .pCommandBuffers = nullptr,
+        .signalSemaphoreCount = 0U,
+        .pSignalSemaphores = nullptr,
+    };
+    {
+        std::scoped_lock submit_lock{scheduler.submit_mutex};
+        void(device.GetGraphicsQueue().Submit(submit_info, *frame->present_done));
+    }
+    std::scoped_lock lock{free_mutex};
+    free_queue.push_back(frame);
+    free_cv.notify_one();
+}
+
 size_t PresentManager::MaxExtraFrames() const {
     return image_count - 1;
 }
@@ -235,10 +279,18 @@ bool PresentManager::NeedsStorage(const Frame* frame, bool required) const {
 
 void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat image_view_format,
                                    VkRenderPass rd, bool storage) {
+    RecreateFrame(frame, width, height, swapchain.GetImageFormat(), image_view_format, rd, storage,
+                  nullptr);
+}
+
+void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height,
+                                   VkFormat frame_image_format, VkFormat image_view_format,
+                                   VkRenderPass rd, bool storage, MemoryAllocator* allocator) {
     auto& dld = device.GetLogical();
 
     frame->width = width;
     frame->height = height;
+    frame->format = frame_image_format;
 
     const bool with_storage = storage && frame->storage_capable;
     VkImageUsageFlags storage_usage = 0;
@@ -246,12 +298,12 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
         storage_usage = VK_IMAGE_USAGE_STORAGE_BIT;
     }
 
-    frame->image = memory_allocator.CreateImage({
+    frame->image = (allocator != nullptr ? *allocator : memory_allocator).CreateImage({
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
         .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT,
         .imageType = VK_IMAGE_TYPE_2D,
-        .format = swapchain.GetImageFormat(),
+        .format = frame_image_format,
         .extent =
             {
                 .width = width,
@@ -302,7 +354,7 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
             .flags = 0,
             .image = *frame->image,
             .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = swapchain.GetImageFormat(),
+            .format = frame_image_format,
             .components =
                 {
                     .r = VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -577,7 +629,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         RecreateSwapchain(frame);
     }
 
-    while (swapchain.AcquireNextImage(!use_present_thread)) {
+    while (swapchain.AcquireNextImage(!use_present_thread, frame->renderer_paced)) {
         RecreateSwapchain(frame);
     }
 
@@ -696,16 +748,32 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         VK_PIPELINE_STAGE_TRANSFER_BIT,
     };
 
+    // A frame the scheduler did not render (VTX-HLE) also signals the present timeline: the next
+    // acquire with this present semaphore waits for this submission instead of a renderer tick.
+    const VkSemaphore present_timeline =
+        frame->renderer_paced ? VK_NULL_HANDLE : swapchain.PresentTimeline();
+    const bool signal_timeline = present_timeline != VK_NULL_HANDLE;
+    const std::array signal_semaphores{render_semaphore, present_timeline};
+    const std::array<u64, 2> signal_values{0, swapchain.NextPresentTimelineValue()};
+    const VkTimelineSemaphoreSubmitInfo timeline_info{
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .pNext = nullptr,
+        .waitSemaphoreValueCount = 0,
+        .pWaitSemaphoreValues = nullptr,
+        .signalSemaphoreValueCount = 2,
+        .pSignalSemaphoreValues = signal_values.data(),
+    };
+
     const VkSubmitInfo submit_info{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .pNext = nullptr,
+        .pNext = signal_timeline ? &timeline_info : nullptr,
         .waitSemaphoreCount = 2U,
         .pWaitSemaphores = wait_semaphores.data(),
         .pWaitDstStageMask = wait_stage_masks.data(),
         .commandBufferCount = 1,
         .pCommandBuffers = cmdbuf.address(),
-        .signalSemaphoreCount = 1U,
-        .pSignalSemaphores = &render_semaphore,
+        .signalSemaphoreCount = signal_timeline ? 2U : 1U,
+        .pSignalSemaphores = signal_semaphores.data(),
     };
 
     // Submit the image copy/blit to the swapchain
@@ -722,6 +790,10 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
             vk::Check(result);
             break;
         }
+    }
+
+    if (signal_timeline) {
+        swapchain.MarkPresentTimelineSubmitted();
     }
 
     // Present

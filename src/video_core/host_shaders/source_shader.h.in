@@ -7,8 +7,6 @@
 
 namespace HostShaders {
 
-constexpr std::string_view @CONTENTS_NAME@ = {
-@CONTENTS@
-};
+constexpr std::string_view @CONTENTS_NAME@ = {@CONTENTS@};
 
 } // namespace HostShaders

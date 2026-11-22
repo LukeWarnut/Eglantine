@@ -46,6 +46,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/renderer_base.h"
+#include "video_core/load_progress.h"
 #include "video_core/shader_notify.h"
 
 namespace Tegra {
@@ -400,6 +401,8 @@ struct GPU::Impl {
     // previous members has been destroyed
     VideoCommon::GPUThread::ThreadManager gpu_thread;
 
+    /// Declared before the renderer so it outlives the renderer's workers that report to it.
+    VideoCore::LoadProgressSink load_progress;
     std::unique_ptr<VideoCore::RendererBase> renderer;
     const bool use_nvdec;
 
@@ -569,6 +572,10 @@ VideoCore::ShaderNotify& GPU::ShaderNotify() {
 
 const VideoCore::ShaderNotify& GPU::ShaderNotify() const {
     return impl->shader_notify;
+}
+
+VideoCore::LoadProgressSink& GPU::LoadProgress() {
+    return impl->load_progress;
 }
 
 void GPU::RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers,

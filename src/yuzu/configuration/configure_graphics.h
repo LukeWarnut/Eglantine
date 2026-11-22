@@ -42,6 +42,7 @@ class ConfigureGraphics;
 
 namespace ConfigurationShared {
 class Builder;
+class VtxHleGrey;
 }
 
 class ConfigureGraphics : public ConfigurationShared::Tab {
@@ -62,6 +63,7 @@ public:
 
 private:
     void changeEvent(QEvent* event) override;
+    void showEvent(QShowEvent* event) override;
     void RetranslateUI();
 
     void Setup(const ConfigurationShared::Builder& builder);
@@ -70,6 +72,8 @@ private:
     void UpdateVsyncSetting() const;
     void UpdateBackgroundColorButton(QColor color);
     void UpdateAPILayout();
+    /// Tells the dialog's VTX-HLE greying which Graphics path and API the page shows.
+    void UpdateVtxHle();
     void UpdateDeviceSelection(int device);
 
     void RetrieveVulkanDevices();
@@ -110,4 +114,6 @@ private:
     QWidget* api_widget;
     QComboBox* aspect_ratio_combobox;
     QComboBox* resolution_combobox;
+    QComboBox* path_combobox{};
+    ConfigurationShared::VtxHleGrey* vtx_hle{};
 };

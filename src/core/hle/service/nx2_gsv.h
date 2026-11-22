@@ -64,6 +64,7 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_transfer_memory.h"
 #include "core/hle/kernel/svc_results.h"
+#include "core/hle/nvn/hle_runtime.h"
 #include "core/memory.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/nx2_video_decoder.h"
@@ -84,6 +85,8 @@
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_movie_pacing.h"
+#include "core/hle/service/nx2_native_image_directory.h"
+#include "core/hle/service/nx2_native_pool.h"
 #include "core/hle/service/nx2_frame_interval.h"
 #include "core/hle/service/nx2_oot_time.h"
 #include "core/hle/service/sm/sm.h"
@@ -1588,37 +1591,51 @@ struct Nx2NativeObjects {
     u32 next_image{1};
 };
 
-// Block-linear layout of an InterModuleUserImagePreference (16 words): word 2 holds
-// (width - 1) | (height - 1) << 16, word 4 the block height (log2 of GOB rows), word 5 the row
-// pitch in 64-byte GOBs. Formula from changes.patch (native_image_layout.h); preferences outside
-// it fall back to 4 bytes per pixel and 128-row blocks.
-struct Nx2ImageLayout {
-    u32 width;
-    u32 height;
-    u64 pitch;
-    u32 block_height_log2;
-    u64 size;
-    u64 alignment;
-};
-
-inline Nx2ImageLayout Nx2CalculateImageLayout(const u32* preference) {
-    Nx2ImageLayout layout{};
-    layout.width = (preference[2] & 0xFFFF) + 1;
-    layout.height = (preference[2] >> 16) + 1;
-    const u64 pitch_gobs = preference[5];
-    const u32 block_height_log2 = preference[4];
-    if (block_height_log2 <= 8 && pitch_gobs >= (u64{layout.width} * 4 + 63) / 64 &&
-        pitch_gobs <= 4096) {
-        layout.pitch = pitch_gobs * 64;
-        layout.block_height_log2 = block_height_log2;
-    } else {
-        layout.pitch = Common::AlignUp(u64{layout.width} * 4, 64);
-        layout.block_height_log2 = 7;
+// What nn::gpu::sdk::QueryNativeImage (gsv 428) would be told about image `handle`, for VTX-HLE
+// (Nx2NativeImageDirectory): the descriptor QueryNativeImage builds. nullopt for a handle that
+// names no image, a decoder output image, or an image whose memory is not bound or does not hold it.
+inline std::optional<Nx2NativeImageInfo> Nx2DescribeNativeImage(Nx2NativeObjects& objects,
+                                                                u32 handle) {
+    std::scoped_lock lk{objects.mutex};
+    auto it = objects.images.upper_bound(handle);
+    if (it == objects.images.begin()) {
+        LOG_WARNING(Service, "nx2:gsv native image {} is not in the table", handle);
+        return std::nullopt;
     }
-    const u64 block_rows = u64{1} << layout.block_height_log2;
-    layout.size = layout.pitch * Common::AlignUp(u64{layout.height}, block_rows);
-    layout.alignment = std::max<u64>(64 * block_rows, 0x1000);
-    return layout;
+    --it;
+    const auto& image = it->second;
+    const u64 index = handle - it->first;
+    if (index >= image.count || image.size == 0 || image.decoder ||
+        index > (std::numeric_limits<u64>::max() - image.offset) / image.size) {
+        LOG_WARNING(Service, "nx2:gsv native image {} is not a user image of pool {} (count {})",
+                    handle, it->first, image.count);
+        return std::nullopt;
+    }
+    const u64 image_offset = image.offset + index * image.size;
+    const auto layout = Nx2CalculateImageLayout(image.preference.data());
+    const auto memory_it = objects.memories.find(image.memory);
+    if (memory_it == objects.memories.end() || memory_it->second.address == 0) {
+        LOG_WARNING(Service, "nx2:gsv native image {}: memory {} is not bound", handle, image.memory);
+        return std::nullopt;
+    }
+    if (layout.size != image.size || image_offset > memory_it->second.size ||
+        layout.size > memory_it->second.size - image_offset) {
+        LOG_WARNING(Service, "nx2:gsv native image {} ({:#x}+{:#x}) does not fit memory {} ({:#x})",
+                    handle, image_offset, layout.size, image.memory, memory_it->second.size);
+        return std::nullopt;
+    }
+    Nx2NativeImageInfo info;
+    info.address = memory_it->second.address + image_offset;
+    info.size = layout.size;
+    info.descriptor[0] = 1;
+    info.descriptor[1] = image.preference[1];
+    info.descriptor[2] = image.preference[2];
+    info.descriptor[4] = layout.block_height_log2;
+    info.descriptor[5] = static_cast<u32>(layout.pitch / 64);
+    info.descriptor[8] = 1;
+    info.descriptor[9] = 1;
+    info.descriptor[11] = static_cast<u32>(layout.size);
+    return info;
 }
 
 // GameChat's graphics side (nn::chat::gsv), handed out by gsv 1202. Read from the SDK's
@@ -3771,6 +3788,7 @@ private:
                     Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
                 system.GPU().InvalidateRegion(*device, m_tiled.size());
             }
+            Core::NvnHle::Hle::Runtime::Instance().NotifyHostWrite(address, m_tiled.size());
             return {width, height};
         }
         decoder->Render(*frame.picture, layout.format, width, height, layout.pitch,
@@ -3785,6 +3803,8 @@ private:
         if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
             system.GPU().InvalidateRegion(*device, layout.size);
         }
+        // VTX-HLE's copies of that memory (GPU-only pool buffers, texture images) follow too.
+        Core::NvnHle::Hle::Runtime::Instance().NotifyHostWrite(address, layout.size);
         return {width, height};
     }
 
@@ -3989,9 +4009,16 @@ public:
             {1612, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool1612"},
             {1691, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize1691"},
         });
+        // VTX-HLE makes its native image pools out of this session's images.
+        Nx2NativeImageDirectory::Get().Add(
+            this, [objects = std::weak_ptr<Nx2NativeObjects>{m_objects}](u32 handle) {
+                const auto locked = objects.lock();
+                return locked ? Nx2DescribeNativeImage(*locked, handle) : std::nullopt;
+            });
     }
 
     ~INx2GraphicsSystemSession() override {
+        Nx2NativeImageDirectory::Get().Remove(this);
         if (m_syncpt_memory != nullptr) {
             system.Host1x().GetSyncpointManager().SetGuestMirror({});
         }

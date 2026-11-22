@@ -237,6 +237,8 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdDrawIndexedIndirectCount vkCmdDrawIndexedIndirectCount{};
     PFN_vkCmdDrawIndirectByteCountEXT vkCmdDrawIndirectByteCountEXT{};
     PFN_vkCmdDrawMeshTasksEXT vkCmdDrawMeshTasksEXT{};
+    PFN_vkCmdDrawMeshTasksIndirectEXT vkCmdDrawMeshTasksIndirectEXT{};
+    PFN_vkCmdDrawMeshTasksIndirectCountEXT vkCmdDrawMeshTasksIndirectCountEXT{};
     PFN_vkCmdEndConditionalRenderingEXT vkCmdEndConditionalRenderingEXT{};
     PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT{};
     PFN_vkCmdEndQuery vkCmdEndQuery{};
@@ -246,9 +248,9 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier{};
     PFN_vkCmdPipelineBarrier2 vkCmdPipelineBarrier2{};
     PFN_vkCmdPushConstants vkCmdPushConstants{};
+    PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR{};
     PFN_vkCmdPushDescriptorSetWithTemplateKHR vkCmdPushDescriptorSetWithTemplateKHR{};
     PFN_vkCmdResetQueryPool vkCmdResetQueryPool{};
-    PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp{};
     PFN_vkCmdResolveImage vkCmdResolveImage{};
     PFN_vkCmdSetBlendConstants vkCmdSetBlendConstants{};
     PFN_vkCmdSetCullModeEXT vkCmdSetCullModeEXT{};
@@ -289,6 +291,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdSetColorBlendEnableEXT vkCmdSetColorBlendEnableEXT{};
     PFN_vkCmdSetColorBlendEquationEXT vkCmdSetColorBlendEquationEXT{};
     PFN_vkCmdWaitEvents vkCmdWaitEvents{};
+    PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp{};
     PFN_vkCreateBuffer vkCreateBuffer{};
     PFN_vkCreateBufferView vkCreateBufferView{};
     PFN_vkCreateCommandPool vkCreateCommandPool{};
@@ -1287,15 +1290,16 @@ public:
         dld->vkCmdResetQueryPool(handle, query_pool, first, count);
     }
 
-    void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
-                        u32 query) const noexcept {
-        dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
-    }
-
     void BindDescriptorSets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, u32 first,
                             Span<VkDescriptorSet> sets, Span<u32> dynamic_offsets) const noexcept {
         dld->vkCmdBindDescriptorSets(handle, bind_point, layout, first, sets.size(), sets.data(),
                                      dynamic_offsets.size(), dynamic_offsets.data());
+    }
+
+    void PushDescriptorSetKHR(VkPipelineBindPoint bind_point, VkPipelineLayout layout, u32 set,
+                              Span<VkWriteDescriptorSet> writes) const noexcept {
+        dld->vkCmdPushDescriptorSetKHR(handle, bind_point, layout, set, writes.size(),
+                                       writes.data());
     }
 
     void PushDescriptorSetWithTemplateKHR(VkDescriptorUpdateTemplate update_template,
@@ -1345,6 +1349,18 @@ public:
 
     void DrawMeshTasksEXT(u32 group_count_x, u32 group_count_y, u32 group_count_z) const noexcept {
         dld->vkCmdDrawMeshTasksEXT(handle, group_count_x, group_count_y, group_count_z);
+    }
+
+    void DrawMeshTasksIndirectEXT(VkBuffer buffer, VkDeviceSize offset, u32 draw_count,
+                                  u32 stride) const noexcept {
+        dld->vkCmdDrawMeshTasksIndirectEXT(handle, buffer, offset, draw_count, stride);
+    }
+
+    void DrawMeshTasksIndirectCountEXT(VkBuffer buffer, VkDeviceSize offset, VkBuffer count_buffer,
+                                       VkDeviceSize count_offset, u32 max_draw_count,
+                                       u32 stride) const noexcept {
+        dld->vkCmdDrawMeshTasksIndirectCountEXT(handle, buffer, offset, count_buffer, count_offset,
+                                                max_draw_count, stride);
     }
 
     void DrawIndirectCount(VkBuffer src_buffer, VkDeviceSize src_offset, VkBuffer count_buffer,
@@ -1611,6 +1627,11 @@ public:
         dld->vkCmdWaitEvents(handle, events.size(), events.data(), src_stage_mask, dst_stage_mask,
                              memory_barriers.size(), memory_barriers.data(), buffer_barriers.size(),
                              buffer_barriers.data(), image_barriers.size(), image_barriers.data());
+    }
+
+    void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
+                        u32 query) const noexcept {
+        dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
     }
 
     void BindVertexBuffers2EXT(u32 first_binding, u32 binding_count, const VkBuffer* buffers,

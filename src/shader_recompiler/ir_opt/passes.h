@@ -19,6 +19,10 @@ struct HostTranslateInfo;
 namespace Shader::Optimization {
 
 void CollectShaderInfoPass(Environment& env, IR::Program& program);
+/// Reads VTX-HLE's NVN2 compute driver bank window from `env` into `program.info` (no-op for every
+/// other environment). Runs before GlobalMemoryToStorageBufferPass, which biases its tracking
+/// towards the window, and again inside CollectShaderInfoPass.
+void ApplyNvnBufferWindow(Environment& env, IR::Program& program);
 void ConditionalBarrierPass(IR::Program& program);
 void ConstantPropagationPass(Environment& env, IR::Program& program);
 void DeadCodeEliminationPass(IR::Program& program);
@@ -48,5 +52,9 @@ void VertexBTransformPass(IR::Program& program);
 void JoinTextureInfo(Info& base, Info& source);
 /// Adds the storage buffers of source to base, at most limit in all
 void JoinStorageInfo(Info& base, Info& source, size_t limit = Info::MAX_SSBOS);
+/// Appends the raw global memory address table as the last storage buffer descriptor (see
+/// HostTranslateInfo::nvn_raw_global_table_ssbo). No-op unless `info` uses raw global memory with
+/// a table storage buffer.
+void AddRawGlobalTableDescriptor(Info& info);
 
 } // namespace Shader::Optimization

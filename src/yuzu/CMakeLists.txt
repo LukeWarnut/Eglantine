@@ -159,6 +159,8 @@ add_executable(yuzu
     configuration/input_profiles.h
     configuration/shared_widget.cpp
     configuration/shared_widget.h
+    configuration/vtx_hle_grey.cpp
+    configuration/vtx_hle_grey.h
     debugger/console.cpp
     debugger/console.h
     debugger/controller.cpp

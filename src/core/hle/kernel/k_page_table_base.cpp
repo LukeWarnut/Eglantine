@@ -3251,6 +3251,11 @@ Result KPageTableBase::WriteDebugMemory(KProcessAddress dst_address, KProcessAdd
         R_UNLESS(can_debug, ResultInvalidCurrentMemory);
     }
 
+    // The copy below writes the process' memory through host pointers: tell the page tracker.
+    SCOPE_EXIT {
+        m_memory->NotifyHostWrite(GetInteger(dst_address), size);
+    };
+
     // Get the impl.
     auto& impl = this->GetImpl();
     auto& src_memory = GetCurrentMemory(m_system.Kernel());
@@ -4025,6 +4030,11 @@ Result KPageTableBase::CopyMemoryFromKernelToLinear(KProcessAddress dst_addr, si
             dst_addr, size, dst_state_mask, dst_state, dst_test_perm, dst_test_perm,
             dst_attr_mask | KMemoryAttribute::Uncached, dst_attr));
 
+        // The copy writes the process' memory through host pointers: tell the page tracker.
+        SCOPE_EXIT {
+            m_memory->NotifyHostWrite(GetInteger(dst_addr), size);
+        };
+
         auto& impl = this->GetImpl();
 
         // Begin traversal.
@@ -4110,6 +4120,12 @@ Result KPageTableBase::CopyMemoryFromHeapToHeap(
         R_TRY(dst_page_table.CheckMemoryStateContiguous(
             dst_addr, size, dst_state_mask, dst_state, dst_test_perm, dst_test_perm,
             dst_attr_mask | KMemoryAttribute::Uncached, dst_attr));
+
+        // The copy writes the destination process' memory through host pointers: tell its page
+        // tracker.
+        SCOPE_EXIT {
+            dst_page_table.m_memory->NotifyHostWrite(GetInteger(dst_addr), size);
+        };
 
         // Get implementations.
         auto& src_impl = src_page_table.GetImpl();
@@ -4242,6 +4258,12 @@ Result KPageTableBase::CopyMemoryFromHeapToHeapWithoutCheckDestination(
         R_TRY(src_page_table.CheckMemoryStateContiguous(
             src_addr, size, src_state_mask, src_state, src_test_perm, src_test_perm,
             src_attr_mask | KMemoryAttribute::Uncached, src_attr));
+
+        // The copy writes the destination process' memory through host pointers: tell its page
+        // tracker.
+        SCOPE_EXIT {
+            dst_page_table.m_memory->NotifyHostWrite(GetInteger(dst_addr), size);
+        };
 
         // Destination state is intentionally unchecked.
 

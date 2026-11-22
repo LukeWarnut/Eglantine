@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/renderer_vulkan/present/present_semaphore_ticks.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Layout {
@@ -41,7 +42,28 @@ public:
 
     /// Acquires the next image in the swapchain, waits as needed.
     /// `may_flush`: false on the async present thread (see Scheduler::Wait).
-    bool AcquireNextImage(bool may_flush = true);
+    /// `renderer_paced`: the frame was rendered through `scheduler`, whose tick then paces the
+    /// image. False for frames another submitter rendered (VTX-HLE's replay): the renderer's
+    /// scheduler holds none of their work, so those frames are paced by their own fences and by
+    /// the present timeline (`PresentTimeline`).
+    bool AcquireNextImage(bool may_flush = true, bool renderer_paced = true);
+
+    /// Timeline semaphore the submission that waits on `CurrentPresentSemaphore` of a frame that
+    /// is not renderer paced signals, with `NextPresentTimelineValue`; null unless VTX-HLE runs.
+    /// Recorded by `MarkPresentTimelineSubmitted` once submitted.
+    [[nodiscard]] VkSemaphore PresentTimeline() const {
+        return *present_timeline;
+    }
+
+    [[nodiscard]] u64 NextPresentTimelineValue() const {
+        return present_semaphore_ticks.Next();
+    }
+
+    /// The submission waiting on `CurrentPresentSemaphore` was submitted and signals
+    /// `NextPresentTimelineValue`: the next acquire with this semaphore waits for it to have run.
+    void MarkPresentTimelineSubmitted() {
+        present_semaphore_ticks.Submitted(frame_index);
+    }
 
     /// Presents the rendered image to the swapchain.
     void Present(VkSemaphore render_semaphore);
@@ -134,6 +156,10 @@ private:
     std::vector<u64> resource_ticks;
     std::vector<vk::Semaphore> present_semaphores;
     std::vector<vk::Semaphore> render_semaphores;
+    /// Present timeline (see PresentTimeline) and, per present semaphore, its value signalled
+    /// by the submission that last waited on it.
+    vk::Semaphore present_timeline;
+    PresentSemaphoreTicks present_semaphore_ticks;
 
     u32 width;
     u32 height;

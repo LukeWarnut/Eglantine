@@ -141,6 +141,8 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdDrawIndexedIndirectCount);
     X(vkCmdDrawIndirectByteCountEXT);
     X(vkCmdDrawMeshTasksEXT);
+    X(vkCmdDrawMeshTasksIndirectEXT);
+    X(vkCmdDrawMeshTasksIndirectCountEXT);
     X(vkCmdEndConditionalRenderingEXT);
     X(vkCmdEndQuery);
     X(vkCmdEndRenderPass);
@@ -150,6 +152,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdPipelineBarrier);
     X(vkCmdPipelineBarrier2);
     X(vkCmdPushConstants);
+    X(vkCmdPushDescriptorSetKHR);
     X(vkCmdPushDescriptorSetWithTemplateKHR);
     X(vkCmdSetBlendConstants);
     X(vkCmdSetDepthBias);
@@ -162,6 +165,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdSetStencilWriteMask);
     X(vkCmdSetViewport);
     X(vkCmdWaitEvents);
+    X(vkCmdWriteTimestamp);
     X(vkCmdBindVertexBuffers2EXT);
     X(vkCmdSetCullModeEXT);
     X(vkCmdSetDepthBoundsTestEnableEXT);
@@ -191,7 +195,6 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdSetColorBlendEnableEXT);
     X(vkCmdSetColorBlendEquationEXT);
     X(vkCmdResetQueryPool);
-    X(vkCmdWriteTimestamp);
     X(vkCmdResolveImage);
     X(vkCreateBuffer);
     X(vkCreateBufferView);
