@@ -414,6 +414,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("This option can be overridden when region setting is auto-select"));
     INSERT(Settings, region_index, tr("Region:"), tr("The region of the console."));
     INSERT(Settings, time_zone_index, tr("Time Zone:"), tr("The time zone of the console."));
+    INSERT(Settings, console_theme, tr("Console Theme:"),
+           tr("The system theme reported to games and homebrew that follow it, such as hbmenu."));
     INSERT(Settings, sound_index, tr("Sound Output Mode:"), QString());
     INSERT(Settings, use_docked_mode, tr("Console Mode:"),
            tr("Selects if the console is in Docked or Handheld mode.\nGames will change "
@@ -691,6 +693,11 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(Region, China, tr("China")),
                               PAIR(Region, Korea, tr("Korea")),
                               PAIR(Region, Taiwan, tr("Taiwan")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::ConsoleTheme>::Index(),
+                          {
+                              PAIR(ConsoleTheme, BasicWhite, tr("Basic White")),
+                              PAIR(ConsoleTheme, BasicBlack, tr("Basic Black")),
                           }});
     translations->insert(
         {Settings::EnumMetadata<Settings::TimeZone>::Index(),

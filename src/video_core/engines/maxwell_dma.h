@@ -251,6 +251,8 @@ public:
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
 private:
+    void WriteRegister(u32 method, u32 value);
+
     /// Performs the copy from the source buffer to the destination buffer as configured in the
     /// registers.
     void Launch();

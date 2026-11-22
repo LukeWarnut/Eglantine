@@ -589,15 +589,18 @@ Result ISystemSettingsServer::SetEulaVersions(
 }
 
 Result ISystemSettingsServer::GetColorSetId(Out<ColorSet> out_color_set_id) {
-    LOG_DEBUG(Service_SET, "called, color_set=", m_system_settings.color_set_id);
-
-    *out_color_set_id = m_system_settings.color_set_id;
+    // The console theme setting is the source of truth, as for the region and language.
+    *out_color_set_id = static_cast<ColorSet>(Settings::values.console_theme.GetValue());
+    LOG_DEBUG(Service_SET, "called, color_set={}", *out_color_set_id);
     R_SUCCEED();
 }
 
 Result ISystemSettingsServer::SetColorSetId(ColorSet color_set_id) {
     LOG_DEBUG(Service_SET, "called, color_set={}", color_set_id);
 
+    if (color_set_id <= ColorSet::BasicBlack) {
+        Settings::values.console_theme.SetValue(static_cast<Settings::ConsoleTheme>(color_set_id));
+    }
     m_system_settings.color_set_id = color_set_id;
     SetSaveNeeded();
     R_SUCCEED();

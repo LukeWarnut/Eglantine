@@ -172,6 +172,7 @@ ENUM(Upscaler, Auto, Game, Fsr, Bilinear, Dlss, Dlaa);
 ENUM(ColdHintMode, Off, WhenRamIsLow, Always);
 ENUM(MeshShaderMode, Auto, Native, ComputeFallback);
 ENUM(UpdateChannel, Unset, Stable, ReleaseCandidate, Daily);
+ENUM(ConsoleTheme, BasicWhite, BasicBlack);
 
 template <typename Type>
 inline std::string_view CanonicalizeEnum(Type id) {

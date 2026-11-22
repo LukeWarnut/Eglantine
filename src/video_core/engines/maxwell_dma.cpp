@@ -40,19 +40,42 @@ void MaxwellDMA::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
 
 void MaxwellDMA::ConsumeSinkImpl(Core::System& system) {
     for (auto [method, value] : method_sink) {
-        regs.reg_array[method] = value;
+        WriteRegister(method, value);
     }
     method_sink.clear();
 }
 
-void MaxwellDMA::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
+void MaxwellDMA::WriteRegister(u32 method, u32 value) {
     if (method >= NUM_REGS) {
         // Ampere copy (Switch 2) can use methods past this register file; don't write past it.
         LOG_DEBUG(HW_GPU, "Ignoring MaxwellDMA method {:#x} past the register file", method);
         return;
     }
+    regs.reg_array[method] = value;
 
-    regs.reg_array[method] = method_argument;
+    // Pascal and later copy classes also take each origin as its own 32-bit method
+    // (NVC1B5_SRC_ORIGIN_X..NVC1B5_DST_ORIGIN_Y), which NVK uses instead of the packed
+    // SET_SRC_ORIGIN/SET_DST_ORIGIN. Whichever form was written last applies.
+    switch (method) {
+    case 0x744 / sizeof(u32):
+        regs.src_params.origin.x.Assign(value);
+        break;
+    case 0x748 / sizeof(u32):
+        regs.src_params.origin.y.Assign(value);
+        break;
+    case 0x74C / sizeof(u32):
+        regs.dst_params.origin.x.Assign(value);
+        break;
+    case 0x750 / sizeof(u32):
+        regs.dst_params.origin.y.Assign(value);
+        break;
+    default:
+        break;
+    }
+}
+
+void MaxwellDMA::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
+    WriteRegister(method, method_argument);
 
     if (method == offsetof(Regs, launch_dma) / sizeof(u32)) {
         Launch();
