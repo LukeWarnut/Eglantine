@@ -2304,7 +2304,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             } else {
                 for (u32 i = 0; i < rg_masks.size(); ++i) if (rg_masks[i] == mask) swizzle = i;
             }
-            if (!insn.Bits(60, 1) || (dimension != 0 && dimension != 1 && !array && !volume) ||
+            // Bit 60 clear (NAK's non-scalar form, e.g. a level fetch): the coordinates fill Ra and
+            // the level, offset and sample Rb, instead of the values being split evenly over both.
+            // The two agree for 1D with up to one more value and 2D with one or two (Ra = x, y).
+            const u32 extras = u32{level} + u32{offsets} + u32{multisample};
+            const bool same_layout = insn.Bits(60, 1) || (dimension == 0 && extras <= 1) ||
+                                     (dimension == 1 && extras >= 1 && extras <= 2);
+            if (!same_layout || (dimension != 0 && dimension != 1 && !array && !volume) ||
                 swizzle == ~0U || (insn.Bits(76, 5) & ~5U) ||
                 (multisample && (dimension != 1 || level || offsets || (source_a & 1) || source_a >= 254 ||
                                  source_b == 255)) ||

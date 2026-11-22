@@ -71,6 +71,30 @@ TEST_CASE("Ampere TLD.SCR.LZ takes its handle from a uniform register", "[video_
     REQUIRE(((tld >> 31) & 0xf) == 7);
 }
 
+TEST_CASE("Ampere TLD.LL without the scalar bit lowers like the scalar form", "[video_core][ampere]") {
+    // NAK (Touhou 10's pause capture blit): TLD.LL R6, R2, R4, R0, 0x0, 1, 2D, 0xf. Bit 60 is clear
+    // because the level makes a second source list: x, y in R4, R5, the level in R0.
+    const std::array<Instruction, 2> code{{
+        {{0x04067b66, 0x20400000, 0x059e0f02, 0x00be0400}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    const u64 tlds = FindMaxwell(lowered, 0xda, 56);
+    REQUIRE(tlds != 0);
+    REQUIRE(((tlds >> 8) & 0xff) == 4);  // x, y
+    REQUIRE(((tlds >> 20) & 0xff) == 0); // level
+    REQUIRE(((tlds >> 53) & 0xf) == 5);  // 2D.LL
+
+    // 2D at level zero has nothing after the coordinates: without the bit, x and y sit together
+    // in Ra rather than split over Ra and Rb, which this lowering doesn't read.
+    const std::array<Instruction, 2> unsplit{{
+        {{0x04067b66, 0x20400000, 0x009e0f02, 0x00be0400}},
+        EXIT,
+    }};
+    REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(unsplit)));
+}
+
 TEST_CASE("Ampere I2F converts signed 16-bit sources", "[video_core][ampere]") {
     // I2F.S16 R8, R8
     const std::array<Instruction, 2> code{{
