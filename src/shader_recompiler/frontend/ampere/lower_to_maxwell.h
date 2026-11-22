@@ -101,7 +101,7 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
     const auto operand = [&](u32 bit, u32 count = 1) { operands.push_back({bit, count}); };
     const u32 opcode = input.Bits(0, 12);
     switch (opcode) {
-    case 0x802: case 0xa02: case 0xb08: case 0xd08: operand(16); break;
+    case 0x802: case 0xa02: case 0xb06: case 0xb08: case 0xd08: operand(16); break;
     case 0x804: case 0x80b: case 0x80c: operand(24); break; // 0x80b: FSETP, immediate B
     case 0x805: operand(16, 2); break;
     case 0x306: case 0x308: operand(16); operand(32); break; // I2F, MUFU
@@ -3134,9 +3134,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{insn.Bits(60, 2)} << 41));
             break;
         }
-        case 0x906: { // I2F.F32.U32/S32 of an immediate; rounding (78-79) as Maxwell's (39-40).
+        case 0x906: case 0xb06: { // I2F.F32.U32/S32 of an immediate or a constant buffer (Ship of
+                                  // Harkinian, NAK: I2F.F32.S32 R2, c[0x2][0x4]); rounding (78-79) as Maxwell's (39-40).
             if ((insn.words[2] & ~0xc400U) != 0x00201000) return fail(index, "native immediate integer-to-float mode");
-            mov_imm(250, insn.words[1]);
+            if (opcode == 0xb06) {
+                if (insn.Bits(60, 4) || materialize(2, 255, 250, false, false) == 255)
+                    return fail(index, "native constant buffer integer-to-float mode");
+            } else {
+                mov_imm(250, insn.words[1]);
+            }
             emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{2} << 10) | (u64{insn.Bits(74, 1)} << 13) |
                  (u64{250} << 20) | (u64{insn.Bits(78, 2)} << 39));
             break;

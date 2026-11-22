@@ -222,6 +222,19 @@ ToolResult Backtrace(ToolContext& ctx, const json& args) {
             }
             json t = ThreadJson(thread);
             t["frames"] = std::move(frames);
+            if (!all) {
+                // One thread: also its registers, to follow a blocked wait into guest memory.
+                const auto& context = thread.GetContext();
+                json regs = json::object();
+                for (size_t i = 0; i < 29; ++i) {
+                    regs[fmt::format("x{}", i)] = Hex(context.r[i]);
+                }
+                regs["fp"] = Hex(context.fp);
+                regs["lr"] = Hex(context.lr);
+                regs["sp"] = Hex(context.sp);
+                regs["pc"] = Hex(context.pc);
+                t["registers"] = std::move(regs);
+            }
             threads.push_back(std::move(t));
         }
     }

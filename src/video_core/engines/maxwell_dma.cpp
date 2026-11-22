@@ -25,6 +25,24 @@ namespace Tegra::Engines {
 
 using namespace Texture;
 
+namespace {
+// With remap enabled, line lengths, widths and X origins count elements of the destination
+// component size times component count (NVK uploads every texture this way); without it, bytes.
+template <typename Regs>
+u32 RemapElementSize(const Regs& regs) {
+    if (regs.launch_dma.remap_enable == 0) {
+        return 1;
+    }
+    return (regs.remap_const.component_size_minus_one + 1) *
+           (regs.remap_const.num_dst_components_minus_one + 1);
+}
+
+// The accelerated image copies view the image as one of these element sizes.
+bool IsAcceleratedElementSize(u32 size) {
+    return size == 1 || size == 2 || size == 4 || size == 8 || size == 16;
+}
+} // namespace
+
 MaxwellDMA::MaxwellDMA(MemoryManager& memory_manager_)
     : memory_manager{memory_manager_}
 {
@@ -121,6 +139,17 @@ void MaxwellDMA::Launch() {
     const LaunchDMA& launch = regs.launch_dma;
     ASSERT(launch.interrupt_type == LaunchDMA::InterruptType::NONE);
 
+    // ouncevk (NVK) follows its copies with launches of zero lines or zero length. They move
+    // nothing; the buffer cache would otherwise build a zero-sized buffer for them.
+    if (regs.line_length_in == 0 || (launch.multi_line_enable && regs.line_count == 0)) {
+        ReleaseSemaphore();
+        return;
+    }
+    const u32 element_size = RemapElementSize(regs);
+    const bool is_const_a_dst = launch.remap_enable != 0 &&
+                                regs.remap_const.dst_x == RemapConst::Swizzle::CONST_A;
+    const u32 line_bytes = is_const_a_dst ? regs.line_length_in : regs.line_length_in * element_size;
+
     if (launch.multi_line_enable) {
         const bool is_src_pitch = launch.src_memory_layout == LaunchDMA::MemoryLayout::PITCH;
         const bool is_dst_pitch = launch.dst_memory_layout == LaunchDMA::MemoryLayout::PITCH;
@@ -135,18 +164,18 @@ void MaxwellDMA::Launch() {
         if (is_src_pitch && is_dst_pitch) {
             if (regs.line_count == 1 ||
                 (regs.pitch_in >= 0 && regs.pitch_out >= 0 &&
-                 static_cast<u32>(regs.pitch_in) == regs.line_length_in &&
-                 static_cast<u32>(regs.pitch_out) == regs.line_length_in)) {
+                 static_cast<u32>(regs.pitch_in) == line_bytes &&
+                 static_cast<u32>(regs.pitch_out) == line_bytes)) {
                 memory_manager.CopyBlock(
                     regs.offset_out, regs.offset_in,
-                    static_cast<size_t>(regs.line_count) * regs.line_length_in);
+                    static_cast<size_t>(regs.line_count) * line_bytes);
             } else {
                 for (u32 line = 0; line < regs.line_count; ++line) {
                     const GPUVAddr source_line =
                         regs.offset_in + static_cast<size_t>(line) * regs.pitch_in;
                     const GPUVAddr dest_line =
                         regs.offset_out + static_cast<size_t>(line) * regs.pitch_out;
-                    memory_manager.CopyBlock(dest_line, source_line, regs.line_length_in);
+                    memory_manager.CopyBlock(dest_line, source_line, line_bytes);
                 }
             }
         } else {
@@ -159,8 +188,7 @@ void MaxwellDMA::Launch() {
     } else {
         // TODO: allow multisized components.
         auto& accelerate = rasterizer->AccessAccelerateDMA();
-        const bool is_const_a_dst = regs.remap_const.dst_x == RemapConst::Swizzle::CONST_A;
-        if (regs.launch_dma.remap_enable != 0 && is_const_a_dst) {
+        if (is_const_a_dst) {
             const u32 component_size = regs.remap_const.component_size_minus_one + 1;
             ASSERT(component_size == 1 || component_size == 2 || component_size == 4);
             if (component_size == 4) {
@@ -205,12 +233,12 @@ void MaxwellDMA::Launch() {
                         convert_linear_2_blocklinear_addr(regs.offset_out + offset), 16);
                 }
             } else {
-                if (!accelerate.BufferCopy(regs.offset_in, regs.offset_out, regs.line_length_in)) {
+                if (!accelerate.BufferCopy(regs.offset_in, regs.offset_out, line_bytes)) {
                     Tegra::Memory::GpuGuestMemoryScoped<
                         u8, Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>
-                        tmp_write_buffer(memory_manager, regs.offset_in, regs.line_length_in,
+                        tmp_write_buffer(memory_manager, regs.offset_in, line_bytes,
                                          &read_buffer);
-                    tmp_write_buffer.SetAddressAndSize(regs.offset_out, regs.line_length_in);
+                    tmp_write_buffer.SetAddressAndSize(regs.offset_out, line_bytes);
                 }
             }
         }
@@ -224,7 +252,7 @@ void MaxwellDMA::CopyBlockLinearToPitch() {
 
     u32 bytes_per_pixel = 1;
     DMA::ImageOperand src_operand;
-    src_operand.bytes_per_pixel = bytes_per_pixel;
+    src_operand.bytes_per_pixel = RemapElementSize(regs);
     src_operand.params = regs.src_params;
     src_operand.address = regs.offset_in;
 
@@ -237,7 +265,8 @@ void MaxwellDMA::CopyBlockLinearToPitch() {
     copy_info.length_x = regs.line_length_in;
     copy_info.length_y = regs.line_count;
     auto& accelerate = rasterizer->AccessAccelerateDMA();
-    if (accelerate.ImageToBuffer(copy_info, src_operand, dst_operand)) {
+    if (IsAcceleratedElementSize(src_operand.bytes_per_pixel) &&
+        accelerate.ImageToBuffer(copy_info, src_operand, dst_operand)) {
         return;
     }
 
@@ -298,7 +327,7 @@ void MaxwellDMA::CopyPitchToBlockLinear() {
 
     u32 bytes_per_pixel = 1;
     DMA::ImageOperand dst_operand;
-    dst_operand.bytes_per_pixel = bytes_per_pixel;
+    dst_operand.bytes_per_pixel = RemapElementSize(regs);
     dst_operand.params = regs.dst_params;
     dst_operand.address = regs.offset_out;
     DMA::BufferOperand src_operand;
@@ -310,7 +339,8 @@ void MaxwellDMA::CopyPitchToBlockLinear() {
     copy_info.length_x = regs.line_length_in;
     copy_info.length_y = regs.line_count;
     auto& accelerate = rasterizer->AccessAccelerateDMA();
-    if (accelerate.BufferToImage(copy_info, src_operand, dst_operand)) {
+    if (IsAcceleratedElementSize(dst_operand.bytes_per_pixel) &&
+        accelerate.BufferToImage(copy_info, src_operand, dst_operand)) {
         return;
     }
 

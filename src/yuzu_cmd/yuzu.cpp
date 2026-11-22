@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <csignal>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -160,6 +161,21 @@ static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* exception) {
                      path, error);
     }
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// abort(), std::terminate and STL hardening end in __fastfail (0xc0000409), which skips the
+// unhandled exception filter: print their stack too.
+static void PrintAbortStack(const char* reason) {
+    if (std::getenv("EDEN_NX2_CRASH_DUMP") == nullptr) {
+        return;
+    }
+    std::fprintf(stderr, "%s on thread %lu\n", reason, GetCurrentThreadId());
+    void* frames[48];
+    const USHORT count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+    for (USHORT i = 0; i < count; ++i) {
+        PrintCodeAddress("frame", frames[i]);
+    }
+    std::fflush(stderr);
 }
 #endif
 
@@ -563,6 +579,15 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(WriteCrashDump);
+    std::set_terminate([] {
+        PrintAbortStack("std::terminate");
+        std::abort();
+    });
+    std::signal(SIGABRT, [](int) { PrintAbortStack("abort"); });
+    _set_invalid_parameter_handler([](const wchar_t*, const wchar_t*, const wchar_t*, unsigned, uintptr_t) {
+        PrintAbortStack("CRT invalid parameter");
+        std::abort();
+    });
 #endif
     Nx2Sampler::StartFromEnvironment();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling

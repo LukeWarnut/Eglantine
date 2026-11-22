@@ -74,4 +74,17 @@ TEST_CASE("Ampere I2F converts 16-bit uniform sources", "[video_core][ampere]") 
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(code)));
 }
 
+TEST_CASE("Ampere I2F converts 32-bit constant buffer sources", "[video_core][ampere]") {
+    // Ship of Harkinian's pixel shaders (NAK): I2F.F32.S32 R2, c[0x2][0x4].
+    const std::array<Instruction, 2> code{{
+        {{0x00027b06, 0x00800100, 0x00201400, 0x000e8200}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    // MOV R250, c[0x2][0x4], then a signed 32-bit Maxwell I2F of R250.
+    REQUIRE(Contains(lowered, 0x4c980788001700faULL));
+    REQUIRE(Contains(lowered, 0x5cb800000fa72a02ULL));
+}
+
 } // namespace
