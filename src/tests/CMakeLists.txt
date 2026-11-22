@@ -81,6 +81,7 @@ add_executable(tests
     video_core/spirv_atomic_retry.cpp
     video_core/spirv_fragment_shuffle.cpp
     video_core/ampere_depth_compare.cpp
+    video_core/bitselect_texture_handle.cpp
     video_core/shader_bench.cpp
     video_core/shader_precache.cpp
     video_core/shader_precache_identity.cpp

@@ -324,13 +324,32 @@ void Maxwell3D::DrawManager::UpdateTopology(Maxwell3D& maxwell3d) {
         case Maxwell3D::Regs::PrimitiveTopologyOverride::None:
             break;
         case Maxwell3D::Regs::PrimitiveTopologyOverride::Points:
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyPoints:
             draw_state.topology = Maxwell3D::Regs::PrimitiveTopology::Points;
             break;
         case Maxwell3D::Regs::PrimitiveTopologyOverride::Lines:
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyIndexedLines:
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyLines:
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyLinesImm:
             draw_state.topology = Maxwell3D::Regs::PrimitiveTopology::Lines;
             break;
         case Maxwell3D::Regs::PrimitiveTopologyOverride::LineStrip:
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyLineStrip:
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyIndexedLineStrip:
             draw_state.topology = Maxwell3D::Regs::PrimitiveTopology::LineStrip;
+            break;
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyIndexedTriangles:
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyTriangles:
+            draw_state.topology = Maxwell3D::Regs::PrimitiveTopology::Triangles;
+            break;
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyTriangleStrip:
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyIndexedTriangleStrip:
+            draw_state.topology = Maxwell3D::Regs::PrimitiveTopology::TriangleStrip;
+            break;
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyTriangleFan:
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyIndexedTriangleFan:
+        case Maxwell3D::Regs::PrimitiveTopologyOverride::LegacyTriangleFanImm:
+            draw_state.topology = Maxwell3D::Regs::PrimitiveTopology::TriangleFan;
             break;
         default:
             draw_state.topology = Maxwell3D::Regs::PrimitiveTopology(maxwell3d.regs.topology_override);

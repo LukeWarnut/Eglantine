@@ -505,12 +505,57 @@ bool IsMemoryLoad(IR::Opcode opcode) {
     }
 }
 
+// An immediate, or the complement of one (constant propagation leaves BitwiseNot32 of an
+// immediate as it is).
+std::optional<u32> ImmediateMask(const IR::Value& value) {
+    if (value.IsImmediate()) {
+        return value.U32();
+    }
+    const IR::Inst* const inst{value.InstRecursive()};
+    if (inst->GetOpcode() == IR::Opcode::BitwiseNot32 && inst->Arg(0).IsImmediate()) {
+        return ~inst->Arg(0).U32();
+    }
+    return std::nullopt;
+}
+
+// (x | ~m) & (y | m) with an immediate mask m: x's bits outside m merged with y's inside it, the
+// IR of LOP3.LUT 0xe2. NVK builds its combined handles this way, texture index from one word and
+// sampler index from another.
+bool IsBitSelect(const IR::Inst& inst) {
+    if (inst.GetOpcode() != IR::Opcode::BitwiseAnd32) {
+        return false;
+    }
+    std::array<u32, 2> masks{};
+    for (size_t arg = 0; arg < 2; ++arg) {
+        if (inst.Arg(arg).IsImmediate()) {
+            return false;
+        }
+        const IR::Inst* const term{inst.Arg(arg).InstRecursive()};
+        if (term->GetOpcode() != IR::Opcode::BitwiseOr32) {
+            return false;
+        }
+        const std::optional lhs{ImmediateMask(term->Arg(0))};
+        const std::optional rhs{ImmediateMask(term->Arg(1))};
+        if (lhs.has_value() == rhs.has_value()) {
+            return false;
+        }
+        masks[arg] = lhs ? *lhs : *rhs;
+    }
+    return masks[0] == ~masks[1];
+}
+
 std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
     // A value loaded from memory is not a constant buffer word, whatever its address is built
     // from: the search does not look into a load's operands (a handle read from a storage
     // buffer would otherwise be taken from the buffer's address in the constant buffer).
     const IR::Value start{ResolveConditionalPhi(value, block)};
     if (start.IsImmediate()) {
+        return std::nullopt;
+    }
+    // No single word gives a bit select, and the search would keep whichever of its words it
+    // reached first (the sampler word for NVK's blits, which then read texture 0): leave it to a
+    // handle program, which computes it for each draw.
+    if (IsBitSelect(*start.InstRecursive())) {
         return std::nullopt;
     }
     std::unordered_set<const IR::Inst*> visited;
