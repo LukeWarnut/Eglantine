@@ -45,7 +45,10 @@ public:
     std::optional<u32> MemoryReadCode(u64 vaddr) override;
     void InstructionSynchronizationBarrierRaised() override {
         last_code_addr = u64(-1); //reset back, force refetch
+        FlushInstructionCacheLines();
     }
+    /// Invalidates the lines IC IVAU named since the last flush.
+    void FlushInstructionCacheLines();
     void MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) override;
     void MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value) override;
     bool MemoryWriteExclusive8(u64 vaddr, std::uint8_t value, std::uint8_t expected) override;
@@ -70,6 +73,11 @@ public:
     u64 m_tpidr_el0{};
     u64 m_last_cntpct{}; ///< The previous counter read (GetCNTPCT spin detection)
     u64 m_spin_ticks{32}; ///< Reads closer than this (~1.7 us) count as a polling loop
+    // IC IVAU lines not invalidated yet. A loop over a whole code region (libnx
+    // armICacheInvalidate) names one line per instruction: invalidating each with its own halt
+    // made 211 MB take minutes, so contiguous lines wait for the ISB that has to follow them.
+    u64 m_icache_lines_start{};
+    u64 m_icache_lines_end{};
     Kernel::KProcess* m_process{};
     const bool m_debugger_enabled{};
     const bool m_check_memory_access{};

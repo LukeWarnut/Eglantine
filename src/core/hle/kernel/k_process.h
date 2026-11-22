@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <map>
 
 #include "core/arm/arm_interface.h"
@@ -91,6 +92,8 @@ private:
     KProcessAddress m_arg_pointer{};
     KProcessAddress m_arg_return_address{};
     KProcessAddress m_main_thread_handle_addr{};
+    std::function<void(KProcess&)> m_run_callback;
+    size_t m_alias_region_padding{};
     KHandleTable m_handle_table;
     KProcessAddress m_plr_address{};
     ThreadList m_thread_list{};
@@ -271,6 +274,14 @@ public:
     }
     void SetMainThreadHandleAddr(KProcessAddress addr) {
         m_main_thread_handle_addr = addr;
+    }
+    /// Grows the alias region of a 39-bit address space; set before LoadFromMetadata.
+    void SetAliasRegionPadding(size_t size) {
+        m_alias_region_padding = size;
+    }
+    /// Called by Run() once the handle table exists, before the main thread starts.
+    void SetRunCallback(std::function<void(KProcess&)> callback) {
+        m_run_callback = std::move(callback);
     }
 
     size_t GetMainStackSize() const {

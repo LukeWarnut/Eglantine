@@ -117,10 +117,22 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
     case Dynarmic::A64::InstructionCacheOperation::InvalidateByVAToPoU: {
         static constexpr u64 ICACHE_LINE_SIZE = 64;
         const u64 cache_line_start = value & ~(ICACHE_LINE_SIZE - 1);
-        m_parent.InvalidateCacheRange(cache_line_start, ICACHE_LINE_SIZE);
-        break;
+        const u64 cache_line_end = cache_line_start + ICACHE_LINE_SIZE;
+        if (m_icache_lines_start != m_icache_lines_end &&
+            (cache_line_start > m_icache_lines_end || cache_line_end < m_icache_lines_start)) {
+            FlushInstructionCacheLines();
+        }
+        if (m_icache_lines_start == m_icache_lines_end) {
+            m_icache_lines_start = cache_line_start;
+            m_icache_lines_end = cache_line_end;
+        } else {
+            m_icache_lines_start = (std::min)(m_icache_lines_start, cache_line_start);
+            m_icache_lines_end = (std::max)(m_icache_lines_end, cache_line_end);
+        }
+        return;
     }
     case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoU:
+        m_icache_lines_start = m_icache_lines_end = 0;
         m_parent.ClearInstructionCache();
         break;
     case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoUInnerSharable:
@@ -154,7 +166,17 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
     }
 }
 
+void DynarmicCallbacks64::FlushInstructionCacheLines() {
+    if (m_icache_lines_start == m_icache_lines_end) {
+        return;
+    }
+    m_parent.InvalidateCacheRange(m_icache_lines_start, m_icache_lines_end - m_icache_lines_start);
+    m_icache_lines_start = m_icache_lines_end = 0;
+    m_parent.m_jit->HaltExecution(Dynarmic::HaltReason::CacheInvalidation);
+}
+
 void DynarmicCallbacks64::CallSVC(u32 svc) {
+    FlushInstructionCacheLines();
     m_parent.m_svc = svc;
     m_parent.m_jit->HaltExecution(SupervisorCall);
 }
@@ -290,6 +312,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
     // Unpredictable instructions
     config.define_unpredictable_behaviour = true;
+
+    // Pending IC IVAU lines are invalidated at the ISB after them.
+    config.hook_isb = true;
 
     // Timing
     config.wall_clock_cntpct = m_uses_wall_clock;
@@ -432,12 +457,17 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     m_jit->ClearExclusiveState();
-    return TranslateHaltReason(m_jit->Run());
+    const auto halt_reason = m_jit->Run();
+    // The thread may go to another core: the lines it named must not wait for an ISB here.
+    m_cb->FlushInstructionCacheLines();
+    return TranslateHaltReason(halt_reason);
 }
 
 HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
     m_jit->ClearExclusiveState();
-    return TranslateHaltReason(m_jit->Step());
+    const auto halt_reason = m_jit->Step();
+    m_cb->FlushInstructionCacheLines();
+    return TranslateHaltReason(halt_reason);
 }
 
 u32 ArmDynarmic64::GetSvcNumber() const {

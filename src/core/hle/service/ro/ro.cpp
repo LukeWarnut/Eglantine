@@ -7,11 +7,25 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
 #include <openssl/err.h>
 #include <openssl/evp.h>
 
+#include "common/logging.h"
 #include "common/scope_exit.h"
+#include "core/arm/arm_interface.h"
+#include "core/core.h"
+#include "core/hardware_properties.h"
+#include "core/hle/kernel/k_client_port.h"
+#include "core/hle/kernel/k_client_session.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/kernel.h"
+#include "core/hle/service/sm/sm.h"
 
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/ro/ro.h"
@@ -335,6 +349,11 @@ public:
         R_SUCCEED();
     }
 
+    Kernel::KProcess* GetProcess(size_t context_id) {
+        const ProcessContext* ctx = this->GetContextById(context_id);
+        return ctx != nullptr ? ctx->GetProcess() : nullptr;
+    }
+
     void UnregisterProcess(Kernel::KernelCore& kernel, size_t context_id) {
         this->FreeContext(kernel, context_id);
     }
@@ -567,6 +586,70 @@ private:
     }
 };
 
+// kaihen's ldr:ro (ouncebrew/kaihen, libkaihen/include/kaihen/protocol.h): Switch 2 homebrew
+// compiles code into its heap and has ldr:ro map those pages as code, through the session
+// ounce-hbloader passes it.
+enum KaihenRoCommand : u32 {
+    KaihenRoCommand_MapJitCode = 65010,
+    KaihenRoCommand_UnmapJitCode = 65011,
+    KaihenRoCommand_ReleaseJitCode = 65012,
+    KaihenRoCommand_MapJitAlias = 65013,
+    KaihenRoCommand_PublishJitAlias = 65014,
+    KaihenRoCommand_PublishJitRanges = 65015,
+};
+
+struct KaihenJitRange {
+    u64 offset;
+    u64 size;
+};
+static_assert(sizeof(KaihenJitRange) == 0x10);
+
+struct KaihenJitAliasInfo {
+    u64 address;
+    u32 memory_type;
+    u32 permission;
+    u32 attribute;
+    u32 reserved;
+};
+static_assert(sizeof(KaihenJitAliasInfo) == 0x18);
+
+constexpr size_t MaxJitMappings = 512;
+
+struct JitMapping {
+    u64 destination;
+    u64 source;
+    u64 size;
+};
+
+std::mutex g_homebrew_mutex;
+// The JIT code each process mapped, by process id.
+std::unordered_map<u64, std::vector<JitMapping>> g_jit_mappings;
+// Processes the homebrew loader opened an ldr:ro session for; that session binds itself to the
+// process on its first request, as if the loader had initialized it.
+std::unordered_set<u64> g_loader_processes;
+
+size_t UnmapJitMappings(Kernel::KProcess& process, std::vector<JitMapping>& mappings) {
+    auto& page_table = process.GetPageTable();
+    for (const auto& mapping : mappings) {
+        const Result result =
+            page_table.UnmapCodeMemory(mapping.destination, mapping.source, mapping.size);
+        if (R_FAILED(result)) {
+            LOG_WARNING(Service_LDR, "Unable to unmap JIT code at {:#x}+{:#x}: {:#x}",
+                        mapping.destination, mapping.size, result.raw);
+        }
+    }
+    return std::exchange(mappings, {}).size();
+}
+
+void PublishJitCode(Kernel::KProcess& process, u64 address, std::span<const u8> data) {
+    process.GetMemory().WriteBlock(address, data.data(), data.size());
+    for (size_t core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+        if (auto* const arm = process.GetArmInterface(core); arm != nullptr) {
+            arm->InvalidateCacheRange(address, data.size());
+        }
+    }
+}
+
 class RoInterface : public ServiceFramework<RoInterface> {
 public:
     explicit RoInterface(Core::System& system_, const char* name_, std::shared_ptr<RoContext> ro,
@@ -582,6 +665,12 @@ public:
             {3,  C<&RoInterface::UnregisterModuleInfo>, "UnregisterModuleInfo"},
             {4,  C<&RoInterface::RegisterProcessHandle>, "RegisterProcessHandle"},
             {10, C<&RoInterface::RegisterProcessModuleInfo>, "RegisterProcessModuleInfo"},
+            {KaihenRoCommand_MapJitCode, C<&RoInterface::MapJitCode>, "MapJitCode"},
+            {KaihenRoCommand_UnmapJitCode, C<&RoInterface::UnmapJitCode>, "UnmapJitCode"},
+            {KaihenRoCommand_ReleaseJitCode, C<&RoInterface::ReleaseJitCode>, "ReleaseJitCode"},
+            {KaihenRoCommand_MapJitAlias, C<&RoInterface::MapJitAlias>, "MapJitAlias"},
+            {KaihenRoCommand_PublishJitAlias, C<&RoInterface::PublishJitAlias>, "PublishJitAlias"},
+            {KaihenRoCommand_PublishJitRanges, C<&RoInterface::PublishJitRanges>, "PublishJitRanges"},
         };
         // clang-format on
 
@@ -589,45 +678,205 @@ public:
     }
 
     ~RoInterface() {
+        if (auto* const process = m_ro->GetProcess(m_context_id); process != nullptr) {
+            // The process is going away with the session: its mappings go with its page table.
+            std::scoped_lock lk{g_homebrew_mutex};
+            g_jit_mappings.erase(process->GetProcessId());
+        }
         m_ro->UnregisterProcess(system.Kernel(), m_context_id);
+    }
+
+    Result MapJitCode(ClientProcessId client_pid, u64 destination, u64 source, u64 size) {
+        LOG_DEBUG(Service_LDR, "MapJitCode {:#x} <- {:#x} +{:#x}", destination, source, size);
+        R_TRY(this->ValidateClient(*client_pid));
+        R_TRY(ValidateAddressAndNonZeroSize(destination, size));
+        R_TRY(ValidateAddressAndNonZeroSize(source, size));
+        auto* const process = m_ro->GetProcess(m_context_id);
+
+        std::scoped_lock lk{g_homebrew_mutex};
+        auto& mappings = g_jit_mappings[*client_pid];
+        R_UNLESS(mappings.size() < MaxJitMappings, RO::ResultTooManyNro);
+        auto& page_table = process->GetPageTable();
+        R_TRY(page_table.MapCodeMemory(destination, source, size));
+        const Result result = page_table.SetProcessMemoryPermission(
+            destination, size, Kernel::Svc::MemoryPermission::ReadExecute);
+        if (R_FAILED(result)) {
+            static_cast<void>(page_table.UnmapCodeMemory(destination, source, size));
+            R_RETURN(result);
+        }
+        mappings.push_back({destination, source, size});
+        R_SUCCEED();
+    }
+
+    Result UnmapJitCode(ClientProcessId client_pid, u64 destination, u64 source, u64 size) {
+        LOG_DEBUG(Service_LDR, "UnmapJitCode {:#x} <- {:#x} +{:#x}", destination, source, size);
+        R_TRY(this->ValidateClient(*client_pid));
+        std::scoped_lock lk{g_homebrew_mutex};
+        auto& mappings = g_jit_mappings[*client_pid];
+        const auto it = std::ranges::find_if(mappings, [&](const JitMapping& mapping) {
+            return mapping.destination == destination && mapping.source == source &&
+                   mapping.size == size;
+        });
+        R_UNLESS(it != mappings.end(), RO::ResultNotLoaded);
+        R_TRY(m_ro->GetProcess(m_context_id)
+                  ->GetPageTable()
+                  .UnmapCodeMemory(destination, source, size));
+        mappings.erase(it);
+        R_SUCCEED();
+    }
+
+    Result ReleaseJitCode(Out<u64> out_count, ClientProcessId client_pid) {
+        R_TRY(this->ValidateClient(*client_pid));
+        std::scoped_lock lk{g_homebrew_mutex};
+        *out_count = UnmapJitMappings(*m_ro->GetProcess(m_context_id),
+                                      g_jit_mappings[*client_pid]);
+        R_SUCCEED();
+    }
+
+    // kaihen maps the code into its own address space to write it. Here the writes go straight
+    // to the process, so the alias is the code itself.
+    Result MapJitAlias(Out<KaihenJitAliasInfo> out_info, ClientProcessId client_pid,
+                       u64 destination, u64 size) {
+        LOG_DEBUG(Service_LDR, "MapJitAlias {:#x} +{:#x}", destination, size);
+        R_TRY(this->ValidateClient(*client_pid));
+        std::scoped_lock lk{g_homebrew_mutex};
+        R_UNLESS(FindJitMapping(*client_pid, destination, 0, size) != nullptr,
+                 RO::ResultNotLoaded);
+        *out_info = KaihenJitAliasInfo{
+            .address = destination,
+            .memory_type = static_cast<u32>(Kernel::Svc::MemoryState::SharedCode),
+            .permission = static_cast<u32>(Kernel::Svc::MemoryPermission::ReadWrite),
+            .attribute = 0,
+            .reserved = 0,
+        };
+        R_SUCCEED();
+    }
+
+    Result PublishJitAlias(ClientProcessId client_pid, u64 destination, u64 offset, u64 size,
+                           InBuffer<BufferAttr_HipcMapAlias> input) {
+        LOG_DEBUG(Service_LDR, "PublishJitAlias {:#x} +{:#x} {:#x} bytes (buffer {:#x})",
+                  destination, offset, size, input.size());
+        R_TRY(this->ValidateClient(*client_pid));
+        R_UNLESS(input.size() >= size, RO::ResultInvalidSize);
+        std::scoped_lock lk{g_homebrew_mutex};
+        const JitMapping* const mapping = FindJitMapping(*client_pid, destination, offset, size);
+        R_UNLESS(mapping != nullptr, RO::ResultNotLoaded);
+        PublishJitCode(*m_ro->GetProcess(m_context_id), destination + offset,
+                       input.subspan(0, size));
+        R_SUCCEED();
+    }
+
+    Result PublishJitRanges(ClientProcessId client_pid, u64 destination, u64 count,
+                            InBuffer<BufferAttr_HipcMapAlias> ranges_buffer,
+                            InBuffer<BufferAttr_HipcMapAlias> input) {
+        LOG_DEBUG(Service_LDR, "PublishJitRanges {:#x} {} ranges, {:#x} bytes", destination, count,
+                  input.size());
+        R_TRY(this->ValidateClient(*client_pid));
+        R_UNLESS(count <= ranges_buffer.size() / sizeof(KaihenJitRange) &&
+                     ranges_buffer.size() == count * sizeof(KaihenJitRange),
+                 RO::ResultInvalidSize);
+        std::vector<KaihenJitRange> ranges(count);
+        std::memcpy(ranges.data(), ranges_buffer.data(), ranges_buffer.size());
+
+        std::scoped_lock lk{g_homebrew_mutex};
+        u64 total = 0;
+        for (const auto& range : ranges) {
+            R_UNLESS(range.size != 0 &&
+                         FindJitMapping(*client_pid, destination, range.offset, range.size) !=
+                             nullptr,
+                     RO::ResultInvalidSize);
+            total += range.size;
+        }
+        R_UNLESS(total == input.size(), RO::ResultInvalidSize);
+        auto& process = *m_ro->GetProcess(m_context_id);
+        size_t position = 0;
+        for (const auto& range : ranges) {
+            PublishJitCode(process, destination + range.offset,
+                           input.subspan(position, range.size));
+            position += range.size;
+        }
+        R_SUCCEED();
     }
 
     Result MapManualLoadModuleMemory(Out<u64> out_load_address, ClientProcessId client_pid,
                                      u64 nro_address, u64 nro_size, u64 bss_address, u64 bss_size) {
-        R_TRY(m_ro->ValidateProcess(m_context_id, *client_pid));
+        R_TRY(this->ValidateClient(*client_pid));
         R_RETURN(m_ro->MapManualLoadModuleMemory(system.Kernel(), out_load_address.Get(), m_context_id, nro_address,
                                                  nro_size, bss_address, bss_size));
     }
 
     Result UnmapManualLoadModuleMemory(ClientProcessId client_pid, u64 nro_address) {
-        R_TRY(m_ro->ValidateProcess(m_context_id, *client_pid));
+        R_TRY(this->ValidateClient(*client_pid));
         R_RETURN(m_ro->UnmapManualLoadModuleMemory(m_context_id, nro_address));
     }
 
     Result RegisterModuleInfo(ClientProcessId client_pid, u64 nrr_address, u64 nrr_size) {
-        R_TRY(m_ro->ValidateProcess(m_context_id, *client_pid));
+        R_TRY(this->ValidateClient(*client_pid));
         R_RETURN(
             m_ro->RegisterModuleInfo(m_context_id, nrr_address, nrr_size, NrrKind::User, true));
     }
 
     Result UnregisterModuleInfo(ClientProcessId client_pid, u64 nrr_address) {
-        R_TRY(m_ro->ValidateProcess(m_context_id, *client_pid));
+        R_TRY(this->ValidateClient(*client_pid));
         R_RETURN(m_ro->UnregisterModuleInfo(m_context_id, nrr_address));
     }
 
     Result RegisterProcessHandle(ClientProcessId client_pid, InCopyHandle<Kernel::KProcess> process) {
+        {
+            std::scoped_lock lk{g_homebrew_mutex};
+            g_loader_processes.erase(*client_pid);
+        }
         // Register the process.
         R_RETURN(m_ro->RegisterProcess(system.Kernel(), std::addressof(m_context_id), process.Get(), *client_pid));
     }
 
     Result RegisterProcessModuleInfo(ClientProcessId client_pid, u64 nrr_address, u64 nrr_size, InCopyHandle<Kernel::KProcess> process) {
         // Validate the process.
-        R_TRY(m_ro->ValidateProcess(m_context_id, *client_pid));
+        R_TRY(this->ValidateClient(*client_pid));
         // Register the module.
         R_RETURN(m_ro->RegisterModuleInfo(m_context_id, nrr_address, nrr_size, m_nrr_kind, m_nrr_kind == NrrKind::JitPlugin));
     }
 
 private:
+    Result ValidateClient(u64 process_id) {
+        if (m_context_id == InvalidContextId) {
+            this->BindLoaderSession(process_id);
+        }
+        R_RETURN(m_ro->ValidateProcess(m_context_id, process_id));
+    }
+
+    // A session the homebrew loader opened is bound to its process already.
+    void BindLoaderSession(u64 process_id) {
+        {
+            std::scoped_lock lk{g_homebrew_mutex};
+            if (g_loader_processes.erase(process_id) == 0) {
+                return;
+            }
+        }
+        for (auto& process : kernel.GetProcessList()) {
+            if (process->GetProcessId() == process_id) {
+                static_cast<void>(m_ro->RegisterProcess(kernel, std::addressof(m_context_id),
+                                                        process.GetPointerUnsafe(), process_id));
+                return;
+            }
+        }
+    }
+
+    // Requires g_homebrew_mutex.
+    const JitMapping* FindJitMapping(u64 process_id, u64 destination, u64 offset, u64 size) {
+        const auto it = g_jit_mappings.find(process_id);
+        if (it == g_jit_mappings.end()) {
+            return nullptr;
+        }
+        for (const auto& mapping : it->second) {
+            if (mapping.destination == destination && offset <= mapping.size &&
+                size <= mapping.size - offset) {
+                return std::addressof(mapping);
+            }
+        }
+        return nullptr;
+    }
+
     std::shared_ptr<RoContext> m_ro{};
     size_t m_context_id{};
     NrrKind m_nrr_kind{};
@@ -661,6 +910,38 @@ void LoopProcess(Core::System& system) {
     server_manager->RegisterNamedService("ro:1", std::make_shared<RoInterface>(system, "ro:1", ro, NrrKind::JitPlugin), 2);
     server_manager->RegisterNamedService("ro:dmnt", std::make_shared<IDebugMonitorInterface>(system), 2);
     ServerManager::RunServer(std::move(server_manager));
+}
+
+u32 OpenHomebrewSession(Core::System& system, Kernel::KProcess& process) {
+    auto& kernel = system.Kernel();
+    Kernel::KClientPort* port{};
+    if (R_FAILED(system.ServiceManager().GetServicePort(&port, "ldr:ro"))) {
+        LOG_WARNING(Service_LDR, "ldr:ro is not up: homebrew gets no ldr:ro session");
+        return 0;
+    }
+    Kernel::KClientSession* session{};
+    if (const Result result = port->CreateSession(kernel, &session, &process); R_FAILED(result)) {
+        LOG_WARNING(Service_LDR, "Unable to open an ldr:ro session for homebrew: {:#x}", result.raw);
+        return 0;
+    }
+    SCOPE_EXIT {
+        session->Close(kernel);
+    };
+    Kernel::Handle handle{};
+    if (const Result result = process.GetHandleTable().Add(kernel, &handle, session);
+        R_FAILED(result)) {
+        LOG_WARNING(Service_LDR, "Unable to add the homebrew ldr:ro session: {:#x}", result.raw);
+        return 0;
+    }
+    std::scoped_lock lk{g_homebrew_mutex};
+    g_loader_processes.insert(process.GetProcessId());
+    return handle;
+}
+
+size_t ReleaseHomebrewJitCode(Kernel::KProcess& process) {
+    std::scoped_lock lk{g_homebrew_mutex};
+    const auto it = g_jit_mappings.find(process.GetProcessId());
+    return it != g_jit_mappings.end() ? UnmapJitMappings(process, it->second) : 0;
 }
 
 } // namespace Service::RO

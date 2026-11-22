@@ -47,6 +47,7 @@ namespace {
 
 enum class CallType {
     Send,
+    Connect,
     Other,
 };
 
@@ -145,7 +146,8 @@ Errno TranslateNativeError(int e, CallType call_type = CallType::Other) {
     case WSAENOTCONN:
         return Errno::NOTCONN;
     case WSAEWOULDBLOCK:
-        return Errno::AGAIN;
+        // A non-blocking connect still under way: Unix systems and the Switch say EINPROGRESS.
+        return call_type == CallType::Connect ? Errno::INPROGRESS : Errno::AGAIN;
     case WSAECONNREFUSED:
         return Errno::CONNREFUSED;
     case WSAECONNABORTED:
@@ -948,7 +950,7 @@ Errno Socket::Connect(SockAddrIn addr_in) {
         return Errno::SUCCESS;
     }
 
-    return GetAndLogLastError();
+    return GetAndLogLastError(CallType::Connect);
 }
 
 std::pair<SockAddrIn, Errno> Socket::GetPeerName() {

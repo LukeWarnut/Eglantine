@@ -53,7 +53,14 @@ u32 SyncpointManager::FindFreeSyncpoint() {
 
 u32 SyncpointManager::AllocateSyncpoint(bool client_managed) {
     std::lock_guard lock(reservation_lock);
-    return ReserveSyncpoint(FindFreeSyncpoint(), client_managed);
+    const u32 id = ReserveSyncpoint(FindFreeSyncpoint(), client_managed);
+    // A syncpoint freed by its last user keeps its value: fences of the next one start there, as
+    // nvhost does. Switch 2 drivers read the counter itself and refuse a target behind it.
+    auto& syncpoint = syncpoints.at(id);
+    const u32 value = host1x.GetSyncpointManager().GetGuestSyncpointValue(id);
+    syncpoint.counter_min = value;
+    syncpoint.counter_max = value;
+    return id;
 }
 
 void SyncpointManager::FreeSyncpoint(u32 id) {

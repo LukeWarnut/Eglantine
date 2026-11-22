@@ -41,6 +41,7 @@
 #include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/svc_types.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/ro/ro.h"
 #include "core/loader/nro.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
@@ -202,14 +203,19 @@ constexpr u32 kEntryEndOfList = 0;
 constexpr u32 kEntryMainThreadHandle = 1;
 constexpr u32 kEntryNextLoadPath = 2;
 constexpr u32 kEntryOverrideHeap = 3;
+constexpr u32 kEntryOverrideService = 4;
 constexpr u32 kEntryArgv = 5;
 constexpr u32 kEntryAppletType = 7;
 constexpr u32 kAppletTypeApplication = 0;
 constexpr u32 kEntryFlagMandatory = 1;
 // AArch64 encoding for svc #0x7 (ExitProcess).
 constexpr u32 kSvcExitProcessInstruction = 0xD40000E1;
-// MainThreadHandle, AppletType, NextLoadPath, Argv, OverrideHeap (NROs after the first), EndOfList
-constexpr size_t kNumEntries = 6;
+// "ldr:ro" as sm encodes service names.
+constexpr u64 kLdrRoServiceName = 0x00006f723a72646cULL;
+// MainThreadHandle, AppletType, NextLoadPath, Argv, OverrideService (ldr:ro), OverrideHeap (NROs
+// after the first), EndOfList
+constexpr size_t kNumEntries = 7;
+constexpr size_t kLdrRoEntry = 4;
 constexpr size_t kConfigTableSize = kNumEntries * sizeof(ConfigEntry);
 // NextLoadPath buffers, sized like libnx's (hbmenu needs the entry to launch anything).
 constexpr size_t kNextLoadPathSize = 0x200;
@@ -308,18 +314,22 @@ std::optional<HomebrewImage> BuildHomebrewImage(const std::vector<u8>& data, std
     return image;
 }
 
+// ounce-hbloader also passes its ldr:ro session, which kaihen's JIT commands go through.
 void WriteLoaderConfig(Kernel::KProcess& process, const HomebrewImage& image, u64 base,
-                       u32 main_thread_handle, u64 heap_address = 0, u64 heap_size = 0) {
+                       u32 main_thread_handle, u32 ldr_ro_handle, u64 heap_address = 0,
+                       u64 heap_size = 0) {
     ConfigEntry entries[kNumEntries] = {
         {kEntryMainThreadHandle, 0, {main_thread_handle, 0}},
         {kEntryAppletType, 0, {kAppletTypeApplication, 0}},
         {kEntryNextLoadPath, 0, {base + image.NextPathOffset(), base + image.NextArgvOffset()}},
         {kEntryArgv, 0, {0, base + image.ArgvOffset()}},
+        {kEntryOverrideService, 0, {kLdrRoServiceName, ldr_ro_handle}},
         {kEntryEndOfList, 0, {0, 0}},
         {kEntryEndOfList, 0, {0, 0}},
     };
+    static_assert(kLdrRoEntry == 4);
     if (heap_size != 0) {
-        entries[4] = {kEntryOverrideHeap, kEntryFlagMandatory, {heap_address, heap_size}};
+        entries[5] = {kEntryOverrideHeap, kEntryFlagMandatory, {heap_address, heap_size}};
     }
     auto& memory = process.GetMemory();
     memory.WriteBlock(Common::ProcessAddress{base + image.ArgvOffset()}, image.argv.data(),
@@ -358,6 +368,7 @@ struct HomebrewChain {
     u64 base{};
     size_t image_size{};
     u64 alias_source{}; ///< Heap pages the running NRO is aliased from; 0 for the first.
+    u32 ldr_ro_handle{};
     u64 config_addr{};
     u64 next_path_addr{};
     u64 next_argv_addr{};
@@ -442,6 +453,11 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
     // svcMapPhysicalMemory fails (Cemu maps its guest memory with it). 16 MiB, as Suika's NPDM.
     constexpr u32 HomebrewSystemResourceSize = 0x1000000;
 
+    // Chromium NX reserves its Linux guest's address space in the alias region, and Blink's heap
+    // cage does not fit in 64 GiB next to V8's and PartitionAlloc's: give homebrew 128 GiB.
+    using namespace Common::Literals;
+    process.SetAliasRegionPadding(64_GiB);
+
     // Setup the process code layout
     if (process
             .LoadFromMetadata(system.Kernel(),
@@ -453,7 +469,6 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
     // hbloader hands homebrew a heap of all the reported total memory, and Cemu maps its guest
     // memory past that with svcMapPhysicalMemory (1.34 GiB for NES Remix): keep 2 GiB of the
     // limit out of the total, at most half of it.
-    using namespace Common::Literals;
     process.ReservePhysicalMemoryOutsideTotal(2_GiB);
 
     // Relocate code patch and copy to the program_image if running under NCE.
@@ -483,9 +498,19 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
     codeset.memory = std::move(program_image);
     process.LoadModule(system.Kernel(), std::move(codeset), process.GetEntryPoint());
     if (!image->argv.empty()) {
-        // The main thread handle is patched in Run().
-        WriteLoaderConfig(process, *image, base, 0);
+        // The main thread and ldr:ro handles are patched in Run().
+        WriteLoaderConfig(process, *image, base, 0, 0);
         const u64 config_addr = base + image->config_offset;
+        process.SetRunCallback([&system, config_addr](Kernel::KProcess& running) {
+            const u32 handle = Service::RO::OpenHomebrewSession(system, running);
+            running.GetMemory().Write64(config_addr + kLdrRoEntry * sizeof(ConfigEntry) +
+                                            offsetof(ConfigEntry, value) + sizeof(u64),
+                                        handle);
+            std::scoped_lock lock{g_chain_mutex};
+            if (g_chain && g_chain->process_id == running.GetProcessId()) {
+                g_chain->ldr_ro_handle = handle;
+            }
+        });
         process.SetArgPointer(Kernel::KProcessAddress{config_addr});
         if (image->exit_process_offset) {
             process.SetArgReturnAddress(Kernel::KProcessAddress{base + *image->exit_process_offset});
@@ -558,6 +583,15 @@ bool ContinueHomebrewChain(Core::System& system, Kernel::KProcess& process,
     system.GPU().RunInOrder([&gpu_done] { gpu_done.set_value(); });
     gpu_done.get_future().wait();
 
+    // As ounce-hbloader: unmap the JIT code the previous NRO left, its source pages are in the
+    // heap the next one gets.
+    if (const size_t released = Service::RO::ReleaseHomebrewJitCode(process); released != 0) {
+        LOG_INFO(Loader, "Released {} JIT code mappings of the previous NRO", released);
+    }
+    if (chain.ldr_ro_handle == 0) {
+        chain.ldr_ro_handle = Service::RO::OpenHomebrewSession(system, process);
+    }
+
     // Unmap the previous NRO, unless it is the one the process started with.
     if (chain.alias_source != 0) {
         const Result result =
@@ -617,8 +651,8 @@ bool ContinueHomebrewChain(Core::System& system, Kernel::KProcess& process,
             arm->InvalidateCacheRange(base, image_size);
         }
     }
-    WriteLoaderConfig(process, *image, base, main_thread_handle, heap_address,
-                      heap_size - image_size);
+    WriteLoaderConfig(process, *image, base, main_thread_handle, chain.ldr_ro_handle,
+                      heap_address, heap_size - image_size);
 
     // Enter it on this thread, with the stack libnx restored before returning to the loader.
     auto* const arm = process.GetArmInterface(system.Kernel().CurrentPhysicalCoreIndex());

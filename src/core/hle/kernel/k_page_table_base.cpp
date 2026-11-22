@@ -204,7 +204,7 @@ Result KPageTableBase::InitializeForKernel(bool is_64_bit, KVirtualAddress start
                                                m_memory_block_slab_manager));
 }
 
-Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool enable_aslr, bool enable_das_merge, bool from_back, KMemoryManager::Pool pool, KProcessAddress code_address, size_t code_size, KSystemResource* system_resource, KResourceLimit* resource_limit, Core::Memory::Memory& memory, KProcessAddress aslr_space_start) {
+Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool enable_aslr, bool enable_das_merge, bool from_back, KMemoryManager::Pool pool, KProcessAddress code_address, size_t code_size, KSystemResource* system_resource, KResourceLimit* resource_limit, Core::Memory::Memory& memory, KProcessAddress aslr_space_start, size_t alias_region_padding) {
     // Calculate region extents.
     const size_t as_width = GetAddressSpaceWidth(as_type);
     const KProcessAddress start = 0;
@@ -241,7 +241,9 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
     size_t stack_region_size;
     size_t kernel_map_region_size;
     if (m_address_space_width == 39) {
-        alias_region_size = GetSpaceSize(KAddressSpaceInfo::Type::Alias);
+        // Padding is plain alias region, unlike the FW 18+ extra size (address sanitizer
+        // shadow, which libnx keeps other mappings in).
+        alias_region_size = GetSpaceSize(KAddressSpaceInfo::Type::Alias) + alias_region_padding;
         heap_region_size = GetSpaceSize(KAddressSpaceInfo::Type::Heap);
         stack_region_size = GetSpaceSize(KAddressSpaceInfo::Type::Stack);
         kernel_map_region_size = GetSpaceSize(KAddressSpaceInfo::Type::MapSmall);

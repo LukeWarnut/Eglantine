@@ -1870,6 +1870,12 @@ public:
             while (syncpoints.GetGuestSyncpointValue(m_release_syncpoint) != m_release_value) {
                 syncpoints.IncrementGuest(m_release_syncpoint);
             }
+            // Only the guest value counted releases: bring the host value level with it, or a GPU
+            // channel given this syncpoint next would wait on the GPU for releases never made.
+            while (syncpoints.GetHostSyncpointValue(m_release_syncpoint) !=
+                   syncpoints.GetGuestSyncpointValue(m_release_syncpoint)) {
+                syncpoints.IncrementHost(m_release_syncpoint);
+            }
             if (m_release_syncpoint < g_nx2_wide_counters.size()) {
                 g_nx2_wide_counters[m_release_syncpoint] = false;
             }
