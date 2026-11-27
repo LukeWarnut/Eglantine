@@ -40,6 +40,12 @@ public:
         }
         if (opcode == 0x949 || opcode == 0x958) computed_branch = true;
         if (computed_branch) return Result::Continue;
+        // Mesa NAK ends a program whose last block is a loop with that loop's back edge (no
+        // BRA to itself): past an unconditional BRA that nothing branches or calls beyond, the
+        // memory holds alignment padding and the next program's header.
+        if (opcode == 0x947 && instruction.Bits(12, 4) == 7 && instruction.Bits(87, 4) == 7 &&
+            index >= last_forward_target && index >= last_call_target)
+            return Result::Complete;
         if (opcode == 0x94d && instruction.Bits(12, 4) == 7 && index >= last_forward_target) {
             if (index >= last_call_target) return Result::Complete;
             main_exited = true;

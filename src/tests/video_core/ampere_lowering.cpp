@@ -777,4 +777,175 @@ TEST_CASE("Ampere MOV with a one-lane quad mask writes only that lane", "[video_
     }};
     REQUIRE(!static_cast<bool>(LowerToMaxwell(two_lanes)));
 }
+
+// Mesa NAK (homebrew on NVK) encodings, words from pt-nx's shaders.
+TEST_CASE("Ampere Mesa NAK encodings lower", "[video_core][ampere]") {
+    const std::array<Instruction, 20> words{{
+        {{0x00007824, 0x000000b0, 0x000e00ff, 0x001fc800}}, // IMAD R0, R0, 0xb0, RZ (P0 carry-in)
+        {{0x000078a4, 0x00000150, 0x080e0001, 0x001fc600}}, // UIMAD UR0, UR0, 0x150, UR1
+        {{0x00027825, 0xaaaaaaab, 0x000e00ff, 0x001fca00}}, // IMAD.WIDE.U32 R2, R0, imm, RZ
+        {{0x02027a24, 0x00000300, 0x000e0003, 0x000fca00}}, // IMAD R2, R2, c[0x0][0x300], R3
+        {{0x00007899, 0x00000002, 0x08000c3f, 0x001fc800}}, // USHF.L.W.I32 UR0, UR0, 2, URZ
+        {{0x15157219, 0x0000000f, 0x00000cff, 0x000fc800}}, // SHF.L.W.I32 R21, R21, R15, RZ
+        {{0x06017299, 0x00000001, 0x08000c3f, 0x001fd200}}, // USHF.L.W.I32 UR1, UR6, UR1, URZ
+        {{0xff007419, 0x00000e58, 0x00011e00, 0x000fc800}}, // SHF.R.W.U32.HI R0, RZ, R0, 0xe58
+        {{0x01017822, 0x00000066, 0x00010000, 0x001fc200}}, // FSWZADD.FTZ R1, R1, R0
+        {{0x00007d06, 0x00000001, 0x08201400, 0x000e0400}}, // I2F.F32.S32 R0, UR1
+        {{0x2c307981, 0x0000003f, 0x0c1e8d00, 0x00004400}}, // LDG.E.128 R48, [R44.64+URZ]
+        {{0x02007986, 0x00000000, 0x0c10eb3f, 0x0011c400}}, // STG.E [R2.64+URZ], R0
+        {{0x02027367, 0x28000004, 0x049e0d04, 0x001e0200}}, // TLD.B.LZ 2D R2, R2, R4 (handle)
+        {{0x02067364, 0x28000000, 0x059e0f04, 0x000e0400}}, // TLD4.B.A 2D R6, R4, R2, R0 (handle)
+        {{0x10057998, 0x60000000, 0x001ee10c, 0x000e0200}}, // SULD.P 2D R5, [R16], R12 (handle)
+        {{0x0400799c, 0x60000003, 0x0010e102, 0x00c1c400}}, // SUST.P 2D [R4], R3, R2 (handle)
+        {{0x08057394, 0x60000005, 0x001ee006, 0x000e0400}}, // SUATOM.ADD 2D R5, [R8], R5, R6
+        {{0x0aff73a0, 0x60000002, 0x011ee004, 0x0001c400}}, // SURED.MAX 2D [R10], R2, R4
+        {{0x00027ab9, 0x00000000, 0x08000800, 0x003e0200}}, // ULDC UR2, cx[UR0][0x0]
+        {{0x01007a0c, 0x00000100, 0x0bf01070, 0x018fc200}}, // ISETP P0, R0, cx[UR0][0x4]
+    }};
+    for (const Instruction& word : words) {
+        const std::array<Instruction, 2> code{{word, EXIT}};
+        const auto lowered = LowerToMaxwell(code);
+        INFO(fmt::format("{:08x} {:08x} {:08x}: {}", word.words[0], word.words[1], word.words[2],
+                         lowered.error));
+        CHECK(static_cast<bool>(lowered));
+    }
+}
+
+TEST_CASE("Ampere NAK left shifts ignore the I32 type", "[video_core][ampere]") {
+    const std::array<Instruction, 2> code{{
+        {{0x00007899, 0x00000002, 0x08000c3f, 0x001fc800}}, // USHF.L.W.I32 UR0, UR0, 2, URZ
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    const u64 shift = FindMaxwell(lowered, 0x3848, 48);
+    REQUIRE(shift != 0);
+    CHECK((shift & 0xff) == 216);
+    CHECK(((shift >> 8) & 0xff) == 216);
+    CHECK(((shift >> 20) & 0x7ffff) == 2);
+}
+
+TEST_CASE("Ampere SHF.R.HI by a register shifts the immediate right", "[video_core][ampere]") {
+    const std::array<Instruction, 2> code{{
+        {{0xff007419, 0x00000e58, 0x00011e00, 0x000fc800}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    const u64 shift = FindMaxwell(lowered, 0x5c28, 48);
+    REQUIRE(shift != 0);
+    CHECK(((shift >> 8) & 0xff) == 250);
+    CHECK(((shift >> 20) & 0xff) == 0);
+    CHECK(((shift >> 39) & 1) == 1); // .W
+    CHECK(((shift >> 48) & 1) == 0); // unsigned
+}
+
+TEST_CASE("Ampere global loads at [Ra.64+URZ] use the register address", "[video_core][ampere]") {
+    const std::array<Instruction, 2> code{{
+        {{0x2c307981, 0x0000003f, 0x0c1e8d00, 0x00004400}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    const u64 load = FindMaxwell(lowered, 0xeed, 52);
+    REQUIRE(load != 0);
+    CHECK((load & 0xff) == 0x30);
+    CHECK(((load >> 8) & 0xff) == 0x2c);
+    CHECK(((load >> 48) & 7) == 6); // 128 bits
+}
+
+TEST_CASE("Ampere NAK TLD4.B takes the coordinates from Ra and the handle from Rb",
+          "[video_core][ampere]") {
+    const std::array<Instruction, 2> code{{
+        {{0x02067364, 0x28000000, 0x059e0f04, 0x000e0400}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    REQUIRE(lowered.instructions.size() >= 4);
+    CHECK(((lowered.instructions[0] >> 20) & 0xff) == 2); // x
+    CHECK(((lowered.instructions[1] >> 20) & 0xff) == 3); // y
+    CHECK(((lowered.instructions[2] >> 20) & 0xff) == 0); // handle
+    CHECK((lowered.instructions[2] & 0xff) == 246);
+    const u64 gather = FindMaxwell(lowered, 0xdec0000000000000ULL >> 54, 54);
+    REQUIRE(gather != 0);
+    CHECK(((gather >> 38) & 3) == 3); // component A
+}
+
+TEST_CASE("Ampere bindless surface accesses keep the handle register", "[video_core][ampere]") {
+    const std::array<Instruction, 2> load{{
+        {{0x10057998, 0x60000000, 0x001ee10c, 0x000e0200}},
+        EXIT,
+    }};
+    const auto loaded = LowerToMaxwell(load);
+    REQUIRE(static_cast<bool>(loaded));
+    const u64 suld = FindMaxwell(loaded, 0xeb0, 52);
+    REQUIRE(suld != 0);
+    CHECK(((suld >> 51) & 1) == 0); // bindless
+    CHECK(((suld >> 39) & 0xff) == 12);
+    CHECK(((suld >> 33) & 7) == 3); // 2D
+
+    const std::array<Instruction, 2> atomic{{
+        {{0x0aff73a0, 0x60000002, 0x011ee004, 0x0001c400}},
+        EXIT,
+    }};
+    const auto reduced = LowerToMaxwell(atomic);
+    REQUIRE(static_cast<bool>(reduced));
+    const u64 suatom = FindMaxwell(reduced, 0xea00000000000000ULL >> 55, 55);
+    REQUIRE(suatom != 0);
+    CHECK((suatom & 0xff) == 255);
+    CHECK(((suatom >> 29) & 15) == 2); // MAX
+    CHECK(((suatom >> 39) & 0xff) == 4);
+    CHECK(((suatom >> 54) & 1) == 1); // bindless
+}
+
+TEST_CASE("Ampere cx[] reads load from the NVK cbuf handle's address", "[video_core][ampere]") {
+    // ULDC UR2, cx[UR0][0x0]: UR0:UR1 (R216:R217) hold address >> 4 and size >> 4.
+    const std::array<Instruction, 2> code{{
+        {{0x00027ab9, 0x00000000, 0x08000800, 0x003e0200}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+    REQUIRE(lowered.instructions.size() >= 6);
+    const u64 low = lowered.instructions[0]; // SHL R250, R216, 4
+    CHECK((low >> 48) == 0x3848);
+    CHECK((low & 0xff) == 250);
+    CHECK(((low >> 8) & 0xff) == 216);
+    CHECK(((low >> 20) & 0x7ffff) == 4);
+    const u64 load = FindMaxwell(lowered, 0xeed, 52);
+    REQUIRE(load != 0);
+    CHECK((load & 0xff) == 218);
+    CHECK(((load >> 8) & 0xff) == 250);
+    CHECK(((load >> 48) & 7) == 4);
+
+    // ISETP P0, R0, cx[UR0][0x4]: loaded into R248, then the register form.
+    const std::array<Instruction, 2> compare{{
+        {{0x01007a0c, 0x00000100, 0x0bf01070, 0x018fc200}},
+        EXIT,
+    }};
+    const auto compared = LowerToMaxwell(compare);
+    REQUIRE(static_cast<bool>(compared));
+    const u64 operand = FindMaxwell(compared, 0xeed, 52);
+    REQUIRE(operand != 0);
+    CHECK((operand & 0xff) == 248);
+    CHECK(((operand >> 20) & 0xffffff) == 4);
+}
+
+TEST_CASE("Ampere programs ending in a loop's back edge end there", "[video_core][ampere]") {
+    // BRA +0x10 (to 2); EXIT; BRA -0x20 (to 1); then the next program's alignment padding.
+    const std::array<Instruction, 4> code{{
+        {{0x00007947, 0x00000010, 0x03800000, 0x000fc200}},
+        EXIT,
+        {{0x00007947, 0xffffffe0, 0x0383ffff, 0x000fc200}},
+        {{0, 0, 0, 0}},
+    }};
+    ProgramCaptureState capture;
+    CHECK(capture.Observe(code[0], 0) == ProgramCaptureState::Result::Continue);
+    CHECK(capture.Observe(code[1], 1) == ProgramCaptureState::Result::Continue);
+    CHECK(capture.Observe(code[2], 2) == ProgramCaptureState::Result::Complete);
+    const auto lowered = LowerToMaxwell(std::span{code}.first(3));
+    REQUIRE(static_cast<bool>(lowered));
+    CHECK(lowered.source_size == 3 * sizeof(Instruction));
+}
 } // namespace

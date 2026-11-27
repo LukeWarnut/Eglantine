@@ -500,6 +500,24 @@ std::optional<StorageBufferAddr> CbufWord(const IR::Inst* inst) {
     return StorageBufferAddr{.index = inst->Arg(0).U32(), .offset = inst->Arg(1).U32()};
 }
 
+/// The constant buffer word holding a Mesa NVK bindless cbuf handle (address >> 4 in its low
+/// bits) when `low_addr` is that handle's address, as the Ampere lowering builds it for cx[] reads
+std::optional<StorageBufferAddr> NvkCbufHandleWord(const IR::Value& low_addr) {
+    if (low_addr.IsImmediate()) {
+        return std::nullopt;
+    }
+    const IR::Inst* const shift{low_addr.InstRecursive()};
+    if (shift->GetOpcode() != IR::Opcode::ShiftLeftLogical32 || shift->Arg(0).IsImmediate() ||
+        !shift->Arg(1).IsImmediate() || shift->Arg(1).U32() != 4) {
+        return std::nullopt;
+    }
+    const std::optional<StorageBufferAddr> word{CbufWord(shift->Arg(0).InstRecursive())};
+    if (!word || !Common::IsAligned(word->offset, 8)) {
+        return std::nullopt;
+    }
+    return word;
+}
+
 struct TrackingConditions {
     using Predicate = std::pair<IR::Value, bool>;
 
@@ -1347,6 +1365,21 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     }
     // First try to find storage buffers in the NVN address
     const IR::U32 low_addr{low_addr_info->value};
+    if (env.IsNativeProgram()) {
+        if (const std::optional<StorageBufferAddr> handle{NvkCbufHandleWord(low_addr)}) {
+            // A uniform buffer read through its NVK cbuf handle (see StorageOffset).
+            if (IsGlobalMemoryWrite(inst)) {
+                info.writes.insert(*handle);
+            }
+            info.set.insert(*handle);
+            info.to_replace.push_back(StorageInst{
+                .storage_buffer{*handle},
+                .inst = &inst,
+                .block = &block,
+            });
+            return;
+        }
+    }
     const std::optional<StorageBufferAddr> paired_pointer{
         TrackPointerAddend(*low_addr_info, info.iterator_words, conditions)};
     std::optional<StorageBufferAddr> storage_buffer{paired_pointer};
@@ -1490,17 +1523,23 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
 IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer, u32 alignment) {
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     IR::U32 offset;
+    bool nvk_handle{};
     if (const std::optional<LowAddrInfo> low_addr{TrackLowAddress(&inst)}) {
         offset = low_addr->value;
         if (low_addr->imm_offset != 0) {
             offset = ir.IAdd(offset, ir.Imm32(low_addr->imm_offset));
         }
+        nvk_handle = NvkCbufHandleWord(low_addr->value) == buffer;
     } else {
         offset = ir.UConvert(32, IR::U64{inst.Arg(0)});
     }
     // Subtract the least significant 32 bits from the guest offset. The result is the storage
     // buffer offset in bytes.
     IR::U32 low_cbuf{ir.GetCbuf(ir.Imm32(buffer.index), ir.Imm32(buffer.offset))};
+    if (nvk_handle) {
+        // The word is an NVK cbuf handle, the address >> 4 (decoded by the buffer cache).
+        low_cbuf = IR::U32{ir.ShiftLeftLogical(low_cbuf, ir.Imm32(4))};
+    }
 
     // Align the offset base to match the host alignment requirements
     low_cbuf = ir.BitwiseAnd(low_cbuf, ir.Imm32(~(alignment - 1U)));

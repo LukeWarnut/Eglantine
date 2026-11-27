@@ -707,13 +707,24 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
                                                                   : GPUVAddr{};
                 };
+                // Banks 17 and 16 unbound: root tables 0 and 7, as the buffer cache streams them
+                // (NVK's push constants, which pick a material record, are in table 7).
+                const auto root_word = [&](u32 cbuf, u32 offset) -> std::optional<u32> {
+                    const auto& root{maxwell3d->root_tables};
+                    const u32 table = cbuf == 17 ? 0U : cbuf == 16 ? 7U : ~0U;
+                    if (table == ~0U || !((root.loaded_mask >> table) & 1) ||
+                        offset / 4 >= root.tables[table].size()) {
+                        return std::nullopt;
+                    }
+                    return root.tables[table][offset / 4];
+                };
                 const u32 raw = VideoCommon::TextureHandleCache::Enabled()
                                     ? handle_caches[stage][desc.handle_program].Evaluate(
                                           info, desc.handle_program, *gpu_memory, cbuf_address,
-                                          device.GetStorageBufferAlignment())
+                                          device.GetStorageBufferAlignment(), root_word)
                                     : VideoCommon::EvaluateTextureHandle(
                                           info, desc.handle_program, *gpu_memory, cbuf_address,
-                                          device.GetStorageBufferAlignment());
+                                          device.GetStorageBufferAlignment(), root_word);
                 return TexturePair(raw, via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);

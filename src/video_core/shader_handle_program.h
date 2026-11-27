@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 #include <vector>
 
 #include "common/common_types.h"
@@ -21,15 +22,27 @@ namespace VideoCommon {
 /// bound constant buffer's address, 0 when none is bound. storage_alignment is the host storage
 /// buffer offset alignment: storage offsets in the program are relative to the buffer address
 /// aligned down to it (StorageOffset), which is also where the buffer cache binds the buffer.
-template <typename Memory, typename CbufAddress>
+/// root_word(index, offset) serves an unbound bank the buffer cache streams from a root table
+/// (banks 16 and 17, see BindHostGraphicsUniformBuffer), std::nullopt otherwise.
+struct NoRootWord {
+    std::optional<u32> operator()(u32, u32) const {
+        return std::nullopt;
+    }
+};
+
+template <typename Memory, typename CbufAddress, typename RootWord = NoRootWord>
 u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_memory,
-                          CbufAddress&& cbuf_address, u64 storage_alignment) {
+                          CbufAddress&& cbuf_address, u64 storage_alignment,
+                          RootWord&& root_word = {}) {
     const GPUVAddr storage_mask{~(GPUVAddr{(std::max)(storage_alignment, u64{1})} - 1)};
     return Shader::EvaluateHandleProgram(
                info.handle_programs[program],
                [&](u32 index, u32 offset) -> u32 {
                    const GPUVAddr base{cbuf_address(index)};
-                   return base != 0 ? gpu_memory.template Read<u32>(base + offset) : 0U;
+                   if (base == 0) {
+                       return root_word(index, offset).value_or(0U);
+                   }
+                   return gpu_memory.template Read<u32>(base + offset);
                },
                [&](u32 binding, u32 offset) -> u32 {
                    if (binding >= info.storage_buffers_descriptors.size()) {
@@ -41,6 +54,10 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_mem
                        return 0U;
                    }
                    GPUVAddr base{gpu_memory.template Read<u64>(cbuf + descriptor.cbuf_offset)};
+                   if (base >> 45) {
+                       // A Mesa NVK bindless cbuf handle (StorageBufferBinding): address >> 4.
+                       base = (base & ((GPUVAddr{1} << 45) - 1)) << 4;
+                   }
                    if (base != 0 && descriptor.indirect_offset != ~0U) {
                        // The table entry is read at its exact address. Only the buffer address
                        // it holds is aligned down, as the shader does.
@@ -60,17 +77,26 @@ public:
         return enabled;
     }
 
-    template <typename Memory, typename CbufAddress>
+    template <typename Memory, typename CbufAddress, typename RootWord = NoRootWord>
     u32 Evaluate(const Shader::Info& info, u32 program, Memory& memory,
-                 CbufAddress&& cbuf_address, u64 storage_alignment) {
+                 CbufAddress&& cbuf_address, u64 storage_alignment, RootWord&& root_word = {}) {
         if (!Enabled()) {
-            return EvaluateTextureHandle(info, program, memory, cbuf_address, storage_alignment);
+            return EvaluateTextureHandle(info, program, memory, cbuf_address, storage_alignment,
+                                         root_word);
         }
         bool unchanged = valid && last_info == &info && last_program == program &&
                          last_alignment == storage_alignment;
         if (unchanged) {
             for (const auto& input : cbuf_inputs) {
                 if (cbuf_address(input.index) != input.address) {
+                    unchanged = false;
+                    break;
+                }
+            }
+        }
+        if (unchanged) {
+            for (const auto& input : root_inputs) {
+                if (root_word(input.index, input.offset) != input.value) {
                     unchanged = false;
                     break;
                 }
@@ -92,6 +118,7 @@ public:
         }
         valid = false;
         cbuf_inputs.clear();
+        root_inputs.clear();
         memory_inputs.clear();
         RecordingMemory<Memory> recording{memory, memory_inputs};
         result = EvaluateTextureHandle(
@@ -101,7 +128,12 @@ public:
                 cbuf_inputs.push_back({index, address});
                 return address;
             },
-            storage_alignment);
+            storage_alignment,
+            [&](u32 index, u32 offset) -> std::optional<u32> {
+                const std::optional<u32> value = root_word(index, offset);
+                root_inputs.push_back({index, offset, value});
+                return value;
+            });
         last_info = &info;
         last_program = program;
         last_alignment = storage_alignment;
@@ -113,6 +145,11 @@ private:
     struct CbufInput {
         u32 index;
         GPUVAddr address;
+    };
+    struct RootInput {
+        u32 index;
+        u32 offset;
+        std::optional<u32> value;
     };
     struct MemoryInput {
         GPUVAddr address;
@@ -132,6 +169,7 @@ private:
         }
     };
     std::vector<CbufInput> cbuf_inputs;
+    std::vector<RootInput> root_inputs;
     std::vector<MemoryInput> memory_inputs;
     const Shader::Info* last_info{};
     u64 last_alignment{};

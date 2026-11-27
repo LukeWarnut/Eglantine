@@ -319,7 +319,6 @@ void MaxwellDMA::CopyBlockLinearToPitch() {
 
 void MaxwellDMA::CopyPitchToBlockLinear() {
     UNIMPLEMENTED_IF_MSG(regs.dst_params.block_size.width != 0, "Block width is not one");
-    UNIMPLEMENTED_IF(regs.dst_params.layer != 0);
 
     const bool is_remapping = regs.launch_dma.remap_enable != 0;
     const u32 num_remap_components = regs.remap_const.num_dst_components_minus_one + 1;
@@ -378,9 +377,10 @@ void MaxwellDMA::CopyPitchToBlockLinear() {
         tmp_write_buffer(memory_manager, dst_addr, dst_size, &write_buffer);
 
     //  If the input is linear and the output is tiled, swizzle the input and copy it over.
+    // The layer is the first Z slice written (Mesa NVK uploads a 3D texture one slice per copy).
     SwizzleSubrect(tmp_write_buffer, tmp_read_buffer, bytes_per_pixel, width, height, depth,
                    x_offset, dst_params.origin.y, x_elements, regs.line_count, block_height,
-                   block_depth, regs.pitch_in, memory_manager.UsesNativeTiling());
+                   block_depth, regs.pitch_in, memory_manager.UsesNativeTiling(), dst_params.layer);
 }
 
 void MaxwellDMA::CopyBlockLinearToBlockLinear() {

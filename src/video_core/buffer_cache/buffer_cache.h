@@ -3840,7 +3840,15 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                              bool native_pointer, bool table_pointer) const {
-    const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+    GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+    // Mesa NVK's bindless constant buffer handle (struct nvk_bindless_cbuf), which homebrew on NVK
+    // reads uniform buffers through: the address >> 4 in bits 0-44, the size >> 4 in bits 45-63.
+    // Guest GPU addresses have 40 bits, so a plain pointer never sets bit 45.
+    u32 handle_size = 0;
+    if (gpu_addr >> 45) {
+        handle_size = static_cast<u32>(gpu_addr >> 45) << 4;
+        gpu_addr = (gpu_addr & ((u64{1} << 45) - 1)) << 4;
+    }
 
     if (gpu_addr == 0) {
         return NULL_BINDING;
@@ -3854,7 +3862,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     const size_t cache_slot =
         (((gpu_addr >> 4) ^ (gpu_addr >> 20) ^ (u64{cache_flags} * 0x9e3779b9ULL)) &
          (ResolvedStorageAddrCacheSize - 1));
-    if (native_pointer || table_pointer) {
+    const bool cached = (native_pointer || table_pointer) && handle_size == 0;
+    if (cached) {
         const auto& entry = resolved_storage_addr_cache[cache_slot];
         if (entry.valid && entry.gpu_addr == gpu_addr && entry.map_serial == map_serial &&
             entry.memory_id == memory_id && entry.flags == cache_flags) {
@@ -3871,6 +3880,9 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     u32 size = [&]() {
         const u32 memory_layout_size = static_cast<u32>((std::min)(
             u64{gpu_memory->GetMemoryLayoutSize(gpu_addr)}, u64{(std::numeric_limits<u32>::max)()}));
+        if (handle_size != 0) {
+            return (std::min)(handle_size, memory_layout_size);
+        }
         // A pointer read from a table in memory is the base of an object pool, read anywhere in
         // it: bound to the end of its mapping, as far as a storage buffer may reach (at most
         // 256 MiB). Ocarina of Time's grass instances lie 12-18 MiB past theirs (an 8 MiB cap
@@ -3929,7 +3941,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         .buffer_id = BufferId{},
         .single_range = single_range,
     };
-    if (native_pointer || table_pointer) {
+    if (cached) {
         resolved_storage_addr_cache[cache_slot] = ResolvedStorageAddrCacheEntry{
             .gpu_addr = gpu_addr,
             .aligned_gpu_addr = aligned_gpu_addr,

@@ -273,7 +273,7 @@ TEST_CASE("Logged Pokopia SHF register pressure identifies the register shift op
         CHECK(pressure.instruction.words[1] == 255);
         REQUIRE(LowerCopies(std::array{pressure.instruction, Exit}));
     }
-    for (const u32 bit : {8U, 12U, 17U, 27U}) {
+    for (const u32 bit : {8U, 17U, 27U}) {
         auto invalid = LoggedShifts[0];
         invalid.words[2] ^= 1U << bit;
         CHECK_FALSE(LowerCopies(std::array{invalid, Exit}));

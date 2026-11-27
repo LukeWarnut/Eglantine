@@ -80,6 +80,17 @@ std::vector<u64> LayOutLoweredNativeCode(std::span<const u64> header,
     return code;
 }
 
+/// The root table an unbound bank 17 or 16 reads (tables 0 and 7, as the buffer cache streams
+/// them in BindHostGraphicsUniformBuffer), when it has been written.
+static const std::array<u32, 64>* RootTableBank(const Tegra::Engines::Maxwell3D& maxwell3d,
+                                                u32 cbuf_index) {
+    const u32 table = cbuf_index == 17 ? 0U : cbuf_index == 16 ? 7U : ~0U;
+    if (table == ~0U || !((maxwell3d.root_tables.loaded_mask >> table) & 1)) {
+        return nullptr;
+    }
+    return &maxwell3d.root_tables.tables[table];
+}
+
 static u64 MakeCbufKey(u32 index, u32 offset) {
     return (static_cast<u64>(index) << 32) | offset;
 }
@@ -848,9 +859,17 @@ u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
         }
     } else {
         const auto& cbuf{maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index]};
-        ASSERT(cbuf.enabled);
-        if (cbuf_offset < cbuf.size) {
-            value = gpu_memory->Read<u32>(cbuf.address + cbuf_offset);
+        const auto* const root{cbuf.enabled && cbuf.size != 0 ? nullptr
+                                                               : RootTableBank(*maxwell3d, cbuf_index)};
+        if (root) {
+            if (cbuf_offset / 4 < root->size()) {
+                value = (*root)[cbuf_offset / 4];
+            }
+        } else {
+            ASSERT(cbuf.enabled);
+            if (cbuf_offset < cbuf.size) {
+                value = gpu_memory->Read<u32>(cbuf.address + cbuf_offset);
+            }
         }
     }
     cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
@@ -968,6 +987,12 @@ bool GraphicsEnvironment::Detach(Tegra::MaxwellDeviceMemoryManager& device_memor
         auto& copied{copy.const_buffers[index]};
         copied.enabled = live.enabled;
         if (!live.enabled || live.size == 0) {
+            if (const auto* const root{RootTableBank(*maxwell3d, static_cast<u32>(index))}) {
+                copied.enabled = true;
+                copied.size = static_cast<u32>(sizeof(*root));
+                copied.bytes.resize(copied.size + sizeof(u32));
+                std::memcpy(copied.bytes.data(), root->data(), copied.size);
+            }
             continue;
         }
         // The size register can exceed what a constant buffer holds; never copy more than that.

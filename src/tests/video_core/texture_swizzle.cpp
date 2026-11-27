@@ -218,3 +218,24 @@ TEST_CASE("Texture swizzle round-trips", "[video_core][textures]") {
         }
     }
 }
+
+TEST_CASE("Texture subrect swizzle writes the slice its Z origin names", "[video_core][textures]") {
+    // A 3D texture uploaded one slice per copy (Mesa NVK's copy engine sets the DMA layer to the
+    // slice) lands where the whole volume swizzled at once puts it.
+    constexpr u32 bpp = 2, width = 64, height = 16, depth = 16, block_height = 1, block_depth = 4;
+    const size_t slice = static_cast<size_t>(width) * height * bpp;
+    const size_t tiled = CalculateSize(true, bpp, width, height, depth, block_height, block_depth);
+    const std::vector<u8> volume = RandomBytes(slice * depth, 7);
+
+    std::vector<u8> whole(tiled + GOB_SIZE, 0);
+    SwizzleSubrect(whole, volume, bpp, width, height, depth, 0, 0, width, height * depth,
+                   block_height, block_depth, width * bpp);
+
+    std::vector<u8> by_slice(tiled + GOB_SIZE, 0);
+    for (u32 z = 0; z < depth; ++z) {
+        SwizzleSubrect(by_slice, std::span<const u8>(volume).subspan(z * slice, slice), bpp,
+                       width, height, depth, 0, 0, width, height, block_height, block_depth,
+                       width * bpp, false, z);
+    }
+    REQUIRE(by_slice == whole);
+}
