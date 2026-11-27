@@ -400,6 +400,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
+                if (const auto device = memory_manager.GpuToCpuAddress(address);
+                    device && (flags & ((1U << 26) | (1U << 19)))) {
+                    Tegra::Nx2SemaphoreWaiters::Get().Note(
+                        *device, payload, Tegra::Nx2SemaphoreWaiters::Event::Queued);
+                }
                 if (flags & (1U << 26)) {
                     rasterizer->SignalFence([this, address, payload, flags] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,

@@ -6,3 +6,17 @@
 # Consult your distro if this is not the case
 
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ENV{ID_INPUT_JOYSTICK}=="1", MODE="0660", TAG+="uaccess"
+
+# Raw access for the pads RenHDrum drives. The ID_INPUT_JOYSTICK line above does not fire
+# for Bluetooth HID nodes: udev's input tagging runs on the evdev device, and over Bluetooth
+# the kernel's own drivers (hid-nintendo, hid-playstation) provide it, so the hidraw node
+# stays root-only. SDL then cannot claim the pad, and it answers every raw rumble packet with
+# "not supported" -- measured: a Bluetooth Pro Controller lands on hidraw as 0005:057E:2009
+# with driver "nintendo" and mode 0600 while the wired nodes carry the uaccess ACL. The hid
+# device's sysfs name is bus:vendor:product.serial, so match the vendor there instead.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="????:057E:*", MODE="0660", TAG+="uaccess"
+
+# DualSense (054C:0CE6) and DualSense Edge (054C:0DF2): the Bluetooth haptics path opens a
+# second raw handle for output report 0x32, which needs the same access.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="????:054C:0CE6.*", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="????:054C:0DF2.*", MODE="0660", TAG+="uaccess"

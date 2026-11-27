@@ -6,6 +6,7 @@
 // the driver/handle constant banks, and pushing/allocating the descriptor set.
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <unordered_map>
 
@@ -194,16 +195,15 @@ const std::shared_ptr<Texture>& DrawContext::TextureOfId(u32 id) const {
         return none;
     }
     TextureSlot& slot = texture_slots[id % texture_slots.size()];
-    if (slot.id == id && slot.serial == serial && slot.epoch == impl.texture_epoch) {
-        return *slot.texture;
+    if (slot.id == id && slot.serial == serial && slot.texture && slot.texture->live) {
+        return slot.texture;
     }
     const auto it = impl.textures.find(serial);
     if (it == impl.textures.end()) {
         return none;
     }
-    // unordered_map nodes keep their address until erased (which bumps texture_epoch).
-    slot = {id, serial, impl.texture_epoch, &it->second};
-    return it->second;
+    slot = {id, serial, it->second};
+    return slot.texture;
 }
 
 u64 DrawContext::SamplerSerialOfId(u32 id) const {
@@ -832,12 +832,14 @@ bool DrawContext::ViewKeyOf(const Texture& texture, const Storage& s, Shader::Te
     case Shader::TextureType::ColorCube:
         key.type = VK_IMAGE_VIEW_TYPE_CUBE;
         key.layers = 6;
-        compatible = s.type == VK_IMAGE_TYPE_2D && layer_count >= 6;
+        compatible = s.type == VK_IMAGE_TYPE_2D && layer_count >= 6 &&
+                     (s.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0;
         break;
     case Shader::TextureType::ColorArrayCube:
         key.type = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
         key.layers = layer_count / 6 * 6;
-        compatible = s.type == VK_IMAGE_TYPE_2D && layer_count >= 6;
+        compatible = s.type == VK_IMAGE_TYPE_2D && layer_count >= 6 &&
+                     (s.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) != 0;
         break;
     case Shader::TextureType::ColorArray2D:
         key.type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -966,8 +968,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         if (raw_noted_seq != raw_flight.seq || raw_noted_generation != raw_table->generation) {
             raw_noted_seq = raw_flight.seq;
             raw_noted_generation = raw_table->generation;
-            for (const u64 serial : raw_table->pool_serials) {
-                impl.NoteUse(serial, raw_flight.seq);
+            for (Pool* const pool : raw_table->pools) {
+                impl.NoteUse(*pool, raw_flight.seq);
             }
         }
         if (raw_table->device && raw_flight.raw_table_kept != raw_table->device.get()) {
@@ -986,8 +988,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                 alias_noted_generation != alias_table->generation) {
                 alias_noted_seq = raw_flight.seq;
                 alias_noted_generation = alias_table->generation;
-                for (const u64 serial : alias_table->pool_serials) {
-                    impl.NoteUse(serial, raw_flight.seq);
+                for (Pool* const pool : alias_table->pools) {
+                    impl.NoteUse(*pool, raw_flight.seq);
                 }
                 if (alias_table->device) {
                     raw_flight.keepalive.push_back(alias_table->device);
@@ -1013,7 +1015,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         u32 slot;
     };
     const auto buffer_info = [&](const BufferBinding& binding, bool write, bool uniform,
-                                 const SinkSite* sink = nullptr) {
+                                 const SinkSite* sink = nullptr,
+                                 CachedBuffer* slot_cache = nullptr) {
         const auto fallback = [&]() {
             if (write && !uniform && sink != nullptr) {
                 return VkDescriptorBufferInfo{
@@ -1045,69 +1048,109 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                          : DescReason::StorageUnbound);
             return fallback();
         }
-        if (bound_size == 0) {
-            if (Debug::Get().no_zero_size) {
-                // Experiment (EDEN_NX2_NVN_NO_ZERO_SIZE): the dummy buffer, as before these
-                // entries bound the rest of their pool.
-                note(DescReason::StorageZeroSize);
-                return fallback();
+        const u64 current_seq = host->HostFlight().seq;
+        u64 size = 0;
+        BufferRef ref;
+        bool resolved = false;
+        if (slot_cache != nullptr && bound_size != 0 && pass_open) {
+            const u64 pool_gen = impl.pool_generation.load(std::memory_order_acquire);
+            if (slot_cache->address == binding.address && slot_cache->binding_size == bound_size &&
+                slot_cache->pool_gen == pool_gen &&
+                slot_cache->mapping_gen == impl.mkw_mapping_generation &&
+                slot_cache->alias_gen == impl.ro_alias_generation &&
+                slot_cache->ref.pool != nullptr &&
+                !slot_cache->ref.pool->pending.load(std::memory_order_acquire) &&
+                !slot_cache->ref.pool->upload_pending &&
+                (slot_cache->ref.pool->backing == Pool::Backing::Imported ||
+                 slot_cache->ref.pool->backing == Pool::Backing::DeviceLocal)) {
+                ref = slot_cache->ref;
+                size = ref.range;
+                resolved = true;
+                impl.NoteUse(*ref.pool, current_seq);
             }
-            // A storage buffer bound with an address and size 0 is the rest of its pool: the
-            // hardware loads and stores through the address and never looks at the size (nxnative
-            // binds the address and counts the write as the rest of the buffer, nvn_mtl.m sbw_len).
-            // Counted (StorageZeroSize) as a handled case.
-            Pool* pool = nullptr;
-            u64 pool_offset = 0;
-            if (!host->HostResolvePoolRange(binding.address, 1, pool, pool_offset, "buffer")) {
-                note(DescReason::StorageUnresolved);
-                return fallback();
-            }
-            const u64 rest = (std::min<u64>)(pool->size - pool_offset, ZERO_SIZE_RANGE_MAX) & ~u64{3};
-            note(DescReason::StorageZeroSize);
-            if (rest == 0) {
-                return fallback();
-            }
-            bound_size = rest;
-            prof_zero_size = true;
-            unsized = true;
         }
-        u64 size = uniform ? (std::min)(bound_size, MAX_UNIFORM_RANGE) : bound_size;
-        if (uniform) {
-            // The driver binds uniform buffers in whole 256-byte units
-            // (nvnCommandBufferBindUniformBuffer rounds the size up), so the range may run up to
-            // 255 bytes past the end of its pool (or mapped virtual range, both 4 KiB granular):
-            // bind the part up to that boundary. Only a range that ends just past a 4 KiB
-            // boundary pays the extra (silent, cached) lookups.
-            const u64 end = binding.address + size;
-            const u64 boundary = end & ~u64{0xFFF};
-            Pool* pool = nullptr;
-            u64 pool_offset = 0;
-            if (boundary > binding.address && end != boundary && end - boundary < 0x100 &&
-                !impl.ResolveBuffer(binding.address, size, pool, pool_offset) &&
-                impl.ResolveBuffer(binding.address, boundary - binding.address, pool,
-                                   pool_offset)) {
-                size = boundary - binding.address;
+        if (!resolved) {
+            if (bound_size == 0) {
+                if (Debug::Get().no_zero_size) {
+                    // Experiment (EDEN_NX2_NVN_NO_ZERO_SIZE): the dummy buffer, as before these
+                    // entries bound the rest of their pool.
+                    note(DescReason::StorageZeroSize);
+                    return fallback();
+                }
+                // A storage buffer bound with an address and size 0 is the rest of its pool: the
+                // hardware loads and stores through the address and never looks at the size
+                // (nxnative binds the address and counts the write as the rest of the buffer,
+                // nvn_mtl.m sbw_len). Counted (StorageZeroSize) as a handled case.
+                Pool* pool = nullptr;
+                u64 pool_offset = 0;
+                if (!host->HostResolvePoolRange(binding.address, 1, pool, pool_offset, "buffer")) {
+                    note(DescReason::StorageUnresolved);
+                    return fallback();
+                }
+                const u64 rest =
+                    (std::min<u64>)(pool->size - pool_offset, ZERO_SIZE_RANGE_MAX) & ~u64{3};
+                note(DescReason::StorageZeroSize);
+                if (rest == 0) {
+                    return fallback();
+                }
+                bound_size = rest;
+                prof_zero_size = true;
+                unsized = true;
+            }
+            size = uniform ? (std::min)(bound_size, MAX_UNIFORM_RANGE) : bound_size;
+            if (uniform) {
+                // The driver binds uniform buffers in whole 256-byte units
+                // (nvnCommandBufferBindUniformBuffer rounds the size up), so the range may run up
+                // to 255 bytes past the end of its pool (or mapped virtual range, both 4 KiB
+                // granular): bind the part up to that boundary. Only a range that ends just past a
+                // 4 KiB boundary pays the extra (silent, cached) lookups.
+                const u64 end = binding.address + size;
+                const u64 boundary = end & ~u64{0xFFF};
+                Pool* pool = nullptr;
+                u64 pool_offset = 0;
+                if (boundary > binding.address && end != boundary && end - boundary < 0x100 &&
+                    !impl.ResolveBuffer(binding.address, size, pool, pool_offset) &&
+                    impl.ResolveBuffer(binding.address, boundary - binding.address, pool,
+                                       pool_offset)) {
+                    size = boundary - binding.address;
+                }
+            }
+            resolved = ResolveBuffer(binding.address, size, write, ref, ShadowPolicy::Defer);
+            if (resolved && slot_cache != nullptr && !unsized && ref.pool != nullptr &&
+                !ref.pool->pending.load(std::memory_order_acquire) && !ref.pool->upload_pending &&
+                (ref.pool->backing == Pool::Backing::Imported ||
+                 ref.pool->backing == Pool::Backing::DeviceLocal)) {
+                *slot_cache = {
+                    .ref = ref,
+                    .pool_gen = impl.pool_generation.load(std::memory_order_acquire),
+                    .mapping_gen = impl.mkw_mapping_generation,
+                    .alias_gen = impl.ro_alias_generation,
+                    .address = binding.address,
+                    .binding_size = bound_size,
+                };
             }
         }
         // EDEN_NX2_NVN_UBO_SNAPSHOT: the bytes as of the submit call (nvn_uniform_snapshot.h).
         const size_t snapshot_range = uniform && !write && usnap.Active()
                                           ? usnap.Find(binding.address, size)
                                           : UniformSnapshotView::npos;
-        BufferRef ref;
-        const bool resolved = ResolveBuffer(binding.address, size, write, ref, ShadowPolicy::Defer);
         // Inline updates that cover the range are applied on top of the memory.
         bool overlaps = false;
-        for (const InlineUpdate& update : inline_updates) {
-            if (!unsized && update.address < binding.address + size &&
-                binding.address < update.address + update.size) {
-                overlaps = true;
-                break;
+        if (!unsized && !inline_updates.empty()) {
+            for (const InlineUpdate& update : inline_updates) {
+                if (update.address < binding.address + size &&
+                    binding.address < update.address + update.size) {
+                    overlaps = true;
+                    break;
+                }
             }
         }
         const bool misaligned = resolved && uniform && (ref.offset % 256) != 0;
-        const u64 current_seq = host->HostFlight().seq;
-        const bool needs_gpu_source =
+        const bool may_need_gpu_source =
             resolved && !write && snapshot_range == UniformSnapshotView::npos &&
+            (misaligned || (overlaps && pass_open));
+        const bool needs_gpu_source =
+            may_need_gpu_source &&
             (ref.pool->backing == Pool::Backing::DeviceLocal ||
              HasOverlappingShadow(*ref.pool, ref.pool_offset, ref.pool_offset + size) ||
              impl.NeedsGpuFlushForUniform(binding.address, binding.address + size, current_seq));
@@ -1232,7 +1275,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             const size_t first = scratch_buffers.size();
             for (u32 i = 0; i < count; ++i) {
                 switch (binding.role) {
-                case VC::DescriptorRole::DriverBank: {
+                case VC::DescriptorRole::DriverTable: {
                     BufferRef& ref = driver_bank[stage];
                     if (!ref.buffer) {
                         if (binding.stage == VC::ShaderStage::Compute) {
@@ -1331,10 +1374,12 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                         break;
                     }
                     const SinkSite site{stage, slot};
+                    CachedBuffer* const slot_cache =
+                        slot < uniform_cache[stage].size() ? &uniform_cache[stage][slot] : nullptr;
                     scratch_buffers.push_back(buffer_info(
                         slot < stages[stage].uniform.size() ? stages[stage].uniform[slot]
                                                             : BufferBinding{},
-                        false, true, &site));
+                        false, true, &site, slot_cache));
                     break;
                 }
                 }
@@ -1350,8 +1395,17 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                 if (resolved.address == 0 || resolved.size == 0) {
                     LogUnboundStorage(graphics, pipe, binding, slot, resolved);
                 }
+                CachedBuffer* slot_cache = nullptr;
+                if (binding.storage_source == VC::StorageSource::DriverTable &&
+                    stage < BIND_STAGES && slot < storage_cache[stage].size()) {
+                    slot_cache = &storage_cache[stage][slot];
+                } else if (binding.storage_source == VC::StorageSource::ComputeStorageEntry &&
+                           slot < storage_cache[STAGE_COMPUTE].size()) {
+                    slot_cache = &storage_cache[STAGE_COMPUTE][slot];
+                }
                 const SinkSite site{stage, slot};
-                scratch_buffers.push_back(buffer_info(resolved, binding.is_written, false, &site));
+                scratch_buffers.push_back(
+                    buffer_info(resolved, binding.is_written, false, &site, slot_cache));
             }
             write.pBufferInfo = &scratch_buffers[first];
             break;
@@ -1504,7 +1558,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                         if (bound) {
                             if (twin) {
                                 binding_scaled = true;
-                                impl.NoteUse(game_texture->serial, host->HostFlight().seq);
+                                impl.NoteUse(*game_texture, host->HostFlight().seq);
                                 ++impl.stats.rescale_twin_samples;
                             }
                             info.imageLayout = wanted;
@@ -1675,9 +1729,6 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                     noted_sampler = serial;
                     info.sampler = serial != 0 ? SamplerOf(sampler_id, serial, view_anisotropy)
                                                : fallback_sampler;
-                    if (serial != 0) {
-                        impl.NoteUse(serial, host->HostFlight().seq);
-                    }
                 } else {
                     info.sampler = VK_NULL_HANDLE;
                 }
@@ -2030,9 +2081,9 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
     ShadowDecision shadow;
     if (plan.shadow_candidates || !shadows.empty()) {
         shadow = ClassifyShadows(plan);
-        if (shadow.flush_needed) {
+        if (shadow.flush_needed || shadow.need_outside_pass) {
             if (!need) {
-                cause = BreakCause::ShadowAlias;
+                cause = shadow.flush_needed ? BreakCause::ShadowAlias : BreakCause::MirrorUpload;
             }
             need = true;
         }
@@ -2145,7 +2196,7 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
     if (plan.raw_global_writes) {
         pass_buffer_writes = true;
         pass_shader_writes = true;
-        host->HostNoteRawGlobalWrite();
+        host->HostNoteRawGlobalWrite(plan.raw_stores_written_through);
         // The raw table reaches the guest bytes of a read-only mirror's pool: the pages it holds
         // may be stale from this draw on, unless the stores also wrote the mirror (the read-only
         // mirror table the draw was given).
@@ -2176,7 +2227,7 @@ void DrawContext::FinishImages(DrawPlan& plan) {
             // every descriptor of the image names the layout it is in.
             info.imageLayout = plan.LayoutOf(&storage, info.imageLayout);
             if (!binding.scratch && storage.scale_owner == nullptr) {
-                impl.NoteUse(binding.texture->serial, seq);
+                impl.NoteUse(*binding.texture, seq);
             }
             continue;
         }
@@ -2233,8 +2284,10 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     if (scratch_writes.empty() || !pipe.set_layout) {
         return true;
     }
-    if (track) {
-        bool comparable = true;
+    const bool need_sigs = track || !pipe.push_descriptors;
+    bool comparable = false;
+    if (need_sigs) {
+        comparable = true;
         scratch_write_sigs.clear();
         for (const VkWriteDescriptorSet& write : scratch_writes) {
             comparable &= write.pTexelBufferView == nullptr;
@@ -2245,19 +2298,61 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
         for (const VkDescriptorImageInfo& info : scratch_images) {
             scratch_image_sigs.push_back({info.sampler, info.imageView, info.imageLayout});
         }
-        if (!comparable) {
-            bound_state.ForgetDescriptors();
-        } else if (bound_state.TakeDescriptors(*pipe.layout, scratch_write_sigs, scratch_buffers,
-                                               scratch_image_sigs)) {
-            ++counters.elided_descriptors;
-            return true;
+        if (track) {
+            if (!comparable) {
+                bound_state.ForgetDescriptors();
+            } else if (bound_state.TakeDescriptors(*pipe.layout, scratch_write_sigs,
+                                                   scratch_buffers, scratch_image_sigs)) {
+                ++counters.elided_descriptors;
+                return true;
+            }
         }
     }
     if (pipe.push_descriptors) {
         cmd.PushDescriptorSetKHR(bind_point, *pipe.layout, 0, scratch_writes);
         return true;
     }
-    // An allocated set, kept alive by the submission.
+    // An allocated set, kept alive by the submission. Reuse an identical set allocated earlier in
+    // this submission when all descriptors are comparable (no texel buffer views).
+    DescSetSlot* cache_slot = nullptr;
+    u64 cache_hash = 0;
+    const u64 flight_seq = host->HostFlight().seq;
+    if (comparable) {
+        if (desc_set_cache.empty()) {
+            desc_set_cache.resize(512);
+        }
+        const auto mix = [](u64 h, u64 v) noexcept {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return h;
+        };
+        cache_hash = mix(0, std::bit_cast<u64>(*pipe.set_layout));
+        for (const PassBoundState::WriteSig& w : scratch_write_sigs) {
+            cache_hash = mix(cache_hash, (static_cast<u64>(w.binding) << 32) |
+                                             (static_cast<u64>(w.type) << 16) | w.count);
+        }
+        for (const VkDescriptorBufferInfo& b : scratch_buffers) {
+            cache_hash = mix(cache_hash, std::bit_cast<u64>(b.buffer));
+            cache_hash = mix(cache_hash, b.offset);
+            cache_hash = mix(cache_hash, b.range);
+        }
+        for (const PassBoundState::ImageSig& im : scratch_image_sigs) {
+            cache_hash = mix(cache_hash, std::bit_cast<u64>(im.sampler));
+            cache_hash = mix(cache_hash, std::bit_cast<u64>(im.view));
+            cache_hash = mix(cache_hash, static_cast<u64>(im.layout));
+        }
+        cache_slot = &desc_set_cache[static_cast<size_t>(cache_hash) & (desc_set_cache.size() - 1)];
+        if (cache_slot->seq == flight_seq && cache_slot->hash == cache_hash &&
+            cache_slot->set_layout == *pipe.set_layout && cache_slot->set != VK_NULL_HANDLE &&
+            cache_slot->writes == scratch_write_sigs &&
+            cache_slot->buffers.size() == scratch_buffers.size() &&
+            (scratch_buffers.empty() ||
+             std::memcmp(cache_slot->buffers.data(), scratch_buffers.data(),
+                         scratch_buffers.size() * sizeof(VkDescriptorBufferInfo)) == 0) &&
+            cache_slot->images == scratch_image_sigs) {
+            cmd.BindDescriptorSets(bind_point, *pipe.layout, 0, std::span{&cache_slot->set, 1}, {});
+            return true;
+        }
+    }
     const VkDescriptorSet set = AllocateSet(*pipe.set_layout);
     if (!set) {
         bound_state.ForgetDescriptors();
@@ -2269,6 +2364,15 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     }
     impl.dld.vkUpdateDescriptorSets(impl.logical, static_cast<u32>(scratch_writes.size()),
                                     scratch_writes.data(), 0, nullptr);
+    if (cache_slot != nullptr) {
+        cache_slot->seq = flight_seq;
+        cache_slot->hash = cache_hash;
+        cache_slot->set_layout = *pipe.set_layout;
+        cache_slot->set = set;
+        cache_slot->writes = scratch_write_sigs;
+        cache_slot->buffers = scratch_buffers;
+        cache_slot->images = scratch_image_sigs;
+    }
     cmd.BindDescriptorSets(bind_point, *pipe.layout, 0, std::span{&set, 1}, {});
     return true;
 }

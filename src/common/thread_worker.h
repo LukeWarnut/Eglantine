@@ -129,6 +129,25 @@ public:
                work_done.load(std::memory_order_relaxed);
     }
 
+    /// Runs one queued task on the calling thread, if there is one: for a thread that would
+    /// otherwise idle until other work finishes. Stateless workers only.
+    bool TryRunOne() {
+        static_assert(!with_state, "TryRunOne has no state to give the task");
+        Task task;
+        {
+            std::scoped_lock lock{queue_mutex};
+            if (requests.empty()) {
+                return false;
+            }
+            task = std::move(requests.front());
+            requests.pop();
+        }
+        task();
+        ++work_done;
+        wait_condition.notify_all();
+        return true;
+    }
+
     // Drops tasks no worker has started. Running tasks still finish.
     void ClearRequests() {
         std::scoped_lock lock{queue_mutex};

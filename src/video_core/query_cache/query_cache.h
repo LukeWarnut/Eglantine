@@ -318,6 +318,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             result_lock.lock();
         }
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+            Tegra::Nx2SemaphoreWaiters::Get().Note(
+                query_base->guest_address, static_cast<u32>(query_base->value),
+                Tegra::Nx2SemaphoreWaiters::Event::Dropped);
             if (!is_synced) [[likely]] {
                 impl->pending_unregister.push_back(query_location);
             }
@@ -362,6 +365,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     static_assert(sizeof(operation_fn) <= 32,
                   "CounterReport operation lambda should fit in std::function SBO");
     std::function<void()> operation(std::move(operation_fn));
+    Tegra::Nx2SemaphoreWaiters::Get().Note(cpu_addr, payload,
+                                           Tegra::Nx2SemaphoreWaiters::Event::Queued);
     Tegra::g_nx2_async_reports_issued[settle_slot].fetch_add(1, std::memory_order_release);
     if (is_fence) {
         impl->rasterizer.SignalFence(std::move(operation));

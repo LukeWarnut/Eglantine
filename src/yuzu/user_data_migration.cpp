@@ -289,8 +289,9 @@ void UserDataMigrator::ReconcileLegacyPaths(QMainWindow* main_window, QtConfig& 
     }
 
     const fs::path eden_dir = Common::FS::GetEdenPath(EdenPath::EdenDir);
-    static constexpr std::array paths{EdenPath::NANDDir, EdenPath::SDMCDir, EdenPath::SaveDir,
-                                      EdenPath::LoadDir, EdenPath::DumpDir, EdenPath::TASDir};
+    static constexpr std::array paths{EdenPath::NANDDir,  EdenPath::SDMCDir, EdenPath::SaveDir,
+                                      EdenPath::LoadDir,  EdenPath::DumpDir, EdenPath::TASDir,
+                                      EdenPath::ScreenshotsDir};
 
     struct Move {
         EdenPath path;

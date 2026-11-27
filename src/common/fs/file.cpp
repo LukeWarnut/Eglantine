@@ -244,7 +244,8 @@ FileType IOFile::GetType() const {
     return file_type;
 }
 
-void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, FileShareFlag flag) {
+void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, FileShareFlag flag,
+                  bool log_failure) {
     Close();
 
     file_path = path;
@@ -266,11 +267,11 @@ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, File
         if (fd != -1) {
             file = fdopen(fd, "r");
             const auto error_num = errno;
-            if (error_num != 0 && file == nullptr) {
+            if (log_failure && error_num != 0 && file == nullptr) {
                 LOG_ERROR(Common_Filesystem, "Error opening file: {}, error: {}", path.c_str(),
                           strerror(error_num));
             }
-        } else {
+        } else if (log_failure) {
             LOG_ERROR(Common_Filesystem, "Error opening file: {}", path.c_str());
         }
     } else {
@@ -280,7 +281,7 @@ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, File
     file = std::fopen(path.c_str(), AccessModeToStr(mode, type));
 #endif
 
-    if (!IsOpen()) {
+    if (log_failure && !IsOpen()) {
         const auto ec = std::error_code{errno, std::generic_category()};
         LOG_ERROR(Common_Filesystem, "Failed to open the file at path={}, ec_message={}",
                   PathToUTF8String(file_path), ec.message());

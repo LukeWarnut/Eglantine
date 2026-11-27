@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <mutex>
 
 #include "common/common_types.h"
@@ -959,6 +960,8 @@ Result IHidServer::SendVibrationValue(Core::HID::VibrationDeviceHandle vibration
               vibration_device_handle.npad_type, vibration_device_handle.npad_id,
               vibration_device_handle.device_index, aruid.pid);
 
+    // Switch 1 style vibration: no Switch 2 Mode in effect
+    Settings::values.nx2_active_mode.store(0, std::memory_order_relaxed);
     GetResourceManager()->SendVibrationValue(aruid.pid, vibration_device_handle, vibration_value);
     R_SUCCEED()
 }
@@ -1024,6 +1027,8 @@ Result IHidServer::SendVibrationValues(
 
     R_UNLESS(vibration_handles.size() == vibration_values.size(), ResultVibrationArraySizeMismatch);
 
+    // Switch 1 style vibration: no Switch 2 Mode in effect
+    Settings::values.nx2_active_mode.store(0, std::memory_order_relaxed);
     for (std::size_t i = 0; i < vibration_handles.size(); i++) {
         R_TRY(GetResourceManager()->SendVibrationValue(aruid.pid, vibration_handles[i],
                                                        vibration_values[i]));
@@ -1118,15 +1123,21 @@ Result IHidServer::IsVibrationDeviceMounted(
 }
 
 Result IHidServer::SendVibrationValuesInMode(
-    u64 unknown, AppletResourceUserId aruid,
+    u64 mode, AppletResourceUserId aruid,
     InArray<Core::HID::VibrationDeviceHandle, BufferAttr_HipcPointer> vibration_handles,
     InArray<Core::HID::VibrationValue, BufferAttr_HipcPointer> vibration_values) {
-    LOG_DEBUG(Service_HID, "called, unknown={}, applet_resource_user_id={}", unknown, aruid.pid);
+    LOG_DEBUG(Service_HID, "called, mode={}, applet_resource_user_id={}", mode, aruid.pid);
 
     // Unlike 206 this never fails: rumble is best effort and the command is only known from
     // captures, so an unexpected handle or layout shouldn't return an error a game may treat as
     // fatal.
     const auto count = (std::min)(vibration_handles.size(), vibration_values.size());
+    if (count > 0) {
+        // Mode 2 is the Switch 2 translation RenHDrum applies; every other value plays as
+        // Switch 1. Only a request that delivers a sample sets it: an empty one must not
+        // change the translation a still-active Mode 2 stream is using.
+        Settings::values.nx2_active_mode.store(mode == 2 ? 2 : 0, std::memory_order_relaxed);
+    }
     for (std::size_t i = 0; i < count; i++) {
         const auto result = GetResourceManager()->SendVibrationValue(
             aruid.pid, vibration_handles[i], vibration_values[i]);
@@ -1139,16 +1150,53 @@ Result IHidServer::SendVibrationValuesInMode(
 }
 
 void IHidServer::SendVibrationValueInMode(HLERequestContext& ctx) {
-    // Switchbrew names 213 but gives no layout, and two fit its 32 bytes (the mode before the
-    // handle, or after the value as in 206's padding). Log the first request so a run shows which.
-    static std::once_flag logged;
-    std::call_once(logged, [&ctx] {
-        IPC::RequestParser rp{ctx};
-        const auto w = rp.PopRaw<std::array<u32, 8>>();
-        LOG_INFO(Service_HID,
-                 "(STUBBED) first request: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-    });
+    // Switchbrew names 213 but gives no layout. Testbeds parse its 32 bytes as handle 4, mode 4,
+    // VibrationValue 16, aruid 8. No retail title has been seen sending it (0 calls across the
+    // traced sessions), so the parse is range-checked and a layout that doesn't look like a
+    // vibration request is dropped instead of played.
+    IPC::RequestParser rp{ctx};
+    const auto vibration_device_handle = rp.PopRaw<Core::HID::VibrationDeviceHandle>();
+    const auto mode = rp.Pop<u32>();
+    const auto vibration_value = rp.PopRaw<Core::HID::VibrationValue>();
+    ClientAppletResourceUserId aruid{};
+    aruid.pid = rp.Pop<u64>();
+
+    const auto in_range = [](f32 value, f32 low, f32 high) {
+        return value >= low && value <= high;
+    };
+    const bool plausible =
+        mode <= 2 && in_range(vibration_value.low_amplitude, 0.0f, 1.0f) &&
+        in_range(vibration_value.high_amplitude, 0.0f, 1.0f) &&
+        in_range(vibration_value.low_frequency, 0.0f, 4000.0f) &&
+        in_range(vibration_value.high_frequency, 0.0f, 4000.0f);
+
+    if (!plausible) {
+        LOG_DEBUG(Service_HID,
+                  "(STUBBED) 213 with an unexpected layout: npad_type={}, npad_id={}, "
+                  "device_index={}, mode={}, low_amplitude={}, high_amplitude={}",
+                  vibration_device_handle.npad_type, vibration_device_handle.npad_id,
+                  vibration_device_handle.device_index, mode, vibration_value.low_amplitude,
+                  vibration_value.high_amplitude);
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+        return;
+    }
+
+    LOG_DEBUG(Service_HID,
+              "called, npad_type={}, npad_id={}, device_index={}, mode={}, "
+              "applet_resource_user_id={}",
+              vibration_device_handle.npad_type, vibration_device_handle.npad_id,
+              vibration_device_handle.device_index, mode, aruid.pid);
+
+    // Mode 2 is the Switch 2 translation RenHDrum applies; every other value plays as Switch 1.
+    Settings::values.nx2_active_mode.store(mode == 2 ? 2 : 0, std::memory_order_relaxed);
+
+    const auto result =
+        GetResourceManager()->SendVibrationValue(aruid.pid, vibration_device_handle, vibration_value);
+    if (result.IsError()) {
+        LOG_DEBUG(Service_HID, "failed to send vibration 213, result={:#x}", result.raw);
+    }
+
     IPC::ResponseBuilder rb{ctx, 2};
     rb.Push(ResultSuccess);
 }

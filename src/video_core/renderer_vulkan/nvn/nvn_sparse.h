@@ -203,6 +203,18 @@ public:
     void SetTileHash(u32 id, u64 hash) {
         tile_hash_[id] = hash;
     }
+    [[nodiscard]] u32 TileVerifiedGen(u32 id) const {
+        return id < tile_verified_gen_.size() ? tile_verified_gen_[id] : 0;
+    }
+    [[nodiscard]] u64 TileVerifiedPool(u32 id) const {
+        return id < tile_verified_pool_.size() ? tile_verified_pool_[id] : 0;
+    }
+    void SetTileVerifiedGen(u32 id, u64 pool_serial, u32 gen) {
+        if (id < tile_verified_gen_.size()) {
+            tile_verified_pool_[id] = pool_serial;
+            tile_verified_gen_[id] = gen;
+        }
+    }
     /// The next mapped, bound, clean tile to compare with its bytes (round robin), or ~0u.
     [[nodiscard]] u32 NextVerifyTile();
     [[nodiscard]] u64 TileHash(u32 id) const {
@@ -275,6 +287,8 @@ private:
     std::vector<u8> tile_flags_;
     std::vector<u8> tail_flags_;
     std::vector<u64> tile_hash_;
+    std::vector<u64> tile_verified_pool_;
+    std::vector<u32> tile_verified_gen_;
     std::vector<u32> tile_pages_;              ///< host_per_x_ * host_per_y_ per tile
     std::vector<std::vector<u32>> tail_pages_; ///< per layer: host tail tiles, then opaque pages
     std::vector<u32> pending_tiles_;

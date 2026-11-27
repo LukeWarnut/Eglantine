@@ -123,6 +123,7 @@ struct PoolMirror {
     /// VtxCovServeOrMiss): the prefetch's working set, which bounds its copies (null until the
     /// first use).
     std::unique_ptr<MirrorPages> wanted;
+    bool wanted_dirty{true};
     /// The tracker's write counter of the pool's registration (GuestMemory::WriteEpoch) and its
     /// value from before the last whole-pool collect of CPU writes: while they are equal no page
     /// of the pool is dirty, and the currency checks skip the tracker.

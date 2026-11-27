@@ -35,7 +35,7 @@ enum class DescriptorKind : u8 {
 };
 
 enum class DescriptorRole : u8 {
-    DriverBank,       ///< dynamic reads of c0 (driver table) that survived constant folding
+    DriverTable,      ///< dynamic reads of c0 (driver table) that survived constant folding
     ProgramConstants, ///< dynamic reads of c1 that survived folding
     HandleTable,      ///< data reads of c2 (not handle reads)
     UniformBuffer,    ///< game-bound uniform buffer, `slot` = bank - 3

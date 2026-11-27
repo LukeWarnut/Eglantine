@@ -381,6 +381,26 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 }
 
 template <class P>
+size_t TextureCache<P>::InvalidateAstcTranscodes()
+    requires requires(const Runtime& rt, const Image& image) { rt.CanFuseAstc(image); }
+{
+    using Flag = ImageFlagBits;
+    constexpr auto excluded = Flag::Alias | Flag::GpuModified | Flag::CpuModified | Flag::Remapped |
+                              Flag::Unbacked | Flag::TrimmedLevels;
+    size_t marked = 0;
+    for (const auto [id, image] : slot_images) {
+        if (True(image->flags & excluded) || False(image->flags & Flag::Registered) ||
+            !runtime.CanFuseAstc(*image)) {
+            continue;
+        }
+        image->cpu_modification_tick = image->modification_tick;
+        image->flags |= Flag::CpuModified;
+        ++marked;
+    }
+    return marked;
+}
+
+template <class P>
 void TextureCache<P>::TickFrame() {
     frame_start_modification_tick = modification_tick;
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed

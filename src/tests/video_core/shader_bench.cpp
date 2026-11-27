@@ -45,7 +45,8 @@ constexpr u32 HeaderSize = sizeof(Shader::ProgramHeader);
 class BenchEnvironment final : public Shader::Environment {
 public:
     BenchEnvironment(const std::vector<u64>& code_, Shader::Stage stage_, u32 texture_bound_)
-        : code{code_}, texture_bound{texture_bound_} {
+        : code{code_}, remaps{Shader::Ampere::NativeRegisterRemaps(code_)},
+          texture_bound{texture_bound_} {
         stage = stage_;
         is_proprietary_driver = true;
         start_address = stage_ == Shader::Stage::Compute ? HeaderSize : 0;
@@ -66,6 +67,9 @@ public:
     }
     bool IsNativeProgram() const override {
         return true;
+    }
+    std::span<const Shader::Ampere::NativeRegisterRemap> NativeRegisterRemaps() const override {
+        return remaps;
     }
     u32 ReadCbufValue(u32, u32) override {
         return 0;
@@ -104,6 +108,7 @@ public:
 
 private:
     const std::vector<u64>& code;
+    std::vector<Shader::Ampere::NativeRegisterRemap> remaps;
     u32 texture_bound;
 };
 
@@ -118,6 +123,7 @@ std::vector<u64> LayOut(const Shader::Ampere::LoweredProgram& lowered) {
         code.push_back(instruction);
     }
     code.push_back(0);
+    Shader::Ampere::AppendNativeRegisterRemaps(code, lowered.register_remaps);
     Shader::Ampere::AppendNativeAddressMap(code, lowered.source_instruction_offsets);
     return code;
 }
@@ -203,7 +209,10 @@ Sample Run(const std::filesystem::path& path) {
     file.read(reinterpret_cast<char*>(native.data()), native.size() * sizeof(native[0]));
 
     const auto lower_begin = Clock::now();
-    const auto lowered = Shader::Ampere::LowerToMaxwell(native, {.tensor = true});
+    // EGLANTINE_SHADER_BENCH_COPIES=1: the register copy form, to compare with the remaps.
+    static const bool register_copies = std::getenv("EGLANTINE_SHADER_BENCH_COPIES") != nullptr;
+    const auto lowered =
+        Shader::Ampere::LowerToMaxwell(native, {.tensor = true, .register_copies = register_copies});
     sample.ms.lower = Ms(Clock::now() - lower_begin);
     if (!lowered) {
         sample.stage = compute ? "cs" : "gfx";

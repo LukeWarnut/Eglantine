@@ -7,6 +7,11 @@
 #include "hid_core/hid_types.h"
 #include "ui_configure_vibration.h"
 #include "yuzu/configuration/configure_vibration.h"
+#include "input_common/drivers/renhdrum_pad.h"
+#include "yuzu/configuration/configure_hd_rumble.h"
+
+#include <QLabel>
+#include <QPushButton>
 
 ConfigureVibration::ConfigureVibration(QWidget* parent, Core::HID::HIDCore& hid_core_)
     : QDialog(parent), ui(std::make_unique<Ui::ConfigureVibration>()), hid_core{hid_core_} {
@@ -43,6 +48,31 @@ ConfigureVibration::ConfigureVibration(QWidget* parent, Core::HID::HIDCore& hid_
 
     if (!Settings::IsConfiguringGlobal()) {
         ui->checkBoxAccurateVibration->setDisabled(true);
+    }
+
+    auto* hd_rumble_button = new QPushButton(tr("HD Rumble..."));
+    hd_rumble_button->setToolTip(
+        tr("HD Rumble for Pro Controller / Joy-Con and DualSense haptics (RenHDrum)."));
+    connect(hd_rumble_button, &QPushButton::clicked, this, [this] {
+        ConfigureHdRumble dialog(hid_core, this);
+        if (dialog.exec() == QDialog::Accepted) {
+            dialog.ApplyConfiguration();
+        }
+    });
+    ui->verticalLayout->addWidget(hd_rumble_button);
+    hd_rumble_button->setVisible(InputCommon::IsRenHDrumBuilt());
+
+    // The 15 ms packet filter above is bypassed while HD Rumble is on (renhdrum_pad paces the
+    // packets itself), so say so where the checkbox is, not only in the HD Rumble dialog.
+    if (InputCommon::IsRenHDrumBuilt()) {
+        ui->checkBoxAccurateVibration->setToolTip(
+            tr("Not used while HD Rumble is on: the HD Rumble engine paces packets itself.\n"
+               "Otherwise, off drops vibrations that arrive less than 15 ms apart."));
+        auto* hd_rumble_note = new QLabel(tr(
+            "HD Rumble paces packets itself, so \"Enable Accurate Vibration\" is bypassed while "
+            "HD Rumble is on."));
+        hd_rumble_note->setWordWrap(true);
+        ui->verticalLayout->addWidget(hd_rumble_note);
     }
 
     RetranslateUI();

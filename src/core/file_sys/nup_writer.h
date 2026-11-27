@@ -83,7 +83,7 @@ bool HasResumableJournal(const std::filesystem::path& archive);
 enum class ExtractResult { Success, Cancelled, InvalidSource, IoError };
 
 // Unpacks every package back into a loose dump: base/, updates/<version>/ and
-// dlc/<titleid>/<n>/. A single base-only container is written bare, without the base/
+// dlc/<titleid>/<version>/. A single base-only container is written bare, without the base/
 // wrapper, so it round-trips. An existing non-empty output directory is never overwritten.
 ExtractResult ExtractNup(const std::filesystem::path& archive,
                          const std::filesystem::path& out_dir,

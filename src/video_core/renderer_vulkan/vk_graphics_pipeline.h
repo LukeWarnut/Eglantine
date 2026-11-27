@@ -14,7 +14,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <type_traits>
 #include <vector>
@@ -81,6 +83,18 @@ class Scheduler;
 /// Mesh emulation on a device without VK_EXT_mesh_shader: the mesh program (stage 0) is built as
 /// a compute shader that writes its output to a storage buffer, and this vertex shader draws it
 /// (see Shader::Backend::SPIRV::EmitMeshEmulationVertex).
+class GraphicsPipelineLibraryCache;
+
+/// Shader modules shared by the graphics pipelines whose stages are the same SPIR-V, so they can
+/// share VK_EXT_graphics_pipeline_library parts: GraphicsPipelineLibraryCache keys the shader
+/// parts by this object's address and keeps it alive with them.
+struct GraphicsShaderSet {
+    std::array<vk::ShaderModule, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> modules;
+    /// Pipelines built from this set (PipelineCache::FindOrMakeShaderSet). Parts are only
+    /// compiled once a second pipeline shares the set: with one, nothing would link from them.
+    mutable std::atomic<u32> pipelines{0};
+};
+
 struct MeshEmulationSetup {
     std::vector<u32> vertex_spirv;
     u32 output_binding{};
@@ -116,7 +130,12 @@ public:
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
         std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
-        std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
+        std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt,
+        std::shared_ptr<const GraphicsShaderSet> shader_set = {},
+        GraphicsPipelineLibraryCache* library_cache = nullptr,
+        Common::ThreadWorker* library_part_workers = nullptr,
+        PipelineLayoutCache* layout_cache = nullptr, bool fill_library_parts = false);
+    ~GraphicsPipeline();
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
@@ -275,7 +294,13 @@ private:
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are, bool is_indexed);
 
-    void MakePipeline(VkRenderPass render_pass);
+    /// With `parts_only`, compiles the library parts of this pipeline's create info and keeps
+    /// nothing else (QueueLibraryParts).
+    void MakePipeline(VkRenderPass render_pass, bool parts_only = false);
+
+    /// After a pipeline new this session was compiled whole: its library parts on the part
+    /// workers, for the next pipeline with the same shaders to link.
+    void QueueLibraryParts(RenderPassCache& render_pass_cache);
 
     void Validate();
 
@@ -299,6 +324,23 @@ private:
     u64 last_use_frame{};
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
+    /// The stages' modules: spv_modules', or shader_set's when pipelines share them.
+    std::array<VkShaderModule, NUM_STAGES> modules{};
+    std::shared_ptr<const GraphicsShaderSet> shader_set;
+    GraphicsPipelineLibraryCache* library_cache{};
+    Common::ThreadWorker* library_part_workers{};
+    /// The pipeline cache's build workers (null for builds on the calling thread).
+    Common::ThreadWorker* build_workers{};
+    bool fill_library_parts{};
+    /// Set by MakePipeline when it compiled whole a pipeline that could link from parts.
+    bool compiled_whole_for_library{};
+    /// A queued QueueLibraryParts task checks `cancelled` under `mutex`: the destructor sets it,
+    /// waiting for a task that runs.
+    struct LibraryPartsTask {
+        std::mutex mutex;
+        bool cancelled{};
+    };
+    std::shared_ptr<LibraryPartsTask> library_parts_task;
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
     std::array<std::vector<VideoCommon::TextureHandleCache>, NUM_STAGES> handle_caches;
@@ -315,10 +357,12 @@ private:
     bool writes_storage{};
     bool has_render_area_push_constants{};
 
-    vk::DescriptorSetLayout descriptor_set_layout;
+    /// Owns the three handles below, shared with pipelines of the same layout (PipelineLayoutCache).
+    std::shared_ptr<const PipelineLayouts> layouts;
+    VkDescriptorSetLayout descriptor_set_layout{};
     DescriptorAllocator descriptor_allocator;
-    vk::PipelineLayout pipeline_layout;
-    vk::DescriptorUpdateTemplate descriptor_update_template;
+    VkPipelineLayout pipeline_layout{};
+    VkDescriptorUpdateTemplate descriptor_update_template{};
     vk::Pipeline pipeline;
 
     DescriptorBufferLayout descriptor_buffer_layout;

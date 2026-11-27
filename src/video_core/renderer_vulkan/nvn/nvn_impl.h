@@ -140,6 +140,8 @@ struct Pool {
     u8* host{};
     /// VkBuffer device address of the pool's buffer (raw global memory); 0 until first needed.
     u64 device_address{};
+    /// Last submission seq that retained this pool (avoids hashing into `Impl::last_use`).
+    u64 last_use_seq{0};
     /// GuestMemory::Track registration over the whole pool for Recorder::ResolveOverlaps: the pages
     /// of a storage are armed when the GPU takes it over (NoteGpuWrite), so a later CPU write to
     /// them shows. 0: not registered (yet, or tracking unavailable: `takeover_track_tried`).
@@ -171,6 +173,8 @@ struct Pool {
     /// tracking unavailable: `mirror_track_tried`). Replay thread.
     u64 mirror_track{};
     bool mirror_track_tried{false};
+    bool raw_written_through{false};
+    u64 split_raw_epoch_unaliased_seen{0};
     std::shared_ptr<const std::atomic<u64>> mirror_write_epoch;
     u64 mirror_epoch_clean{}; ///< `mirror_write_epoch` before the last TakeWritten
     /// Per MIRROR_PAGE of the pool: `cpu_write_gen` of the last Impl::TakePoolCpuWrites that found
@@ -339,6 +343,7 @@ struct Storage : std::enable_shared_from_this<Storage> {
     /// while the page tracker watched the pool (0: never). While no page under the storage has a
     /// later `page_write_gen`, the CPU did not write it and a check needs no hash
     /// (Impl::tex_hash_tracked).
+    u64 cpu_trusted_pool{0};
     u32 cpu_trusted_gen{0};
     /// The pool's `cpu_write_gen` at the full hash behind `cpu_trusted_gen` (the page compares
     /// move only that one on). A later Pool::raw_write_gen: bytes no page write names may differ.
@@ -417,6 +422,9 @@ struct Texture {
     /// The scaled twin of this texture object (Impl::ScaledTextureOf), for views of the twin
     /// storage; null until a scaled pass or sampled read needs it. It goes with the texture.
     std::shared_ptr<Texture> scaled;
+    /// Last submission seq that retained this texture (avoids hashing into `Impl::last_use`).
+    u64 last_use_seq{0};
+    bool live{true};
 };
 
 /// The scaled twin of `native` (nvn_rescale.cpp): no image yet, the guest description of `native`
@@ -456,6 +464,10 @@ struct InFlight {
     bool submitted{false};
     VkSemaphore semaphore{VK_NULL_HANDLE}; ///< Null: nothing was submitted, complete at once.
     u64 value{};
+    /// Replay thread only: highest timeline value actually accepted by vkQueueSubmit for this
+    /// flight, and whether a batched submit containing a piece of this flight failed.
+    u64 gpu_submitted_value{0};
+    bool failed{false};
 
     std::vector<vk::Buffer> staging;
     vk::Buffer download;
@@ -467,6 +479,8 @@ struct InFlight {
     const RawTableBuffer* raw_table_kept{nullptr};
     /// A draw or dispatch of this submission stored to raw global memory (Impl::split_raw_epoch).
     bool raw_writes{false};
+    /// Same, without full write-through aliases (`Impl::split_raw_epoch_unaliased`).
+    bool raw_writes_unaliased{false};
     /// Host buffer chunks the draw path carved this submission's dynamic data from; returned to
     /// the free list by the completion thread.
     std::vector<std::shared_ptr<ArenaChunk>> arena;
@@ -802,6 +816,7 @@ struct Context::Impl {
         std::atomic<u64> overlaps_skipped_cpu_rewrite{};
         /// Counters of the memory work (nvn_storage.cpp / nvn_upload.cpp).
         std::atomic<u64> storages_created{};     ///< VkImages created (first use of a storage)
+        std::atomic<u64> storages_recycled{};    ///< VkImages taken from the exact-shape recycle pool
         std::atomic<u64> storages_reused{};      ///< textures that found a cached storage
         std::atomic<u64> storages_evicted{};
         std::atomic<u64> storages_superseded_evicted{}; ///< ... GPU-written ones a later GPU write replaced
@@ -1001,6 +1016,8 @@ struct Context::Impl {
     /// Bumped whenever a pool is created, destroyed or backed (the raw global table depends on
     /// the set; the backing thread bumps it under backing_mutex).
     std::atomic<u64> pool_generation{0};
+    /// Bumped whenever a split-imported mirror pool is backed or destroyed.
+    std::atomic<u64> split_alias_generation{0};
 
     /// Guest address -> device address ranges of every backed pool, for shaders that read and write
     /// raw global memory (Shader::Profile::RAW_GLOBAL_TABLE_*). Adjacent pools whose guest and
@@ -1015,6 +1032,7 @@ struct Context::Impl {
         /// Pools with a buffer of their own that the entries cover (a draw that uses the table
         /// retains them; chunks live as long as the context).
         std::vector<u64> pool_serials;
+        std::vector<Pool*> pools;
         /// An imported pool: GPU writes through the table are host-visible there.
         Pool* imported_pool{nullptr};
     } raw_table;
@@ -1025,6 +1043,7 @@ struct Context::Impl {
         u64 generation{0};
         /// Pool-set generation the entries were built from.
         u64 mirror_generation{~u64{0}};
+        u64 split_generation{~u64{0}};
         bool read_only_enabled{};
         bool storage_enabled{};
         /// The entries in device memory (null when there are none); draws keep it alive through
@@ -1034,6 +1053,7 @@ struct Context::Impl {
         u64 high{};
         /// Pools whose current mirror is kept current by the aliases in this table.
         std::vector<u64> pool_serials;
+        std::vector<Pool*> pools;
     } raw_write_through_table;
     /// Bumped whenever any mirror is made, promoted to a storage mirror or released.
     u64 ro_alias_generation{0};
@@ -1134,6 +1154,8 @@ struct Context::Impl {
     std::unordered_map<u64, u64> last_use; ///< serial -> last seq that retained it
     /// Bumped whenever an entry of `textures` is erased (cached node pointers die).
     u64 texture_epoch{1};
+    /// Bumped whenever an entry of `textures` is created or erased.
+    u64 texture_change_epoch{1};
     /// The serials erased last: erase number n (texture_epoch - 1 when it happened) is at
     /// n % size. Lets a holder of many node pointers drop only the dead ones.
     std::array<u64, 4096> texture_erased{};
@@ -1145,7 +1167,7 @@ struct Context::Impl {
         u64 serial{~u64{0}};
         u64 seq{0};
     };
-    std::array<UseSlot, 256> use_cache{};
+    std::array<UseSlot, 4096> use_cache{};
     /// Replay thread: recently resolved pool ranges, valid while `pool_generation` is unchanged.
     /// [begin, end) is the part of the pool no other pool starts in, so the answer is the same as
     /// the address map's for every address in it.
@@ -1165,7 +1187,7 @@ struct Context::Impl {
         Pool* pool{};
         u64 offset{};
     };
-    mutable std::array<ExactResolveSlot, 256> mkw_resolve_cache{};
+    mutable std::array<ExactResolveSlot, 4096> mkw_resolve_cache{};
     u64 mkw_mapping_generation{};
     mutable u64 mkw_resolve_hits{};
     mutable u64 mkw_resolve_misses{};
@@ -1206,6 +1228,34 @@ struct Context::Impl {
     /// texture over the same bytes reuses the image. Replay thread only.
     std::map<StorageKey, std::shared_ptr<Storage>> storage_cache;
     u64 storage_cache_bytes{0};
+    /// Exact-shape VkImage recycler for non-sparse storage images (avoids WDDM vmaCreateImage /
+    /// vmaDestroyImage kernel overhead when storages churn). Replay thread only.
+    struct ImageRecycleKey {
+        VkImageCreateFlags flags{};
+        VkImageType type{};
+        VkFormat format{};
+        u32 width{};
+        u32 height{};
+        u32 depth{};
+        u32 levels{};
+        u32 layers{};
+        VkSampleCountFlagBits samples{};
+        VkImageUsageFlags usage{};
+        bool operator==(const ImageRecycleKey&) const = default;
+        auto operator<=>(const ImageRecycleKey&) const = default;
+    };
+    struct RecycledImage {
+        ImageRecycleKey key;
+        vk::Image image;
+        u64 vram_bytes{};
+        u64 lru_tick{};
+    };
+    static constexpr u64 IMAGE_RECYCLE_MAX_BYTES = u64{256} << 20;
+    static constexpr u64 IMAGE_RECYCLE_MAX_COUNT = 128;
+    std::map<ImageRecycleKey, std::vector<RecycledImage>> image_recycle_pool;
+    u64 image_recycle_bytes{0};
+    u64 image_recycle_count{0};
+    u64 image_recycle_tick{0};
     /// Trim threshold (ContextOptions::storage_cache_budget_bytes) and the throttle of the passes
     /// over the whole cache: the next one runs when the cache has grown past `trim_floor_bytes` or
     /// at present `trim_next_present`. Replay thread only.
@@ -1332,6 +1382,7 @@ struct Context::Impl {
                        const std::vector<std::pair<u64, u64>>& runs);
     /// MirrorTakeStale over the whole pool, for the pages uniform bindings used (`wanted`).
     void MirrorTakeStaleWanted(Pool& pool, std::vector<std::pair<u64, u64>>& runs);
+    void MirrorMarkPrefetch(Pool& pool, u64 offset, u64 size);
     /// A draw stores through raw global memory: read-only mirrors do not hold the raw table's
     /// target, so every page of every one of them is copied in again at its next use. With
     /// `written_through` (the draw's stores also wrote the read-only mirror table) only the
@@ -1353,6 +1404,13 @@ struct Context::Impl {
     void ReleaseVramMirror(Pool& pool);
     /// Pools with a VRAM mirror (MirrorInvalidateAll) and their bytes (budget).
     std::vector<Pool*> vram_mirrored;
+    /// Subset of `vram_mirrored` whose `prefetch` flag is set (`PrefetchMirrors`).
+    struct PrefetchMirrorEntry {
+        Pool* pool{};
+        PoolMirror* mirror{};
+        const std::atomic<u64>* write_epoch{};
+    };
+    std::vector<PrefetchMirrorEntry> vram_prefetch_mirrors;
     std::atomic<u64> vram_mirror_bytes{0}; ///< read by DescribeState
     bool vram_mirror_no_tracker_logged{false};
     /// EDEN_NX2_NVN_WB_MONITOR: counters of every mirror created (never removed; DescribeState).
@@ -1412,6 +1470,10 @@ struct Context::Impl {
     /// Bumped when a submission that stored to raw global memory completes: split pools' mirror
     /// pages trusted before may be stale (Recorder::MirrorTakeCpuWrites).
     std::atomic<u64> split_raw_epoch{0};
+    /// Monotonic epoch captured from `split_raw_epoch` when a raw-writing submission without full
+    /// write-through completes; split pools included in `raw_write_through_table` stay valid past
+    /// write-through-only raw writes.
+    std::atomic<u64> split_raw_epoch_unaliased{0};
     /// BarrierMergeMask of ContextOptions::barrier_merge, else EDEN_NX2_TRY_BARRIER_MERGE (set at
     /// construction); 0 = off.
     u32 barrier_merge{0};
@@ -1465,10 +1527,8 @@ struct Context::Impl {
     std::future<std::unique_ptr<BcGpuEncoder>> bc_encoder_future;
     bool bc_encoder_failed{false};
     [[nodiscard]] BcGpuEncoder* BcEncoder();
-    /// Replay thread: the scratch BC stand-in uploads reuse (grown up to BC_SCRATCH_BUDGET).
-    /// AcquireBcScratch returns it, a bigger one, or a one-off for a single layer above the
-    /// budget; null when no image could be created (logged once).
-    std::shared_ptr<BcScratch> bc_scratch;
+    /// Replay thread: LRU pool of scratch BC stand-in images (up to 4 shapes within BC_SCRATCH_BUDGET).
+    std::vector<std::shared_ptr<BcScratch>> bc_scratches;
     bool bc_scratch_failed_logged{false};
     [[nodiscard]] std::shared_ptr<BcScratch> AcquireBcScratch(u32 width, u32 height, u32 layers);
     /// EDEN_NX2_NVN_BC7_QUALITY (nvn_bc_encode.h) for BC7 stand-ins.
@@ -1545,6 +1605,31 @@ struct Context::Impl {
     void RetireCompleted();
     void FailFlight(InFlight& flight);
     void MarkSubmitted(InFlight& flight, VkSemaphore semaphore, u64 value);
+    struct SubmitBatch {
+        struct Entry {
+            VkTimelineSemaphoreSubmitInfo timeline{};
+            std::array<VkSemaphore, 16> signals{};
+            std::array<u64, 16> signal_values{};
+            std::vector<VkSemaphore> wait_semaphores;
+            std::vector<u64> wait_values;
+            std::vector<VkPipelineStageFlags> wait_stages;
+            VkCommandBuffer cmd{VK_NULL_HANDLE};
+            u32 signal_count{0};
+            u64 flight_seq{0};
+            InFlight* flight{nullptr};
+            VkSemaphore queue_timeline{VK_NULL_HANDLE};
+            u64 queue_signal_value{0};
+        };
+        struct Mark {
+            InFlight* flight{};
+            VkSemaphore semaphore{VK_NULL_HANDLE};
+            u64 value{0};
+        };
+        std::vector<Entry> entries;
+        std::vector<Mark> marks;
+        bool batching{false};
+    } submit_batch;
+    void FlushSubmitBatch();
     /// The Vulkan device was lost at `where`: logs it (once), reports the loss to the device
     /// (Aftermath) and tells the owner to stop the emulation. Callable from any context thread.
     void NoteDeviceLost(const char* where);
@@ -1647,6 +1732,16 @@ struct Context::Impl {
     [[nodiscard]] bool DependenciesKnown(const VC::Submission& submission,
                                          u64* missing = nullptr) const;
     void NoteUse(u64 serial, u64 seq);
+    static void NoteUse(Pool& pool, u64 seq) noexcept {
+        if (seq > pool.last_use_seq) {
+            pool.last_use_seq = seq;
+        }
+    }
+    static void NoteUse(Texture& texture, u64 seq) noexcept {
+        if (seq > texture.last_use_seq) {
+            texture.last_use_seq = seq;
+        }
+    }
 
     /// Virtual pool range -> the physical pool and offset backing it, when one physical range
     /// covers all of it.
@@ -1654,6 +1749,12 @@ struct Context::Impl {
                              u64& physical_offset) const;
 
     // --- storages, virtual pools, CPU coherency (nvn_storage.cpp) ---
+    /// Takes a recycled non-sparse VkImage matching `info`, or an empty handle on miss.
+    [[nodiscard]] vk::Image TakeRecycledImage(const VkImageCreateInfo& info);
+    /// Moves a completed, non-sparse storage's VkImage into `image_recycle_pool`.
+    void RecycleImage(Storage& s);
+    /// Releases every VkImage held in `image_recycle_pool`.
+    void ClearRecycledImages();
     /// Creates the VkImage of `s` on first use. False when it cannot be created (logged once).
     bool EnsureImage(Storage& s);
     /// Bytes [offset, offset + size) of `pool` as the guest sees them: a contiguous host pointer
@@ -1734,7 +1835,7 @@ struct Context::Impl {
     /// Drops cached storages nobody uses once the cache is over budget (least recently used first)
     /// or the device over its memory budget, and idle render targets past the age limit.
     /// `at_present`: the periodic pass of a present (the cache need not have grown).
-    void TrimStorageCache(bool at_present = false);
+    void TrimStorageCache(bool at_present = false, u64 retire_seq = 0);
     /// True when the GPU wrote every byte of the storage's span again after the storage's own last
     /// write, through other storages of the pool that took its contents over first (overlap
     /// resolution at their use): its image holds nothing the pool's bytes do not, so a later

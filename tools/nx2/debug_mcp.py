@@ -88,7 +88,8 @@ TOOLS = [
                        "storage buffers (kind: buffer, buffer_<hash>.bin.zst) and dispatch group "
                        "counts (kind: launch). 'sampled_max_mib' lists larger sampled "
                        "textures (skipped: size) without reading them back, so the capture "
-                       "stays under the 2 GiB cap. Returns "
+                       "stays under the 2 GiB cap. 'sampled_tics' filters sampled captures and "
+                       "includes raw host BC mip levels for the listed descriptors. Returns "
                        "the directory, summary, entry counts and the first manifest entries. "
                        "'index' builds index.html with frame_dump_index.py.",
         "inputSchema": {
@@ -97,6 +98,7 @@ TOOLS = [
                 "sampled": {"type": "boolean"},
                 "buffers": {"type": "boolean"},
                 "sampled_max_mib": {"type": "integer", "minimum": 0, "maximum": 65536},
+                "sampled_tics": {"type": "array", "items": {"type": "integer", "minimum": 0}},
                 "timeout_s": {"type": "integer", "minimum": 1, "maximum": 600},
                 "manifest_lines": {"type": "integer", "minimum": 0, "maximum": 5000},
                 "index": {"type": "boolean"},
@@ -126,6 +128,19 @@ TOOLS = [
                 "hashes": {"type": "array", "items": {"type": "string"}},
                 "reject": {"type": "boolean"},
                 "timeout_s": {"type": "integer", "minimum": 0, "maximum": 60},
+            },
+        },
+    },
+    {
+        "name": "astc_fusion",
+        "description": "Query or switch ASTC-to-BC fusion in the emulated Vulkan GPU. Changes "
+                       "apply at a frame boundary and mark eligible cached textures for "
+                       "re-transcoding on next use. Omit 'enable' to query.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enable": {"type": "boolean"},
+                "timeout_s": {"type": "integer", "minimum": 1, "maximum": 60},
             },
         },
     },

@@ -43,6 +43,11 @@ if (NOT TARGET enet::enet)
     add_library(enet::enet ALIAS enet)
 endif()
 
+# nxformat reader, header-only
+add_library(nxformat_reader INTERFACE)
+target_include_directories(nxformat_reader SYSTEM INTERFACE ./nxformat)
+target_compile_features(nxformat_reader INTERFACE cxx_std_17)
+
 # stb
 add_library(stb stb/stb_dxt.cpp)
 target_include_directories(stb PUBLIC ./stb)
@@ -165,7 +170,16 @@ if (NOT YUZU_USE_BUNDLED_SDL3)
         set(SDL_FILE ON)
     endif()
 
-    AddJsonPackage(sdl3)
+    if (RENHDRUM_SDL_PATCHES)
+        # SDL 3.4.8 with RenHDrum's HD Rumble transport modes (no-queue / write-after-input).
+        # SDL_HDRumbleSet* is not in SDL's export headers, so a shared patched SDL hides the
+        # transport functions and the link fails: the patched SDL is always static.
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        AddJsonPackage(NAME sdl3-hdrumble FORCE_BUNDLED_PACKAGE ON)
+    else()
+        AddJsonPackage(sdl3)
+    endif()
 else()
     message(STATUS "Using bundled SDL3")
     AddJsonPackage(sdl3-ci)

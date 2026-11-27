@@ -101,6 +101,24 @@ enum class Opt : unsigned {
     /// Async shaders: keep FileEnvironments of graphics pipelines skipped at boot and replay their
     /// translation and compilation on background workers on first skippable use
     ReplayDiskRecordings,
+    /// Async shaders: a draw the build budget defers still queues its pipeline's translation,
+    /// so a later frame finds it translating or done instead of starting it then
+    QueueDeferredTranslation,
+    /// Native stages: a stage another thread is translating is waited for and reused instead of
+    /// translated a second time (threads that hold no such stage themselves)
+    StageInFlight,
+    /// Graphics pipelines with the same descriptor layout share their set layout, pipeline layout
+    /// and update template (PipelineLayoutCache): creating them waits on a driver lock while
+    /// pipelines compile
+    SharedPipelineLayouts,
+    /// Translation threads run at normal priority, above the driver compile workers (both stay
+    /// below the emulation's threads): every skipped draw waits for its translation first
+    TranslationPriority,
+    /// Shared layouts are saved per title and created at boot, before anything compiles
+    SavedPipelineLayouts,
+    /// A translation thread waiting for a stage another thread translates runs other queued
+    /// translations meanwhile instead of idling
+    HelpWhileInFlight,
     Count,
 };
 
@@ -115,6 +133,9 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "handle_page_cache", "dma_forward", "draw_begin_coalesce", "pending_wake", "diag_draw_lite",
     "shader_build_budget", "compute_rebuild_async", "compute_preload_variants", "stale_target_skip",
     "geometry_consistency", "build_order_priority", "replay_disk_recordings",
+    "queue_deferred_translation", "stage_in_flight", "shared_pipeline_layouts",
+    "translation_priority", "saved_pipeline_layouts",
+    "help_while_in_flight",
 };
 
 static_assert(static_cast<size_t>(Opt::Count) <= 64, "the off-mask is 64 bits");

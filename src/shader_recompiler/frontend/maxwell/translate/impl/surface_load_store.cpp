@@ -159,10 +159,11 @@ unsigned SwizzleMask(u64 swizzle) {
     return MASK[swizzle];
 }
 
-IR::Value MakeColor(IR::IREmitter& ir, IR::Reg reg, int num_regs) {
+IR::Value MakeColor(TranslatorVisitor& v, IR::Reg reg, int num_regs) {
+    IR::IREmitter& ir{v.ir};
     std::array<IR::U32, 4> colors;
     for (int i = 0; i < num_regs; ++i) {
-        colors[static_cast<size_t>(i)] = ir.GetReg(reg + i);
+        colors[static_cast<size_t>(i)] = v.X(reg + i);
     }
     for (int i = num_regs; i < 4; ++i) {
         colors[static_cast<size_t>(i)] = ir.Imm32(0);
@@ -269,11 +270,11 @@ void TranslatorVisitor::SUST(u64 insn) {
 
     IR::Value color;
     if (is_typed) {
-        color = MakeColor(ir, sust.data_reg, SizeInRegs(sust.size));
+        color = MakeColor(*this, sust.data_reg, SizeInRegs(sust.size));
     } else {
         const unsigned mask{SwizzleMask(sust.swizzle)};
         if (mask == 0xf) {
-            color = MakeColor(ir, sust.data_reg, 4);
+            color = MakeColor(*this, sust.data_reg, 4);
         } else {
             // The data registers hold the masked components in order; the others keep the
             // texel's current values.

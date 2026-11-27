@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <string_view>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include "common/cityhash.h"
 #include "common/fs/fs_util.h"
@@ -277,7 +279,7 @@ void FrameDump::StopWriter() {
 }
 
 void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers, u64 id,
-                    size_t sampled_max_bytes_) {
+                    size_t sampled_max_bytes_, std::vector<u32> sampled_tics_) {
     if (!schedule.Arm(sampled, buffers, id)) {
         VideoCore::Nx2Debug::FinishCapture(id, {.error = "another capture is in progress"});
         return;
@@ -285,6 +287,7 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers
     StopWriter();
     directory = std::move(directory_);
     sampled_max_bytes = sampled_max_bytes_;
+    sampled_tics = std::move(sampled_tics_);
     truncated = false;
     recorded_bytes = 0;
     written_bytes = 0;
@@ -293,6 +296,7 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers
     pass_framebuffer = nullptr;
     dispatch_sampled.clear();
     seen_buffers.clear();
+    seen_vertex_inputs.clear();
     written_buffers.clear();
     shader_keys.clear();
     pass_index = 0;
@@ -358,6 +362,8 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
         .rescaled = rescaled,
         .msaa = info.num_samples > 1,
         .depth_encoding = depth_encoding,
+        .view_image = view.ImageHandle(),
+        .view_mip_count = view.range.extent.levels,
     };
 }
 
@@ -370,6 +376,14 @@ u32 FrameDump::TexelBytes(const Target& target) {
     default:
         return 4;
     }
+}
+
+size_t FrameDump::ImageBytes(const Target& target) {
+    if (target.host_blocks) {
+        return size_t{(target.width + 3) / 4} * ((target.height + 3) / 4) * target.depth *
+               VideoCore::Surface::BytesPerBlock(*target.host_blocks);
+    }
+    return size_t{target.width} * target.height * target.depth * TexelBytes(target);
 }
 
 int FrameDump::Decode(const Target& target, const u8* pixel, std::array<float, 4>& out) {
@@ -411,6 +425,26 @@ bool FrameDump::BeginPass(const void* framebuffer, std::span<ImageView* const> c
 }
 
 namespace {
+std::optional<PixelFormat> HostBcFormat(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return PixelFormat::BC1_RGBA_UNORM;
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return PixelFormat::BC1_RGBA_SRGB;
+    case VK_FORMAT_BC2_UNORM_BLOCK: return PixelFormat::BC2_UNORM;
+    case VK_FORMAT_BC2_SRGB_BLOCK: return PixelFormat::BC2_SRGB;
+    case VK_FORMAT_BC3_UNORM_BLOCK: return PixelFormat::BC3_UNORM;
+    case VK_FORMAT_BC3_SRGB_BLOCK: return PixelFormat::BC3_SRGB;
+    case VK_FORMAT_BC4_UNORM_BLOCK: return PixelFormat::BC4_UNORM;
+    case VK_FORMAT_BC4_SNORM_BLOCK: return PixelFormat::BC4_SNORM;
+    case VK_FORMAT_BC5_UNORM_BLOCK: return PixelFormat::BC5_UNORM;
+    case VK_FORMAT_BC5_SNORM_BLOCK: return PixelFormat::BC5_SNORM;
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK: return PixelFormat::BC6H_UFLOAT;
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK: return PixelFormat::BC6H_SFLOAT;
+    case VK_FORMAT_BC7_UNORM_BLOCK: return PixelFormat::BC7_UNORM;
+    case VK_FORMAT_BC7_SRGB_BLOCK: return PixelFormat::BC7_SRGB;
+    default: return std::nullopt;
+    }
+}
+
 std::optional<std::pair<GPUVAddr, u32>> SampledKey(const FrameDump::Sampled& texture) {
     const Image* const image = texture.view ? texture.view->BackingImage() : nullptr;
     if (!image) {
@@ -426,8 +460,7 @@ bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string nam
                               std::string tags) {
     tags += SamplerJson(texture.sampler);
     if (const auto target = MakeTarget(*texture.view, index)) {
-        const size_t size =
-            size_t{target->width} * target->height * target->depth * TexelBytes(*target);
+        const size_t size = ImageBytes(*target);
         if (sampled_max_bytes != 0 && size > sampled_max_bytes) {
             Enqueue({.tags = fmt::format(
                          R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},)"
@@ -440,6 +473,46 @@ bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string nam
     }
     const Image& image = *texture.view->BackingImage();
     const auto& info = image.info;
+    if (!sampled_tics.empty() && info.type == VideoCommon::ImageType::e2D &&
+        info.num_samples == 1 && image.host_level_offset == 0 && !image.IsRescaled() &&
+        False(image.flags & VideoCommon::ImageFlagBits::Unbacked) &&
+        (image.UsageFlags() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0) {
+        if (const auto host_blocks = HostBcFormat(image.HostFormat())) {
+            const auto& range = texture.view->range;
+            const s32 end_level = std::min(range.base.level + range.extent.levels,
+                                           info.resources.levels);
+            const auto view_tags = fmt::format(
+                R"({},"view_base_level":{},"view_levels":{},"view_base_layer":{},"view_layers":{})",
+                tags, range.base.level, range.extent.levels, range.base.layer, range.extent.layers);
+            bool recorded = false;
+            for (s32 level = range.base.level; level < end_level; ++level) {
+                const Target target{
+                    .slot = index,
+                    .image = image.Handle(),
+                    .format = texture.view->format,
+                    .width = std::max(1U, info.size.width >> level),
+                    .height = std::max(1U, info.size.height >> level),
+                    .depth = 1,
+                    .level = level,
+                    .layer = range.base.layer,
+                    .gpu_addr = image.gpu_addr,
+                    .rescaled = false,
+                    .msaa = false,
+                    .depth_encoding = DepthEncoding::None,
+                    .host_blocks = host_blocks,
+                    .view_image = texture.view->ImageHandle(),
+                    .view_mip_count = range.extent.levels,
+                };
+                if (sampled_max_bytes != 0 && ImageBytes(target) > sampled_max_bytes) {
+                    continue;
+                }
+                recorded |= Record(target, fmt::format("{}_mip{}", name, level), view_tags);
+            }
+            if (recorded || truncated) {
+                return recorded;
+            }
+        }
+    }
     Enqueue({.tags = fmt::format(
                  R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"type":{},)"
                  R"("gpu_addr":"{:#x}","skipped":"format"}})",
@@ -451,6 +524,9 @@ bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string nam
 bool FrameDump::NoteSampled(std::span<const Sampled> textures) {
     bool recorded = false;
     for (const Sampled& texture : textures) {
+        if (!sampled_tics.empty() && std::ranges::find(sampled_tics, texture.tic) == sampled_tics.end()) {
+            continue;
+        }
         const auto key = SampledKey(texture);
         if (!key || std::ranges::find(pass_sampled, *key) != pass_sampled.end()) {
             continue;
@@ -470,6 +546,9 @@ bool FrameDump::NoteSampled(std::span<const Sampled> textures) {
 void FrameDump::NoteDispatchSampled(u64 shader_hash, std::span<const Sampled> textures) {
     for (u32 index = 0; index < textures.size(); ++index) {
         const Sampled& texture = textures[index];
+        if (!sampled_tics.empty() && std::ranges::find(sampled_tics, texture.tic) == sampled_tics.end()) {
+            continue;
+        }
         const auto key = SampledKey(texture);
         if (!key) {
             continue;
@@ -496,28 +575,92 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
     for (BoundBuffer& buffer : buffers) {
         const size_t program = compute ? 0 : buffer.stage + 1;
         const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
+        const bool from_host = buffer.guest.empty();
+        // Guest-read buffers are recorded again whenever their bytes change between draws, so
+        // per-draw constants (inline cbuf writes) show the value each draw saw.
+        const u64 contents =
+            from_host ? 0
+                      : Common::CityHash64(reinterpret_cast<const char*>(buffer.guest.data()),
+                                           buffer.guest.size());
         const std::tuple<u64, bool, u32, u64, u32> key{shader, buffer.storage, buffer.index,
                                                        buffer.device_addr, buffer.size};
-        if (std::ranges::find(seen_buffers, key) != seen_buffers.end()) {
-            continue;
+        const auto seen = std::ranges::find(seen_buffers, key, &SeenBuffer::first);
+        if (seen != seen_buffers.end()) {
+            if (from_host || seen->second == contents) {
+                continue;
+            }
+            seen->second = contents;
+        } else {
+            seen_buffers.emplace_back(key, contents);
         }
-        seen_buffers.push_back(key);
         const std::string owner =
             compute ? fmt::format(R"("dispatch":{},"after_draws":{})", dispatches, draws)
                     : fmt::format(R"("pass":{},"draw":{})", pass_index, draws - 1);
-        const bool from_host = buffer.guest.empty();
-        std::string tags = fmt::format(
-            R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","key":"{}","type":"{}",)"
-            R"("index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}",)"
-            R"("bound_size":{},"size":{},"gpu_modified":{},"source":"{}")",
-            owner, buffer.stage, shader, KeyOf(shader), buffer.storage ? "storage" : "uniform",
-            buffer.index, buffer.written, buffer.gpu_addr, buffer.device_addr, buffer.bound_size,
-            buffer.size, buffer.gpu_modified, from_host ? "host" : "guest");
+        const auto make_tags = [&](std::string_view source) {
+            return fmt::format(
+                R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","key":"{}","type":"{}",)"
+                R"("index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}",)"
+                R"("bound_size":{},"size":{},"gpu_modified":{},"source":"{}")",
+                owner, buffer.stage, shader, KeyOf(shader), buffer.storage ? "storage" : "uniform",
+                buffer.index, buffer.written, buffer.gpu_addr, buffer.device_addr,
+                buffer.bound_size, buffer.size, buffer.gpu_modified, source);
+        };
         if (!from_host) {
-            Enqueue({.tags = std::move(tags), .data = std::move(buffer.guest), .raw = true});
+            Enqueue({.tags = make_tags("guest"), .data = std::move(buffer.guest), .raw = true});
             continue;
         }
+        std::string tags = make_tags("host");
         recorded |= RecordBuffer(buffer.host, buffer.host_offset, buffer.size, std::move(tags));
+    }
+    return recorded;
+}
+
+bool FrameDump::NoteDrawInputs(std::span<const u64> shader_hashes, const DrawArgs& args,
+                               std::span<VertexInput> inputs) {
+    const auto pairs = [](std::span<const std::pair<u32, u32>> values) {
+        std::string out;
+        for (const auto& [index, word] : values) {
+            out += fmt::format("{}[{},\"{:#010x}\"]", out.empty() ? "" : ",", index, word);
+        }
+        return out;
+    };
+    std::string tags =
+        fmt::format(R"({{"kind":"draw_args","pass":{},"draw":{},{},"topology":{},"indexed":{},)"
+                    R"("vertex_first":{},"vertex_count":{},"index_first":{},"index_count":{},)"
+                    R"("index_format":{},"base_vertex":{},"base_instance":{},"instance_count":{},)"
+                    R"("attributes":[{}],"streams":[{}])",
+                    pass_index, draws - 1, ShaderList(shader_hashes), args.topology, args.indexed,
+                    args.vertex_first, args.vertex_count, args.index_first, args.index_count,
+                    args.index_format, static_cast<s32>(args.base_vertex), args.base_instance,
+                    args.instance_count, pairs(args.attributes), pairs(args.streams));
+    if (args.indirect) {
+        tags += fmt::format(
+            R"(,"indirect":"{:#x}","include_count":{},"count_addr":"{:#x}","max_draws":{},)"
+            R"("stride":{},"from_record":{},"indirect_gpu_modified":{},"indirect_words_guest":[{}])",
+            args.indirect_addr, args.include_count, args.count_addr, args.max_draws, args.stride,
+            args.from_record, args.indirect_gpu_modified, fmt::join(args.indirect_words, ","));
+    }
+    Enqueue({.tags = tags + "}"});
+
+    bool recorded = false;
+    for (VertexInput& input : inputs) {
+        const std::pair<u64, u32> key{input.device_addr, input.size};
+        if (std::ranges::find(seen_vertex_inputs, key) != seen_vertex_inputs.end()) {
+            continue;
+        }
+        seen_vertex_inputs.push_back(key);
+        const std::string common = fmt::format(
+            R"("kind":"buffer","pass":{},"draw":{},"type":"{}","slot":{},"gpu_addr":"{:#x}",)"
+            R"("device_addr":"{:#x}","bound_size":{},"size":{},"gpu_modified":{})",
+            pass_index, draws - 1,
+            input.slot == -2 ? "indirect" : (input.slot < 0 ? "index" : "vertex"), input.slot,
+            input.gpu_addr, input.device_addr, input.bound_size, input.size, input.gpu_modified);
+        Enqueue(
+            {.tags = common + R"(,"source":"guest")", .data = std::move(input.guest), .raw = true});
+        if (input.host != VK_NULL_HANDLE) {
+            recorded |= RecordBuffer(input.host, input.host_offset, input.size,
+                                     common + R"(,"source":"host")");
+        }
     }
     return recorded;
 }
@@ -629,7 +772,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
         Enqueue({.tags = fmt::format(R"({{"name":"{}",{},"skipped":"msaa"}})", name, tags)});
         return false;
     }
-    const size_t size = size_t{target.width} * target.height * target.depth * TexelBytes(target);
+    const size_t size = ImageBytes(target);
     if (recorded_bytes + size > SIZE_CAP) {
         truncated = true;
         return false;
@@ -741,12 +884,9 @@ void FrameDump::Drain() {
     scheduler.Finish();
     for (Readback& readback : readbacks) {
         readback.buffer.Invalidate();
-        const Target& target = readback.target;
-        const auto mapped =
-            readback.buffer.Mapped().first(readback.raw ? readback.bytes
-                                                        : size_t{target.width} * target.height *
-                                                              target.depth * TexelBytes(target));
-        Enqueue({.target = target,
+        const auto mapped = readback.buffer.Mapped().first(
+            readback.raw ? readback.bytes : ImageBytes(readback.target));
+        Enqueue({.target = readback.target,
                  .name = std::move(readback.name),
                  .tags = std::move(readback.tags),
                  .data = {mapped.begin(), mapped.end()},
@@ -812,7 +952,7 @@ void FrameDump::Write(const Job& job) {
     ++images;
 
     std::array<float, 4> pixel;
-    const int channels = Decode(target, data.data(), pixel);
+    const int channels = target.host_blocks ? 0 : Decode(target, data.data(), pixel);
     std::string stats;
     std::string png{"null"};
     if (channels != 0) {
@@ -882,10 +1022,14 @@ void FrameDump::Write(const Job& job) {
         << fmt::format(
                R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"level":{},)"
                R"("layer":{},"gpu_addr":"{:#x}","rescaled":{},"depth_encoding":{},)"
-               R"("raw":"{}.raw.zst","png":{}{}}})",
+               R"("host_image":"{:#x}","view_image":"{:#x}","view_mip_count":{},)"
+               R"("raw":"{}.raw.zst","png":{}{}{}}})",
                job.name, job.tags, target.format, target.width, target.height, target.depth,
                target.level, target.layer, target.gpu_addr, target.rescaled,
-               static_cast<u32>(target.depth_encoding), job.name, png, stats)
+               static_cast<u32>(target.depth_encoding), std::bit_cast<u64>(target.image),
+               std::bit_cast<u64>(target.view_image), target.view_mip_count, job.name, png, stats,
+               target.host_blocks ? fmt::format(R"(,"host_format":"{}")", *target.host_blocks)
+                                  : std::string{})
         << '\n';
 }
 

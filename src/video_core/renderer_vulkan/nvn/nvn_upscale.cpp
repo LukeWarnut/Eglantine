@@ -657,10 +657,10 @@ bool DrawContext::UpscaleNetwork(const VideoCore::Upscaler::Rect& input_rect,
         return false;
     }
     const u64 seq = host->HostFlight().seq;
-    impl.NoteUse(colour->serial, seq);
-    impl.NoteUse(output->serial, seq);
+    impl.NoteUse(*colour, seq);
+    impl.NoteUse(*output, seq);
     if (depth) {
-        impl.NoteUse(depth->serial, seq);
+        impl.NoteUse(*depth, seq);
     }
 
     UpscaleJob job;
@@ -740,7 +740,7 @@ void DrawContext::EvaluateDlssOp(const VC::EvaluateDlssPayload& p) {
         if (it == impl.textures.end() || !it->second || !it->second->storage) {
             return false;
         }
-        impl.NoteUse(ref.texture.serial, host->HostFlight().seq);
+        impl.NoteUse(*it->second, host->HostFlight().seq);
         held[slot] = it->second;
         image.texture = it->second.get();
         image.level = ref.texture.level;

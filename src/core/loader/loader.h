@@ -51,6 +51,7 @@ enum class FileType {
     NAX,
     KIP,
     NUP,
+    NX,
     DeconstructedRomDirectory,
 };
 
@@ -301,6 +302,20 @@ public:
     }
 
     /**
+     * Get the RomFS of another program of the same application (multi-program titles), with
+     * that program's updates applied. Containers holding several programs implement this so
+     * OpenDataStorageWithProgramIndex finds programs that are not in the content provider.
+     *
+     * @param program_id The program to open, one of ReadProgramIds
+     * @param[out] out_file The RomFS
+     *
+     * @return ResultStatus result of function
+     */
+    virtual ResultStatus ReadProgramRomFS(u64 program_id, FileSys::VirtualFile& out_file) {
+        return ResultStatus::ErrorNotImplemented;
+    }
+
+    /**
      * Get the raw update of the application, should it come packed with one
      *
      * @param[out] out_file The raw update NCA file (Program-type)
@@ -308,6 +323,17 @@ public:
      * @return ResultStatus result of function
      */
     virtual ResultStatus ReadUpdateRaw(FileSys::VirtualFile& out_file) {
+        return ResultStatus::ErrorNotImplemented;
+    }
+
+    /**
+     * Get the add-on content (DLC) the application ships with inside its own file
+     *
+     * @param[out] out_content Pairs of each entry's title ID and version
+     *
+     * @return ResultStatus result of function
+     */
+    virtual ResultStatus ReadAddOnContent(std::vector<std::pair<u64, u32>>& out_content) {
         return ResultStatus::ErrorNotImplemented;
     }
 

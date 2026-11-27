@@ -28,6 +28,16 @@ signals:
     void ItemExpandedChanged(const QModelIndex& item);
     void FilterResultReady(int visible, int total);
 
+protected:
+    void updateGeometries() override;
+
 private slots:
     void OnItemExpanded(const QModelIndex& item);
+
+private:
+    void FitLastSection();
+
+    bool fitting_last_section = false;
+    int last_section = -1;
+    int last_section_width = 0;
 };

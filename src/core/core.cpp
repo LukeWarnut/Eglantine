@@ -530,8 +530,12 @@ struct System::Impl {
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
+        FileSys::SetLooseAOC({});
         cheat_engine.reset();
         core_timing.ClearPendingEvents();
+        if (content_provider) {
+            content_provider->SetGameArchive(nullptr);
+        }
         app_loader.reset();
         audio_core.reset();
         gpu_core.reset();
@@ -725,6 +729,7 @@ void System::InitializeDebugger() {
 
 SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::string& filepath,
                                 Service::AM::FrontendAppletParameters& params) {
+    FileSys::SetLooseAOC({});
     return impl->Load(*this, emu_window, filepath, params);
 }
 

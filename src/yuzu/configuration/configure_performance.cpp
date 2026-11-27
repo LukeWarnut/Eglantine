@@ -631,7 +631,8 @@ ConfigureShaders::ConfigureShaders(const Core::System& system_,
         layout->addWidget(group);
     };
 
-    add_group(tr("Compilation"), {&values.use_asynchronous_shaders, &values.mesh_shader_mode});
+    add_group(tr("Compilation"), {&values.use_asynchronous_shaders, &values.mesh_shader_mode,
+                                  &values.graphics_pipeline_library});
     add_group(tr("Caches"),
               {&values.use_disk_shader_cache, &values.use_vulkan_driver_pipeline_cache,
                &values.driver_shader_cache_size});
@@ -643,6 +644,7 @@ ConfigureShaders::~ConfigureShaders() = default;
 bool ConfigureShaders::IsShaderSetting(u32 id) {
     const auto& v = Settings::values;
     return id == v.use_asynchronous_shaders.Id() || id == v.mesh_shader_mode.Id() ||
+           id == v.graphics_pipeline_library.Id() ||
            id == v.use_disk_shader_cache.Id() || id == v.use_vulkan_driver_pipeline_cache.Id() ||
            id == v.private_driver_shader_cache.Id() || id == v.driver_shader_cache_size.Id();
 }

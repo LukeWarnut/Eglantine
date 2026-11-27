@@ -405,9 +405,14 @@ bool KeepsRaw(VkFormat format, VkImageAspectFlags aspect) {
 
 } // namespace
 
-const Config g_config = Read();
+Config g_config = Read();
 
-const bool g_timeline = EnvFlag("EDEN_NX2_NVN_TIMELINE");
+bool g_timeline = EnvFlag("EDEN_NX2_NVN_TIMELINE");
+
+void Reload() {
+    g_config = Read();
+    g_timeline = EnvFlag("EDEN_NX2_NVN_TIMELINE");
+}
 
 void TimelineEvent(const char* event, u64 seq, std::string_view detail) {
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(

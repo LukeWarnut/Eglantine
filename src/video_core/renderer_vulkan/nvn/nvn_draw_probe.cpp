@@ -191,7 +191,7 @@ void DrawContext::AppendBindingDump(std::string& text, const PipelineBase& pipe)
         case VC::DescriptorKind::UniformBuffer:
             for (u32 i = 0; i < binding.count; ++i, ++info_index) {
                 switch (binding.role) {
-                case VC::DescriptorRole::DriverBank: {
+                case VC::DescriptorRole::DriverTable: {
                     if (binding.stage != VC::ShaderStage::Compute) {
                         text += fmt::format("{} c0 driver bank: built per draw, not dumped\n", head);
                         break;

@@ -428,7 +428,8 @@ template <u32 GOB_EXTENT>
         return std::nullopt;
     }
     const ImageInfo& info = overlap.info;
-    if (!IsBlockLinearSizeCompatible(new_info, info, base->level, 0, strict_size)) {
+    // The new image starts at the overlap's mip base->level: compare that mip with its level 0.
+    if (!IsBlockLinearSizeCompatible(info, new_info, base->level, 0, strict_size)) {
         return std::nullopt;
     }
     if (new_info.block != MipBlockSize(info, base->level)) {
@@ -1636,6 +1637,23 @@ bool IsLayerStrideCompatible(const ImageInfo& lhs, const ImageInfo& rhs,
         lhs.resources.levels == 1 && rhs.resources.levels == 1 && lhs.format == rhs.format &&
         lhs.block == rhs.block &&
         lhs.tile_width_spacing == rhs.tile_width_spacing && lhs.num_samples == rhs.num_samples) {
+        return true;
+    }
+    // A single-mip 2D image against a single-layer mip chain of the same layout: the layer stride
+    // of the chain counts its smaller levels, but with one layer no array offset is addressed and
+    // level 0 starts at the base either way, so the single-mip image is the chain's level 0.
+    // Mario Kart World renders its bloom input into a 640x360 target and samples the same memory
+    // as a 5-level texture; refusing this split them into two images, and the bloom chain never
+    // saw the target's writes (a self-feeding loop that turned the screen white).
+    // Two chains of the same base extent can also share their common mip levels.
+    if (lhs.type == ImageType::e2D && rhs.type == ImageType::e2D &&
+        lhs.resources.layers == 1 && rhs.resources.layers == 1 &&
+        lhs.resources.levels != rhs.resources.levels &&
+        (lhs.resources.levels == 1 || rhs.resources.levels == 1 || lhs.size == rhs.size) &&
+        lhs.format == rhs.format &&
+        lhs.block == rhs.block && lhs.block.depth == 0 &&
+        lhs.tile_width_spacing == rhs.tile_width_spacing && lhs.num_samples == rhs.num_samples &&
+        lhs.maxwell_gob_layout == rhs.maxwell_gob_layout) {
         return true;
     }
     // If either of the layer strides is zero, we can assume they are compatible

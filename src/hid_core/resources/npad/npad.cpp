@@ -154,6 +154,12 @@ void NPad::FreeAppletResourceId(u64 aruid) {
 }
 
 void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTriggerType type, std::size_t controller_idx) {
+    // The input threads can deliver a sample before SetNpadExternals has run, or while the core is
+    // being torn down; there is nothing to update then and the holder is null.
+    if (!applet_resource_holder.applet_resource) {
+        return;
+    }
+
     if (type == Core::HID::ControllerTriggerType::All) {
         ControllerUpdate(kernel, Core::HID::ControllerTriggerType::Connected, controller_idx);
         ControllerUpdate(kernel, Core::HID::ControllerTriggerType::Battery, controller_idx);

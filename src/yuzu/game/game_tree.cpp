@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+
 #include <QApplication>
 #include <QHeaderView>
 #include <QScroller>
@@ -26,6 +28,58 @@ GameTree::GameTree(QWidget* parent) : QTreeView{parent} {
 
     connect(this, &QTreeView::expanded, this, &GameTree::OnItemExpanded);
     connect(this, &QTreeView::collapsed, this, &GameTree::OnItemExpanded);
+
+    // Instead of QHeaderView's stretchLastSection, which locks the last column's width: it is
+    // widened to fill the view, but never below the width the user gave it.
+    connect(header(), &QHeaderView::sectionResized, this, [this](int logical, int, int new_size) {
+        if (fitting_last_section) {
+            return;
+        }
+        if (logical == last_section && new_size > 0) {
+            last_section_width = new_size;
+        }
+        FitLastSection();
+    });
+    connect(header(), &QHeaderView::sectionMoved, this, [this] { FitLastSection(); });
+}
+
+void GameTree::updateGeometries() {
+    QTreeView::updateGeometries();
+    FitLastSection();
+}
+
+void GameTree::FitLastSection() {
+    auto* hdr = header();
+    if (fitting_last_section || hdr->count() == 0) {
+        return;
+    }
+    int logical = -1;
+    for (int visual = hdr->count() - 1; visual >= 0; --visual) {
+        const int candidate = hdr->logicalIndex(visual);
+        if (!hdr->isSectionHidden(candidate)) {
+            logical = candidate;
+            break;
+        }
+    }
+    if (logical == -1) {
+        return;
+    }
+
+    fitting_last_section = true;
+    if (logical != last_section) {
+        if (last_section != -1 && last_section < hdr->count() && last_section_width > 0 &&
+            !hdr->isSectionHidden(last_section)) {
+            hdr->resizeSection(last_section, last_section_width);
+        }
+        last_section = logical;
+        last_section_width = hdr->sectionSize(logical);
+    }
+    const int others = hdr->length() - hdr->sectionSize(logical);
+    const int width = std::max(last_section_width, viewport()->width() - others);
+    if (width != hdr->sectionSize(logical)) {
+        hdr->resizeSection(logical, width);
+    }
+    fitting_last_section = false;
 }
 
 void GameTree::SetModel(GameListModel* model) {
@@ -53,16 +107,36 @@ void GameTree::OnItemExpanded(const QModelIndex& item) {
 }
 
 void GameTree::SaveInterfaceLayout() {
-    UISettings::values.gamelist_header_state = header()->saveState();
+    auto* hdr = header();
+    // Save the last column at the user's width, not the width it was widened to.
+    const bool fitted = last_section != -1 && last_section < hdr->count() &&
+                        !hdr->isSectionHidden(last_section) && last_section_width > 0;
+    const int fitted_width = fitted ? hdr->sectionSize(last_section) : 0;
+    fitting_last_section = true;
+    if (fitted) {
+        hdr->resizeSection(last_section, last_section_width);
+    }
+    UISettings::values.gamelist_header_state = hdr->saveState();
+    if (fitted) {
+        hdr->resizeSection(last_section, fitted_width);
+    }
+    fitting_last_section = false;
 }
 
 void GameTree::LoadInterfaceLayout() {
     auto* hdr = header();
 
-    if (hdr->restoreState(UISettings::values.gamelist_header_state))
-        return;
+    if (!hdr->restoreState(UISettings::values.gamelist_header_state))
+        hdr->resizeSection(GameListModel::COLUMN_NAME, 840);
 
-    hdr->resizeSection(GameListModel::COLUMN_NAME, 840);
+    // Applied after restoreState, which brings back the flags of older saved layouts.
+    hdr->setStretchLastSection(false);
+    hdr->setSectionResizeMode(QHeaderView::Interactive);
+    hdr->setSectionsMovable(true);
+    hdr->setFirstSectionMovable(true);
+
+    last_section = -1;
+    FitLastSection();
 }
 
 void GameTree::UpdateColumnVisibility(GameListModel* model) {
@@ -71,6 +145,7 @@ void GameTree::UpdateColumnVisibility(GameListModel* model) {
     setColumnHidden(GameListModel::COLUMN_FILE_TYPE, !UISettings::values.show_types);
     setColumnHidden(GameListModel::COLUMN_SIZE, !UISettings::values.show_size);
     setColumnHidden(GameListModel::COLUMN_PLAY_TIME, !UISettings::values.show_play_time);
+    setColumnHidden(GameListModel::COLUMN_PATH, !UISettings::values.show_path);
 }
 
 QString GameTree::GetLastFilterResultItem() const {

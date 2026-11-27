@@ -41,9 +41,15 @@ public:
     void ResetDefaults();
     void ApplyConfiguration() override;
     void SetConfiguration() override;
+    // The Updates tab, or nullptr when this build has no update settings.
+    QWidget* UpdatesPage() const;
 
 signals:
     void ExternalContentDirsChanged();
+    // Asks for the settings to be saved and closed, and the version manager opened.
+    void OpenVersionManagerRequested();
+    // Asks for the settings to be saved and closed, and the install in `install_dir` launched.
+    void LaunchExperimentalBuildRequested(const QString& install_dir);
 
 private:
     void Setup(const ConfigurationShared::Builder& builder);
@@ -62,4 +68,6 @@ private:
     std::vector<std::function<void(bool)>> apply_funcs{};
 
     const Core::System& system;
+
+    std::unique_ptr<QWidget> updates_page;
 };

@@ -62,7 +62,7 @@ void HMUL2(TranslatorVisitor& v, u64 insn, Merge merge, bool sat, bool abs_a, bo
         lhs = v.ir.FPConvert(16, lhs);
         rhs = v.ir.FPConvert(16, rhs);
     }
-    v.X(hmul2.dest_reg, MergeResult(v.ir, hmul2.dest_reg, lhs, rhs, merge));
+    v.X(hmul2.dest_reg, MergeResult(v, hmul2.dest_reg, lhs, rhs, merge));
 }
 
 void HMUL2(TranslatorVisitor& v, u64 insn, bool sat, bool abs_a, bool neg_a, bool abs_b, bool neg_b,

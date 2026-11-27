@@ -173,6 +173,7 @@ bool Context::Impl::ImportSplitRuns(Pool& pool, std::string& error) {
 }
 
 void Context::Impl::ImmediateSubmit(const std::function<void(vk::CommandBuffer)>& record) {
+    FlushSubmitBatch();
     const VkCommandBuffer raw = AcquireCommandBuffer();
     const vk::CommandBuffer cmd{raw, dld};
     cmd.Begin({
@@ -214,7 +215,7 @@ bool Context::Impl::ResolveBuffer(u64 address, u64 size, Pool*& pool, u64& offse
     if (mario_kart_world) {
         const u64 key = ((address >> 4) ^ (size * 0xd6e8feb86659fd93ULL)) *
                         0x9e3779b97f4a7c15ULL;
-        exact = &mkw_resolve_cache[key >> 56];
+        exact = &mkw_resolve_cache[key >> 52];
         if (exact->generation == generation && exact->mappings == mkw_mapping_generation &&
             exact->address == address && exact->size == size) {
             pool = exact->pool;
@@ -434,8 +435,10 @@ void Context::Impl::EnsureBacking(Pool& pool) {
     // Called for every buffer range an op touches: the common case (backed long ago) must not
     // even start the stall timer.
     const bool was_pending = pool.pending.load(std::memory_order_acquire);
+    const bool need_mirror =
+        !was_pending && pool.backing == Pool::Backing::Mirror && !pool.buffer && pool.size > 0;
     // upload_pending is only read once `pending` is false (the backing thread writes it before).
-    if (!was_pending && !pool.upload_pending) {
+    if (!was_pending && !pool.upload_pending && !need_mirror) {
         return;
     }
     const Common::FrameStats::Scope stall{Common::FrameStats::Cause::PoolBacking};
@@ -445,12 +448,40 @@ void Context::Impl::EnsureBacking(Pool& pool) {
         std::scoped_lock lock{backing_mutex};
         BackPoolLocked(pool);
     }
+    const bool deferred_mirror = pool.backing == Pool::Backing::Mirror && !pool.buffer && pool.size > 0;
+    if (deferred_mirror) {
+        std::scoped_lock lock{backing_mutex};
+        if (!pool.buffer) {
+            try {
+                pool.buffer = CreateHostBuffer(pool.size, pool_usage, MemoryUsage::DeviceLocal,
+                                               AllocationKind::PoolBuffer);
+                pool.mirror_pages.assign(
+                    static_cast<size_t>((pool.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE),
+                    Pool::MirrorPage{});
+                if (!pool.split_runs.empty()) {
+                    split_alias_generation.fetch_add(1, std::memory_order_release);
+                }
+            } catch (const std::exception& exception) {
+                LOG_WARNING(Render_Vulkan,
+                            "[nvn] deferred mirror buffer allocation failed for pool {:#x} "
+                            "({} MiB): {}",
+                            pool.address, pool.size >> 20, exception.what());
+                pool.buffer = {};
+                pool.mirror_pages.clear();
+                pool.backing = Pool::Backing::None;
+                ++pool_generation;
+                if (!pool.split_runs.empty()) {
+                    split_alias_generation.fetch_add(1, std::memory_order_release);
+                }
+            }
+        }
+    }
     const bool was_upload = pool.upload_pending;
     if (was_upload) {
         Pool* const one[] = {&pool};
         UploadWholePools(one);
     }
-    if (log && (was_pending || was_upload)) {
+    if (log && (was_pending || was_upload || deferred_mirror)) {
         LOG_INFO(Render_Vulkan,
                  "[nvn] ensure backing: present {} pool {:#x} size {:.2f} MB flags {:#x} pending {} "
                  "upload {}: {:.2f} ms",
@@ -576,6 +607,43 @@ void Context::Impl::BackPoolLocked(Pool& pool_ref) {
                             desc.guest_address, desc.size, import_error,
                             static_cast<int>(import_result));
             }
+            u64 runs = 0;
+            u64 first_break = desc.size;
+            std::string split_error = "raw_split_import off";
+            if (host == nullptr) {
+                CountHostRuns(desc.guest_address, desc.size, runs, first_break);
+                // Raw global memory reaches the guest bytes only through imports: without them a
+                // raw access into this pool reads 0 (its stores are dropped). If split-import
+                // succeeds, defer allocating the full DeviceLocal mirror buffer until first buffer
+                // use (texture-only asset pools never need one).
+                if (raw_split_import.load(std::memory_order_relaxed)) {
+                    if (options.allow_host_import && importer && importer->Available()) {
+                        const auto split_begin = Clock::now();
+                        if (ImportSplitRuns(*pool, split_error)) {
+                            pool->backing = Pool::Backing::Mirror;
+                            stats.pools_mirrored.fetch_add(1, std::memory_order_relaxed);
+                            stats.pools_mirrored_discontiguous.fetch_add(1,
+                                                                         std::memory_order_relaxed);
+                            split_alias_generation.fetch_add(1, std::memory_order_release);
+                            stats.pools_split_imported.fetch_add(1, std::memory_order_relaxed);
+                            stats.split_runs.fetch_add(pool->split_runs.size(),
+                                                       std::memory_order_relaxed);
+                            path = "split";
+                            LOG_INFO(Render_Vulkan,
+                                     "[nvn] pool {:#x} ({:#x} bytes, flags {:#x}) split-imported "
+                                     "as {} runs (first break at +{:#x}, {:.1f} ms): raw global "
+                                     "memory reads the guest bytes, device-local buffer deferred "
+                                     "until first buffer use",
+                                     desc.guest_address, desc.size, desc.flags,
+                                     pool->split_runs.size(), first_break,
+                                     since(split_begin) / 1e6);
+                            return;
+                        }
+                    } else {
+                        split_error = "host import not available";
+                    }
+                }
+            }
             t = Clock::now();
             pool->buffer = CreateHostBuffer(desc.size, pool_usage, MemoryUsage::DeviceLocal,
                                             AllocationKind::PoolBuffer);
@@ -588,34 +656,6 @@ void Context::Impl::BackPoolLocked(Pool& pool_ref) {
             stats.pools_mirrored.fetch_add(1, std::memory_order_relaxed);
             if (host == nullptr) {
                 stats.pools_mirrored_discontiguous.fetch_add(1, std::memory_order_relaxed);
-                u64 runs = 0;
-                u64 first_break = desc.size;
-                CountHostRuns(desc.guest_address, desc.size, runs, first_break);
-                // Raw global memory reaches the guest bytes only through imports: without them a
-                // raw access into this pool reads 0 (its stores are dropped).
-                std::string split_error = "raw_split_import off";
-                if (raw_split_import.load(std::memory_order_relaxed)) {
-                    if (options.allow_host_import && importer && importer->Available()) {
-                        const auto split_begin = Clock::now();
-                        if (ImportSplitRuns(*pool, split_error)) {
-                            stats.pools_split_imported.fetch_add(1, std::memory_order_relaxed);
-                            stats.split_runs.fetch_add(pool->split_runs.size(),
-                                                       std::memory_order_relaxed);
-                            path = "split";
-                            LOG_INFO(Render_Vulkan,
-                                     "[nvn] pool {:#x} ({:#x} bytes, flags {:#x}) split-imported "
-                                     "as {} runs (first break at +{:#x}, {:.1f} ms): raw global "
-                                     "memory reads the guest bytes, draws bind the device-local "
-                                     "copy",
-                                     desc.guest_address, desc.size, desc.flags,
-                                     pool->split_runs.size(), first_break,
-                                     since(split_begin) / 1e6);
-                            return;
-                        }
-                    } else {
-                        split_error = "host import not available";
-                    }
-                }
                 LOG_INFO(Render_Vulkan,
                          "[nvn] pool {:#x} ({:#x} bytes, flags {:#x}) is a device-local mirror: the "
                          "guest storage is {} host runs (first break at +{:#x}), not one "
@@ -795,6 +835,7 @@ bool Context::Impl::UploadPoolRanges(std::span<const PoolUpload> ranges, bool in
 
 void Context::Impl::CreateTextureNow(const VC::TextureDesc& d) {
     textures[d.serial] = BuildTexture(d);
+    ++texture_change_epoch;
 }
 
 bool Context::Impl::MkwBc3AtlasSupported() {
@@ -992,8 +1033,11 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
     }
 
     storage->create_flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-    if ((target == TexTarget::Cubemap || target == TexTarget::CubemapArray) &&
-        storage->extent.width == storage->extent.height && storage->layers % 6 == 0) {
+    if (storage->samples == VK_SAMPLE_COUNT_1_BIT &&
+        storage->extent.width == storage->extent.height && storage->layers % 6 == 0 &&
+        (target == TexTarget::Cubemap || target == TexTarget::CubemapArray ||
+         (!host->depth && !host->stencil && target == TexTarget::Dim2DArray &&
+          storage->layers >= 6 && layout.size < (u64{8} << 20)))) {
         storage->create_flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     }
     if (storage->type == VK_IMAGE_TYPE_3D) {
@@ -1190,7 +1234,7 @@ std::shared_ptr<Texture> Context::Impl::TargetAlias(const Texture& texture,
 }
 
 void Context::Impl::NoteUse(u64 serial, u64 seq) {
-    UseSlot& slot = use_cache[(serial * 0x9E3779B97F4A7C15ull) >> 56];
+    UseSlot& slot = use_cache[(serial * 0x9E3779B97F4A7C15ull) >> 52];
     if (slot.serial == serial && slot.seq >= seq) {
         return;
     }
@@ -1205,13 +1249,17 @@ void Context::Impl::DestroyNow(u64 serial) {
         after = it->second;
         last_use.erase(it);
     }
-    if (UseSlot& slot = use_cache[(serial * 0x9E3779B97F4A7C15ull) >> 56]; slot.serial == serial) {
+    if (UseSlot& slot = use_cache[(serial * 0x9E3779B97F4A7C15ull) >> 52]; slot.serial == serial) {
         slot = {};
     }
     if (const auto it = pools.find(serial); it != pools.end()) {
         std::shared_ptr<Pool> pool = std::move(it->second);
         pools.erase(it);
+        after = (std::max)(after, pool->last_use_seq);
         pool->released.store(true, std::memory_order_relaxed);
+        if (!pool->split_runs.empty()) {
+            split_alias_generation.fetch_add(1, std::memory_order_release);
+        }
         ReleaseVramMirror(*pool);
         if (pool->takeover_track != 0) {
             if (VC::GuestMemory* const memory = guest.load(std::memory_order_acquire)) {
@@ -1241,9 +1289,12 @@ void Context::Impl::DestroyNow(u64 serial) {
     }
     if (const auto it = textures.find(serial); it != textures.end()) {
         std::shared_ptr<Texture> texture = std::move(it->second);
+        texture->live = false;
         textures.erase(it);
+        after = (std::max)(after, texture->last_use_seq);
         texture_erased[(texture_epoch - 1) % texture_erased.size()] = serial;
         ++texture_epoch;
+        ++texture_change_epoch;
         // The image views of the draw path go with the texture, after the last submission that
         // used them completed.
         std::shared_ptr<TextureViews> views =
@@ -1334,6 +1385,7 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
     std::vector<RawGlobalSource> sources;
     sources.reserve(raw_table.entries.size());
     table.pool_serials.reserve(raw_table.pool_serials.size());
+    table.pools.reserve(raw_table.pools.size());
     const u64 rebuilds = stats.raw_global_rebuilds.load(std::memory_order_relaxed) + 1;
     const bool log_rebuild = rebuilds <= 8 || rebuilds % 64 == 0;
     u64 skipped = 0;
@@ -1352,6 +1404,7 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
                 device.GetLogical().GetBufferDeviceAddress(*pool->vram_mirror->buffer);
             sources.push_back({pool->address, mirror_address, pool->size, 2});
             table.pool_serials.push_back(pool->serial);
+            table.pools.push_back(pool.get());
             table.imported_pool = pool.get();
             ++own_pools;
             own_bytes += pool->size;
@@ -1367,6 +1420,7 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
                 sources.push_back({pool->address + run.offset, run.device_address, run.size, 1});
             }
             table.pool_serials.push_back(pool->serial);
+            table.pools.push_back(pool.get());
             ++split_pools;
             continue;
         }
@@ -1383,6 +1437,7 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
         }
         sources.push_back({pool->address, pool->device_address, pool->size, 1});
         table.pool_serials.push_back(pool->serial);
+        table.pools.push_back(pool.get());
         if (pool->backing == Pool::Backing::Imported) {
             table.imported_pool = pool.get();
         }
@@ -1433,6 +1488,7 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
                                        part_end - part_begin, 1});
                 }
                 table.pool_serials.push_back(physical->serial);
+                table.pools.push_back(physical);
                 continue;
             }
             if (physical->backing != Pool::Backing::Imported &&
@@ -1447,8 +1503,10 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
             sources.push_back({virtual_pool->address + offset,
                                physical->device_address + run.physical_offset, run.size, 1});
             table.pool_serials.push_back(physical->serial);
+            table.pools.push_back(physical);
         }
         table.pool_serials.push_back(virtual_pool->serial);
+        table.pools.push_back(virtual_pool);
     }
     u64 chunk_ranges = 0;
     for (const auto& chunk : import_chunks) {
@@ -1517,7 +1575,9 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
 const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
     const bool read_only_enabled = Common::DiagRequest::TrySwitchEnabled("TRY_RO_MIRROR_EXACT");
     const bool storage_enabled = Common::DiagRequest::TrySwitchEnabled("TRY_STORAGE_RAW_WRITE_THROUGH");
+    const u64 current_split_gen = split_alias_generation.load(std::memory_order_acquire);
     if (raw_write_through_table.mirror_generation == ro_alias_generation &&
+        raw_write_through_table.split_generation == current_split_gen &&
         raw_write_through_table.read_only_enabled == read_only_enabled &&
         raw_write_through_table.storage_enabled == storage_enabled) {
         return raw_write_through_table;
@@ -1543,6 +1603,26 @@ const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
             sources.push_back({pool, {pool->address, target, pool->size}});
         }
     }
+    if (read_only_enabled && (pool_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
+        for (const auto& [serial, entry] : pools) {
+            static_cast<void>(serial);
+            Pool* const pool = entry.get();
+            if (!pool || pool->pending.load(std::memory_order_acquire) ||
+                pool->backing != Pool::Backing::Mirror || pool->split_runs.empty()) {
+                continue;
+            }
+            pool->raw_written_through = false;
+            if (!pool->buffer || pool->size == 0) {
+                continue;
+            }
+            if (pool->device_address == 0) {
+                pool->device_address = device.GetLogical().GetBufferDeviceAddress(pool->Handle());
+            }
+            if (pool->device_address != 0) {
+                sources.push_back({pool, {pool->address, pool->device_address, pool->size}});
+            }
+        }
+    }
     std::ranges::stable_sort(sources, {}, [](const AliasSource& source) {
         return source.range.guest;
     });
@@ -1560,6 +1640,7 @@ const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
     RawWriteThroughTable table;
     table.generation = ++raw_write_through_table_generation;
     table.mirror_generation = ro_alias_generation;
+    table.split_generation = current_split_gen;
     table.read_only_enabled = read_only_enabled;
     table.storage_enabled = storage_enabled;
     table.device = UploadRawTable(entries);
@@ -1567,8 +1648,14 @@ const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
         table.low = entries.front().guest;
         table.high = entries.back().guest + entries.back().size;
         for (Pool* const pool : included) {
-            pool->vram_mirror->written_through = true;
+            if (pool->vram_mirror) {
+                pool->vram_mirror->written_through = true;
+            }
+            if (pool->backing == Pool::Backing::Mirror && !pool->split_runs.empty()) {
+                pool->raw_written_through = true;
+            }
             table.pool_serials.push_back(pool->serial);
+            table.pools.push_back(pool);
         }
     }
     stats.vram_raw_alias_rebuilds.fetch_add(1, std::memory_order_relaxed);

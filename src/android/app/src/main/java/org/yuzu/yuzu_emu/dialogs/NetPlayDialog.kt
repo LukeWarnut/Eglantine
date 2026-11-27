@@ -14,10 +14,12 @@ import android.text.TextWatcher
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.PopupMenu
 import android.widget.Toast
+import androidx.core.widget.doAfterTextChanged
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.bottomsheet.BottomSheetBehavior
@@ -102,24 +104,46 @@ class NetPlayDialog(context: Context) : BottomSheetDialog(context) {
                             gameIdList.add(arrayOf(gameId))
                         }
                     }
+                    val onNicknameChanged: (String) -> Unit = { value ->
+                        val isValid = NetDataValidators.username(value)
+                        layoutNickname.isErrorEnabled = !isValid
+                        layoutNickname.error = if (isValid) {
+                            null
+                        } else {
+                            context.getString(R.string.multiplayer_username_error)
+                        }
+                        if (isValid) {
+                            StringSetting.WEB_USERNAME.setString(value)
+                        }
+                    }
+                    nickname.setText(StringSetting.WEB_USERNAME.getString())
+                    nickname.doAfterTextChanged { onNicknameChanged(it?.toString().orEmpty()) }
+                    onNicknameChanged(nickname.text?.toString().orEmpty())
+
                     btnCreate.setOnClickListener {
-                        showNetPlayInputDialog(true)
-                        dismiss()
+                        confirmNickname(this) {
+                            showNetPlayInputDialog(true)
+                            dismiss()
+                        }
                     }
                     btnJoin.setOnClickListener {
-                        showNetPlayInputDialog(false)
-                        dismiss()
+                        confirmNickname(this) {
+                            showNetPlayInputDialog(false)
+                            dismiss()
+                        }
                     }
                     btnLobbyBrowser.setOnClickListener {
-                        if (!NetDataValidators.username()) {
+                        if (!NetDataValidators.username(nickname.text?.toString())) {
                             Toast.makeText(
                                 context,
                                 R.string.multiplayer_nickname_invalid,
                                 Toast.LENGTH_LONG
                             ).show()
                         } else {
-                            LobbyBrowser(context).show()
-                            dismiss()
+                            confirmNickname(this) {
+                                LobbyBrowser(context).show()
+                                dismiss()
+                            }
                         }
                     }
                 }
@@ -524,7 +548,7 @@ class NetPlayDialog(context: Context) : BottomSheetDialog(context) {
 
         // TODO(alekpop, crueter): Room descriptions
         // TODO(alekpop, crueter): Preview preferred games
-        binding.btnConfirm.setOnClickListener {
+        val connect: () -> Unit = {
             binding.btnConfirm.isEnabled = false
             binding.btnConfirm.text =
                 activity.getString(
@@ -598,7 +622,37 @@ class NetPlayDialog(context: Context) : BottomSheetDialog(context) {
             }
         }
 
+        binding.btnConfirm.setOnClickListener {
+            DefaultNicknameDialog.confirm(
+                activity,
+                binding.username.text.toString(),
+                onChangeNickname = {
+                    binding.layoutUsername.requestFocus()
+                    binding.username.selectAll()
+                },
+                onContinue = connect
+            )
+        }
+
         dialog.show()
+    }
+
+    private fun confirmNickname(
+        binding: DialogMultiplayerConnectBinding,
+        onContinue: () -> Unit
+    ) {
+        DefaultNicknameDialog.confirm(
+            CompatUtils.findActivity(context),
+            binding.nickname.text?.toString().orEmpty(),
+            onChangeNickname = {
+                binding.layoutNickname.error = null
+                binding.nickname.requestFocus()
+                binding.nickname.selectAll()
+                (context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager)
+                    ?.showSoftInput(binding.nickname, InputMethodManager.SHOW_IMPLICIT)
+            },
+            onContinue = onContinue
+        )
     }
 
     private fun applyFullscreenMode() {

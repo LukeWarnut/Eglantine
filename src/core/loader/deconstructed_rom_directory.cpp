@@ -290,8 +290,8 @@ std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exef
 } // namespace
 
 AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile file_,
-                                                                         bool override_update_)
-    : AppLoader(std::move(file_)), override_update(override_update_) {
+                                                                         ExeFSPatching patching_)
+    : AppLoader(std::move(file_)), patching(patching_) {
     const auto file_dir = file->GetContainingDirectory();
     const auto sidecar_dirs = FindSidecarDirs(file_dir);
 
@@ -366,9 +366,9 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
 }
 
 AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
-    FileSys::VirtualDir directory, bool override_update_)
+    FileSys::VirtualDir directory, ExeFSPatching patching_)
     : AppLoader(directory->GetFile("main")), dir(std::move(directory)),
-      override_update(override_update_) {
+      patching(patching_) {
     romfs_exefs_dir = dir;
 }
 
@@ -418,10 +418,11 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         return {result, {}};
     }
 
-    if (override_update) {
+    if (patching != ExeFSPatching::None) {
         const FileSys::PatchManager patch_manager(
             metadata.GetTitleID(), system.GetFileSystemController(), system.GetContentProvider());
-        dir = patch_manager.PatchExeFS(dir);
+        dir = patching == ExeFSPatching::ModsOnly ? patch_manager.PatchExeFSMods(dir)
+                                                 : patch_manager.PatchExeFS(dir);
     }
 
     // Reread in case PatchExeFS affected the main.npdm

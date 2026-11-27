@@ -22,10 +22,10 @@ namespace Loader {
 
 /// Loads a NUP (NX Package) container: loose ExeFS/RomFS trees for a base
 /// program plus its updates in one file. The newest update package is layered
-/// over the base; add-on content packages are recognized but not yet mounted.
+/// over the base; add-on content RomFS trees are registered with the DLC service.
 class AppLoader_NUP final : public AppLoader {
 public:
-    explicit AppLoader_NUP(FileSys::VirtualFile file_);
+    explicit AppLoader_NUP(FileSys::VirtualFile file_, std::size_t requested_program_index = 0);
     ~AppLoader_NUP() override;
 
     /**
@@ -46,15 +46,21 @@ public:
     ResultStatus VerifyIntegrity(std::function<bool(size_t, size_t)> progress_callback) override;
 
     ResultStatus ReadRomFS(FileSys::VirtualFile& out_file) override;
+    ResultStatus ReadProgramRomFS(u64 program_id, FileSys::VirtualFile& out_file) override;
     bool IsRomFSUpdatable() const override;
     ResultStatus ReadProgramId(u64& out_program_id) override;
     ResultStatus ReadProgramIds(std::vector<u64>& out_program_ids) override;
     ResultStatus ReadIcon(std::vector<u8>& buffer) override;
     ResultStatus ReadTitle(std::string& title) override;
+    ResultStatus ReadDisplayVersion(std::string& version) override;
+    ResultStatus ReadAddOnContent(std::vector<std::pair<u64, u32>>& out_content) override;
     ResultStatus ReadControlData(FileSys::NACP& control) override;
     ResultStatus ReadNSOModules(Modules& modules) override;
 
 private:
+    /// Base title whose DLC IDs this container's add-on content uses (edition metadata aware).
+    [[nodiscard]] u64 AddonApplicationId() const;
+
     std::unique_ptr<FileSys::NupContainer> nup;
     std::unique_ptr<AppLoader> secondary_loader;
 
@@ -62,6 +68,7 @@ private:
     FileSys::VirtualFile icon_file;
     u64 base_title_id{};
     std::string display_version;
+    std::string title_override;
     bool has_program{};
 };
 

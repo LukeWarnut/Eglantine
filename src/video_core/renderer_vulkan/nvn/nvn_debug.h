@@ -320,18 +320,20 @@ struct Config {
 /// event model logs its signals, waits and CPU changes the same way (`detail`: queue, address,
 /// values). `<us>` is steady-clock microseconds since its epoch, so lines written by the core
 /// (`[nvn] tl ... guest_wait_*`) share the time base.
-extern const bool g_timeline;
+extern bool g_timeline;
 void TimelineEvent(const char* event, u64 seq, std::string_view detail = {});
 [[nodiscard]] inline bool Timeline() {
     return g_timeline;
 }
 
-/// The configuration, read once from the environment during static initialization. A plain
-/// global, so every read on a hot path is one load (no function-local-static guard).
-extern const Config g_config;
+/// The configuration, read once from the environment during static initialization and refreshed by
+/// `Reload()` once the frontend applies switch files. A plain global, so every read on a hot path
+/// is one load (no function-local-static guard).
+extern Config g_config;
 [[nodiscard]] inline const Config& Get() {
     return g_config;
 }
+void Reload();
 
 /// `present_index` is the 1-based present number the work being recorded belongs to.
 [[nodiscard]] bool FrameSelected(u64 present_index);

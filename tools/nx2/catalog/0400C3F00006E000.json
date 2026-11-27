@@ -1,0 +1,8 @@
+{
+ "title": "0400C3F00006E000",
+ "game": "",
+ "notes": "",
+ "programs": [
+  {"key": "508ee90bc58baa35", "stage": "pixel", "object": "Lotus leaf surface", "how": "Live shader lab: hiding this pixel shader turned the lotus leaf black; restored after test", "updated": "2026-11-25T18:50:41Z"}
+ ]
+}

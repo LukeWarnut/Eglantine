@@ -31,7 +31,7 @@ constexpr std::array<const char*, STAGE_COUNT> STAGE_NAMES{"vs",  "fs", "gs",   
 /// handle tables, c3+ the game's).
 u32 CbufIndexOf(const VC::DescriptorBinding& binding, u32 element) {
     switch (binding.role) {
-    case VC::DescriptorRole::DriverBank:
+    case VC::DescriptorRole::DriverTable:
         return 0;
     case VC::DescriptorRole::ProgramConstants:
         return 1;
@@ -187,7 +187,7 @@ std::optional<InFlight::PathDiff> DrawContext::PathDiffBegin(
                                                                   (std::min<u64>)(bound.size,
                                                                                   info.range))});
                     }
-                } else if (binding->role == VC::DescriptorRole::DriverBank) {
+                } else if (binding->role == VC::DescriptorRole::DriverTable) {
                     range.bound_size = DRIVER_BANK_SIZE;
                     if (!graphics) {
                         std::vector<u8> bank(DRIVER_BANK_SIZE);

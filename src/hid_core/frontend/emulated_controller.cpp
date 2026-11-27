@@ -196,6 +196,14 @@ void EmulatedController::LoadDevices() {
     output_params[4] = android_params;
     output_params[LeftIndex].Set("output", true);
     output_params[RightIndex].Set("output", true);
+    // Which side a vibration is for, for the SDL driver (RenHDrum plays the sides apart). Other
+    // engines keep their "pad": the native Joy-Con driver stores the controller type in it.
+    if (output_params[LeftIndex].Get("engine", "") == "sdl") {
+        output_params[LeftIndex].Set("pad", 0);
+    }
+    if (output_params[RightIndex].Get("engine", "") == "sdl") {
+        output_params[RightIndex].Set("pad", 1);
+    }
     output_params[2].Set("output", true);
     output_params[3].Set("output", true);
     output_params[4].Set("output", true);
@@ -1261,7 +1269,13 @@ bool EmulatedController::SetVibration(DeviceIndex device_index, const VibrationV
         return false;
     }
 
-    if (!Settings::values.enable_accurate_vibrations.GetValue()) {
+    // RenHDrum paces short pulses itself; the 15 ms filter would drop Switch 2 titles' clicks.
+    // Only while it is actually loaded: without the library the standard rumble runs, and there
+    // the filter is what keeps SDL's rumble queue from saturating.
+    const bool hd_rumble_paces_packets =
+        Settings::values.hd_rumble_enabled.GetValue() &&
+        Settings::values.renhdrum_available.GetValue();
+    if (!Settings::values.enable_accurate_vibrations.GetValue() && !hd_rumble_paces_packets) {
         using std::chrono::duration_cast;
         using std::chrono::milliseconds;
         using std::chrono::steady_clock;

@@ -12,6 +12,7 @@
 #include <fmt/format.h>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "video_core/nvn/shader/nvn_driver_layout.h"
 #include "video_core/renderer_vulkan/nvn/nvn_bindless.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_impl.h"
 
@@ -306,6 +307,14 @@ void PipelineCache::Impl::FillStages(PipelineBase& pipeline,
         out.program_constants = stage->constants;
         out.workgroup_size = record.workgroup_size;
         out.shared_memory_size = record.shared_memory_size;
+        for (const TextureQuery& q : record.queries) {
+            if (q.record.bank != VC::HandleBank || q.stage >= 8) {
+                pipeline.queries_handle_bank_only = false;
+            }
+            if (q.stage < 32) {
+                pipeline.query_stage_mask |= 1u << q.stage;
+            }
+        }
         pipeline.queries.insert(pipeline.queries.end(), record.queries.begin(),
                                 record.queries.end());
     }

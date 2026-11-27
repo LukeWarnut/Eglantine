@@ -595,6 +595,29 @@ public:
         }
     }
 
+    /// Like ForEachBoundBuffer for the last draw's index buffer (slot -1) and vertex buffers.
+    template <typename Func>
+    void ForEachBoundVertexInput(Func&& func) {
+        const auto visit = [&](s32 slot, const Binding& binding) {
+            if (binding.device_addr == 0 || binding.size == 0) {
+                return;
+            }
+            const Buffer* host = nullptr;
+            u32 offset = 0;
+            if (binding.buffer_id != NULL_BUFFER_ID) {
+                const Buffer& buffer = slot_buffers[binding.buffer_id];
+                if (buffer.IsInBounds(binding.device_addr, binding.size)) {
+                    host = &buffer;
+                    offset = buffer.Offset(binding.device_addr);
+                }
+            }
+            func(slot, binding, host, offset);
+        };
+        visit(-1, channel_state->index_buffer);
+        ForEachEnabledBit(enabled_vertex_buffers_mask,
+                          [&](u32 index) { visit(static_cast<s32>(index), v_buffer[index]); });
+    }
+
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(DAddr addr, size_t size);
 
@@ -619,6 +642,11 @@ public:
     }
 
     Common::SpinRecursiveMutex mutex;
+    /// Pages the GPU has written. Inner invalidations of them always reach the cache, also with
+    /// skip_cpu_inner_invalidation: games reset GPU-written records and counters that way.
+    [[nodiscard]] const PageFilter& GpuWriteFilter() const noexcept {
+        return inline_gpu_write_filter;
+    }
     Runtime& runtime;
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.

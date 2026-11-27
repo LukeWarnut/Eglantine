@@ -181,10 +181,11 @@ public:
      * @param mode File access mode
      * @param type File type, default is BinaryFile. Use TextFile to open the file as a text file
      * @param flag (Windows only) File-share access flag, default is ShareReadOnly
+     * @param log_failure Whether to log an error if the file cannot be opened
      */
     void Open(const std::filesystem::path& path, FileAccessMode mode,
               FileType type = FileType::BinaryFile,
-              FileShareFlag flag = FileShareFlag::ShareReadOnly);
+              FileShareFlag flag = FileShareFlag::ShareReadOnly, bool log_failure = true);
 
 // #ifdef _WIN32
 //     template <typename Path>

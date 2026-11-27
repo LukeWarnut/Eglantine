@@ -105,6 +105,13 @@
          </widget>
         </item>
         <item>
+         <widget class="QCheckBox" name="show_path">
+          <property name="text">
+           <string>Show Path Column</string>
+          </property>
+         </widget>
+        </item>
+        <item>
          <layout class="QHBoxLayout" name="folder_icon_size_qhbox_layout_2">
           <item>
            <widget class="QLabel" name="folder_icon_size_label">

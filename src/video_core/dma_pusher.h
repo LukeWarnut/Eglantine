@@ -303,7 +303,11 @@ public:
         bool increment_once;
         GPUVAddr resume_address; ///< Where the entry that continues the method starts
     };
-    void ResolveSplitMethod(GPUVAddr entry_address);
+    /// Resumes a parked method continued at `entry_address`; with `park`, parks the unfinished
+    /// method when the entry starts elsewhere.
+    void ResolveSplitMethod(GPUVAddr entry_address, bool park);
+    /// Whether an entry of `list` from index `from` on starts where the split entry ended.
+    bool SplitResumesLater(const CommandList& list, size_t from) const;
     static constexpr size_t MaxParkedMethods = 16;
 
     // Debug aid: hashes of the words of the last entries as they were parsed.

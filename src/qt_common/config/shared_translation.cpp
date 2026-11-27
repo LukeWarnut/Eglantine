@@ -327,6 +327,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "shaders, and the GPU's own stages elsewhere.\n"
               "GPUs without VK_EXT_mesh_shader always use the compute fallback.\n"
               "Takes effect when a game starts."));
+    INSERT(Settings, graphics_pipeline_library, tr("Link pipelines from shared parts (experimental)"),
+           tr("Uses VK_EXT_graphics_pipeline_library: a new pipeline whose shaders another "
+              "pipeline already compiled as parts is linked from them in a few milliseconds. "
+              "Others compile whole, as with this off, and their parts compile in the background "
+              "for the next one.\n"
+              "Experimental: the gain is limited to pipelines new to the driver's cache, and "
+              "shader modules are kept in memory for reuse.\n"
+              "Needs fast linking support from the driver. Takes effect when a game starts."));
     INSERT(Settings, use_vulkan_driver_pipeline_cache, tr("Use Vulkan pipeline cache"),
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
@@ -341,9 +349,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "hundreds of milliseconds each time."));
 #if defined(__linux__)
     INSERT(Settings, driver_shader_cache_size, tr("Separate driver shader cache (Linux only)"),
-           tr("Keeps the NVIDIA driver's shader cache for this emulator in its own folder, up to "
-              "this size, so other applications can't evict it.\nTurn it off to use the "
-              "driver's shared cache instead.\nTakes effect at the next start."));
+           tr("Keeps the NVIDIA or Mesa driver's shader cache for this emulator in its own "
+              "folder, up to this size, so other applications can't evict it.\nTurn it off to "
+              "use the driver's shared cache instead.\nTakes effect at the next start."));
 #else
     INSERT(Settings, driver_shader_cache_size, QString(), QString());
 #endif
@@ -373,6 +381,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, hyrule_30fps, tr("Hyrule Warriors: Age of Imprisonment: 30 FPS mode"),
            tr("Always runs at 30 FPS with the game's split-screen time step, at normal game speed. "
               "Takes precedence over dynamic FPS."));
+    INSERT(Settings, yoshi_sync_movie_submits, tr("Yoshi: Synchronize GPU submissions during movies"),
+           tr("Prevents a green title movie when asynchronous GPU emulation is enabled."));
     INSERT(Settings, barrier_feedback_loops, tr("Barrier feedback loops"),
            tr("Improves rendering of transparency effects in specific games."));
     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),
@@ -447,11 +457,15 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "it bypasses such prompts and directly exits the emulation."));
     INSERT(UISettings, hide_mouse, tr("Hide mouse on inactivity"),
            tr("Hides the mouse after 2.5s of inactivity."));
-    INSERT(UISettings, check_for_updates, tr("Check for updates"),
+    INSERT(UISettings, check_for_updates, tr("Automatically check for updates on launch"),
            tr("Whether or not to check for updates upon startup."));
-    INSERT(UISettings, update_channel, tr("Update channel"),
-           tr("Stable only offers finished releases.\nRelease candidate also offers release "
-              "candidates of upcoming versions.\nDaily offers the automatic daily builds."));
+    INSERT(UISettings, update_channel, tr("Release channel"),
+           tr("Stable offers the releases of nx2.\nNightly offers the daily builds of "
+              "nx2-experimental, with the newest changes and more risk."));
+    INSERT(UISettings, update_variant, tr("Build type"),
+           tr("PGO builds are optimized using a profile of real games and are usually faster.\n"
+              "When a release has no PGO build, the non-PGO one is used.\n"
+              "Experimental builds compiled on this computer are always non-PGO."));
 
     // Linux
     INSERT(UISettings, enable_gamemode, tr("Enable Gamemode"), QString());
@@ -788,9 +802,13 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
          }});
     translations->insert({Settings::EnumMetadata<Settings::UpdateChannel>::Index(),
                           {
-                              PAIR(UpdateChannel, Stable, tr("Stable")),
-                              PAIR(UpdateChannel, ReleaseCandidate, tr("Release candidate")),
-                              PAIR(UpdateChannel, Daily, tr("Daily")),
+                              PAIR(UpdateChannel, Stable, tr("Stable (nx2)")),
+                              PAIR(UpdateChannel, Daily, tr("Nightly (nx2-experimental)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::UpdateVariant>::Index(),
+                          {
+                              PAIR(UpdateVariant, Standard, tr("Non-PGO")),
+                              PAIR(UpdateVariant, Pgo, tr("PGO")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::GpuClock>::Index(),
                           {

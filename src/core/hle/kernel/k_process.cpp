@@ -314,7 +314,8 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
 
     // Setup page table.
     {
-        const auto as_type = params.flags & Svc::CreateProcessFlag::AddressSpaceMask;
+        const auto as_type = params.flags & (Svc::CreateProcessFlag::AddressSpaceMask |
+                                            Svc::CreateProcessFlag::EnableAliasRegionExtraSize);
         const bool enable_aslr = True(params.flags & Svc::CreateProcessFlag::EnableAslr);
         const bool enable_das_merge =
             False(params.flags & Svc::CreateProcessFlag::DisableDeviceAddressSpaceMerge);
@@ -417,7 +418,8 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
 
     // Setup page table.
     {
-        const auto as_type = params.flags & Svc::CreateProcessFlag::AddressSpaceMask;
+        const auto as_type = params.flags & (Svc::CreateProcessFlag::AddressSpaceMask |
+                                            Svc::CreateProcessFlag::EnableAliasRegionExtraSize);
         const bool enable_aslr = True(params.flags & Svc::CreateProcessFlag::EnableAslr);
         const bool enable_das_merge =
             False(params.flags & Svc::CreateProcessFlag::DisableDeviceAddressSpaceMerge);
@@ -1238,6 +1240,11 @@ Result KProcess::LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMeta
         // to point to about 2GiB into the ASLR region.
         flag |= Svc::CreateProcessFlag::AddressSpace64Bit;
         code_address = 0x8000'0000 + aslr_space_offset;
+        // Switch 2 titles reserve large VAMM address regions (XC2 asks for 60 GiB); the extra
+        // alias space backs the svcGetInfo 29/30 region.
+        if (metadata.IsSwitch2()) {
+            flag |= Svc::CreateProcessFlag::EnableAliasRegionExtraSize;
+        }
         break;
     case FileSys::ProgramAddressSpaceType::Is36Bit:
         flag |= Svc::CreateProcessFlag::AddressSpace64BitDeprecated;

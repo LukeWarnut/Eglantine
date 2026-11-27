@@ -114,6 +114,15 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
     connect(ui_tab.get(), &ConfigureUi::LanguageChanged, this, &ConfigureDialog::OnLanguageChanged);
     connect(general_tab.get(), &ConfigureGeneral::ExternalContentDirsChanged, this,
             &ConfigureDialog::ExternalContentDirsChanged);
+    connect(general_tab.get(), &ConfigureGeneral::OpenVersionManagerRequested, this, [this] {
+        emit OpenVersionManagerRequested();
+        accept();
+    });
+    connect(general_tab.get(), &ConfigureGeneral::LaunchExperimentalBuildRequested, this,
+            [this](const QString& install_dir) {
+                emit LaunchExperimentalBuildRequested(install_dir);
+                accept();
+            });
     connect(ui->selectorList, &QListWidget::itemSelectionChanged, this,
             &ConfigureDialog::UpdateVisibleTabs);
 
@@ -184,6 +193,7 @@ void ConfigureDialog::RetranslateUI() {
     ui->tabWidget->setCurrentIndex(old_index);
 }
 
+
 void ConfigureDialog::HandleApplyButtonClicked() {
     UISettings::values.configuration_applied = true;
     ApplyConfiguration();
@@ -192,9 +202,14 @@ void ConfigureDialog::HandleApplyButtonClicked() {
 Q_DECLARE_METATYPE(QList<QWidget*>);
 
 void ConfigureDialog::PopulateSelectionList() {
+    QList<QWidget*> general_tabs{general_tab.get()};
+    if (QWidget* const updates_page = general_tab->UpdatesPage()) {
+        general_tabs.push_back(updates_page);
+    }
+    general_tabs.append({hotkeys_tab.get(), ui_tab.get(), web_tab.get(), debug_tab_tab.get()});
+
     const std::array<std::pair<QString, QList<QWidget*>>, 7> items{
-        {{tr("General"),
-          {general_tab.get(), hotkeys_tab.get(), ui_tab.get(), web_tab.get(), debug_tab_tab.get()}},
+        {{tr("General"), general_tabs},
          {tr("System"),
           {system_tab.get(), profile_tab.get(), network_tab.get(), filesystem_tab.get(),
            applets_tab.get()}},

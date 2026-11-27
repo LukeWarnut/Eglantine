@@ -147,6 +147,7 @@
     <addaction name="action_Enable_Overlay_Applet"/>
     <addaction name="action_Show_Filter_Bar"/>
     <addaction name="action_Show_Status_Bar"/>
+    <addaction name="action_Customize_Home_Screen"/>
     <addaction name="action_Show_Performance_Overlay"/>
     <addaction name="action_Post_Processing_Shaders"/>
     <addaction name="separator"/>
@@ -237,6 +238,7 @@
     <addaction name="action_Open_UserHandbook"/>
     <addaction name="separator"/>
     <addaction name="action_Check_For_Updates"/>
+    <addaction name="action_Version_Manager"/>
     <addaction name="action_About"/>
     <addaction name="action_Eden_Dependencies"/>
     <addaction name="action_Restore_Previous_Version"/>
@@ -332,6 +334,11 @@
     <string>Show &amp;Filter Bar</string>
    </property>
   </action>
+  <action name="action_Customize_Home_Screen">
+   <property name="text">
+    <string>&amp;Customize Home Screen...</string>
+   </property>
+  </action>
   <action name="action_Show_Status_Bar">
    <property name="checkable">
     <bool>true</bool>
@@ -412,6 +419,11 @@
   <action name="action_Check_For_Updates">
    <property name="text">
     <string>Check for &amp;Updates</string>
+   </property>
+  </action>
+  <action name="action_Version_Manager">
+   <property name="text">
+    <string>&amp;Version Manager...</string>
    </property>
   </action>
   <action name="action_Restore_Previous_Version">

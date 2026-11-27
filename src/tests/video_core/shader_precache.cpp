@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 
 #include "shader_recompiler/exception.h"
+#include "video_core/pipeline_cache_backups.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/shader_warm/shader_archives.h"
@@ -224,4 +225,124 @@ TEST_CASE("ShaderPrecache: programs that cannot be lowered are refused", "[video
     const std::array<u8, 16> no_exit{};
     REQUIRE(ShaderWarm::LowerProgram(no_exit, lowered).has_value());
     REQUIRE(lowered.code.empty());
+}
+
+TEST_CASE("PipelineCacheFile: a damaged last record keeps the records before it",
+          "[video_core]") {
+    ShaderWarm::LoweredCode lowered;
+    lowered.code.resize(16 * sizeof(u64));
+    const ShaderWarm::ComputeControl control{{64, 1, 1}, 0, 0};
+    std::string records;
+    for (u8 i = 0; i < 3; ++i) {
+        lowered.code[0] = i;
+        ShaderWarm::ComputeKey key_bytes{};
+        const auto entry = ShaderWarm::ComputeEntry(lowered, control, key_bytes);
+        records.append(reinterpret_cast<const char*>(entry.data()), entry.size());
+    }
+    constexpr u32 version = 7;
+    std::string header{"yuzucach"};
+    header.append(reinterpret_cast<const char*>(&version), sizeof(version));
+    const size_t record_size = records.size() / 3;
+
+    TempDir dir;
+    const auto file = dir.path / "vulkan.bin";
+    // A crash in the middle of an append leaves half of the third record.
+    WriteBytes(file, header + records.substr(0, record_size * 2 + record_size / 2));
+
+    size_t loaded = 0;
+    VideoCommon::LoadPipelines(
+        {}, file, version,
+        [&](std::ifstream& in, VideoCommon::FileEnvironment) {
+            Vulkan::ComputePipelineCacheKey key{};
+            in.read(reinterpret_cast<char*>(&key), sizeof(key));
+            ++loaded;
+        },
+        [](std::ifstream&, std::vector<VideoCommon::FileEnvironment>) {});
+    REQUIRE(loaded == 2);
+    REQUIRE(std::filesystem::exists(file));
+    REQUIRE(std::filesystem::file_size(file) == header.size() + record_size * 2);
+
+    loaded = 0;
+    VideoCommon::LoadPipelines(
+        {}, file, version,
+        [&](std::ifstream& in, VideoCommon::FileEnvironment) {
+            Vulkan::ComputePipelineCacheKey key{};
+            in.read(reinterpret_cast<char*>(&key), sizeof(key));
+            ++loaded;
+        },
+        [](std::ifstream&, std::vector<VideoCommon::FileEnvironment>) {});
+    REQUIRE(loaded == 2);
+}
+
+TEST_CASE("PipelineCacheFile: a build gets its own cache back after another version ran",
+          "[video_core]") {
+    ShaderWarm::LoweredCode lowered;
+    lowered.code.resize(16 * sizeof(u64));
+    const ShaderWarm::ComputeControl control{{64, 1, 1}, 0, 0};
+    const auto cache = [&](u32 version, u8 records) {
+        std::string bytes{"yuzucach"};
+        bytes.append(reinterpret_cast<const char*>(&version), sizeof(version));
+        for (u8 i = 0; i < records; ++i) {
+            lowered.code[0] = i;
+            ShaderWarm::ComputeKey key_bytes{};
+            const auto entry = ShaderWarm::ComputeEntry(lowered, control, key_bytes);
+            bytes.append(reinterpret_cast<const char*>(entry.data()), entry.size());
+        }
+        return bytes;
+    };
+    TempDir dir;
+    const auto file = dir.path / "vulkan.bin";
+    const auto backup = [&](u32 version) {
+        auto path{file};
+        path += fmt::format(".v{}", version);
+        return path;
+    };
+    const auto load = [&](u32 version, VideoCommon::CacheUpgrade* upgrade = nullptr) {
+        size_t loaded = 0;
+        VideoCommon::LoadPipelines(
+            {}, file, version,
+            [&](std::ifstream& in, VideoCommon::FileEnvironment) {
+                Vulkan::ComputePipelineCacheKey key{};
+                in.read(reinterpret_cast<char*>(&key), sizeof(key));
+                ++loaded;
+            },
+            [](std::ifstream&, std::vector<VideoCommon::FileEnvironment>) {}, false, 1, upgrade);
+        return loaded;
+    };
+
+    // A newer build sets the older cache aside and starts empty.
+    WriteBytes(file, cache(7, 2));
+    REQUIRE(load(8) == 0);
+    REQUIRE_FALSE(std::filesystem::exists(file));
+    REQUIRE(std::filesystem::exists(backup(7)));
+
+    // The older build takes it back.
+    REQUIRE(load(7) == 2);
+    REQUIRE_FALSE(std::filesystem::exists(backup(7)));
+
+    // The newer build finds the older cache in place and its own set aside: it takes its own
+    // instead of upgrading the older one.
+    WriteBytes(backup(8), cache(8, 3));
+    VideoCommon::CacheUpgrade upgrade;
+    REQUIRE(load(8, &upgrade) == 3);
+    REQUIRE(upgrade.from_version == 0);
+    REQUIRE(std::filesystem::exists(backup(7)));
+    REQUIRE_FALSE(std::filesystem::exists(backup(8)));
+
+    // Only the two newest set-aside caches are kept.
+    WriteBytes(backup(3), cache(3, 1));
+    WriteBytes(backup(4), cache(4, 1));
+    const auto now = std::filesystem::file_time_type::clock::now();
+    std::filesystem::last_write_time(backup(3), now - std::chrono::hours{3});
+    std::filesystem::last_write_time(backup(4), now - std::chrono::hours{2});
+    std::filesystem::last_write_time(backup(7), now - std::chrono::hours{1});
+    REQUIRE(load(9) == 0);
+    REQUIRE(std::filesystem::exists(backup(8)));
+    REQUIRE(std::filesystem::exists(backup(7)));
+    REQUIRE_FALSE(std::filesystem::exists(backup(4)));
+    REQUIRE_FALSE(std::filesystem::exists(backup(3)));
+
+    VideoCommon::RemovePipelineCacheVersionBackups(file);
+    REQUIRE_FALSE(std::filesystem::exists(backup(8)));
+    REQUIRE_FALSE(std::filesystem::exists(backup(7)));
 }

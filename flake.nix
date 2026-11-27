@@ -61,6 +61,14 @@
       # buildEdenEmulator, a reusable function, imported here
       lib = forAllSystems (system: emulatorTools.${system});
 
+      # NixOS module: programs.eglantine.enable installs the emulator and its udev rules,
+      # which is the supported way to get raw pad access (HD Rumble over Bluetooth needs
+      # it; a plain nix run cannot register udev rules with the host).
+      nixosModules = {
+        eglantine = import ./nix/nixos-module.nix;
+        default = self.nixosModules.eglantine;
+      };
+
       overlays.default = final: _prev: {
         eglantine = mkEglantine final.stdenv.hostPlatform.system { };
       };

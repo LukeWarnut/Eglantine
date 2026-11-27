@@ -218,10 +218,10 @@ Rgb ToneMapToSdr(Rgb encoded, Encoding source, f32 paper_white_nits) {
         relative = Scale(relative, compressed / peak);
     }
     return Map(relative, [](f32 v) {
-        const f32 encoded = LinearToSrgb(std::clamp(v, 0.0f, 1.0f));
+        const f32 srgb = LinearToSrgb(std::clamp(v, 0.0f, 1.0f));
         // Keep the finite-precision knee monotonic at the top end. Values this close to the
         // display white point are indistinguishable after 8-bit capture quantisation.
-        return encoded > 0.999999f ? 1.0f : encoded;
+        return srgb > 0.999999f ? 1.0f : srgb;
     });
 }
 

@@ -23,6 +23,7 @@
 #include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/nvn/nvn_impl.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
+#include "video_core/renderer_vulkan/nvn/nvn_draw_resources.h"
 
 #include "video_core/renderer_vulkan/nvn/nvn_sparse.h"
 #include "video_core/renderer_vulkan/nvn/nvn_upload.h"
@@ -88,8 +89,12 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
     }
     if (!pool.split_runs.empty()) {
         // Raw stores reach a split pool's guest bytes past the tracker: once one completed, every
-        // page is hashed again before it is trusted.
+        // page is hashed again before it is trusted (unless write-through alias kept mirrors current).
+        // Load split_raw_epoch (acquire) before split_raw_epoch_unaliased (acquire) to pair with
+        // the completion thread's reverse release store order.
         const u64 raw_epoch = split_raw_epoch.load(std::memory_order_acquire);
+        pool.split_raw_epoch_unaliased_seen =
+            split_raw_epoch_unaliased.load(std::memory_order_acquire);
         if (raw_epoch != pool.split_raw_epoch_seen) {
             pool.split_raw_epoch_seen = raw_epoch;
             if (!mario_kart_world) {
@@ -161,6 +166,10 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
             const size_t index = static_cast<size_t>(page);
             if (index < pool.mirror_pages.size()) {
                 pool.mirror_pages[index].trusted = false;
+                if (pool.raw_written_through &&
+                    pool.mirror_pages[index].raw_epoch != pool.split_raw_epoch_seen) {
+                    pool.mirror_pages[index].valid = false;
+                }
             }
             if (index < pool.page_write_gen.size()) {
                 pool.page_write_gen[index] = pool.cpu_write_gen;
@@ -263,38 +272,56 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
         return;
     }
     constexpr u64 SMALL_STORAGE = u64{16} << 20;
-    const auto schedule_unchanged = [&] {
+    const auto schedule_unchanged = [&](bool frequent) {
         ++s.unchanged_checks;
         u64 backoff = CheckBackoff((std::min)(s.unchanged_checks, 13u)); // 13+: the 30 cap
-        if (size <= SMALL_STORAGE) {
+        if (mario_kart_world && !frequent && !s.dynamic && s.unchanged_checks >= 13) {
+            backoff = 120;
+        }
+        if (frequent && size <= SMALL_STORAGE) {
             backoff = (std::min)(backoff, u64{3}); // a new glyph shows within a few frames
         }
         s.next_check_tick = tick + 1 + (s.dynamic ? (std::min)(backoff, u64{1}) : backoff);
     };
     // The page tracker saw none of the storage's pages written since a full hash matched: the
     // bytes are the same, no hash needed. Forced checks (a flush, a host write) still hash.
-    const bool tracked = tex_hash_tracked && !watching && !pool.IsVirtual() &&
-                         (pool.flags & PoolFlag::CpuNoAccess) == 0 && TakePoolCpuWrites(pool);
-    const u32 tracked_gen = pool.cpu_write_gen;
+    Pool* check_pool = &pool;
+    u64 check_offset = s.pool_offset;
+    bool single_physical = !pool.IsVirtual();
+    if (!single_physical) {
+        single_physical =
+            ResolveVirtualRange(pool, s.pool_offset, size, check_pool, check_offset) &&
+            check_pool != nullptr;
+    }
+    const bool tracked = tex_hash_tracked && !watching && single_physical &&
+                         (check_pool->flags & PoolFlag::CpuNoAccess) == 0 &&
+                         TakePoolCpuWrites(*check_pool);
+    if (tracked && s.cpu_trusted_pool != check_pool->serial) {
+        s.cpu_trusted_pool = check_pool->serial;
+        s.cpu_trusted_gen = 0;
+        s.cpu_full_gen = 0;
+        s.page_hashes.clear();
+    }
+    const u32 tracked_gen = check_pool->cpu_write_gen;
     const bool trusted = tracked && !forced && s.cpu_trusted_gen != 0;
     // A raw store completed since the full compare: it may have written any byte, so the check
     // below is the one of an untracked texture (signature, full compare when due). Pages the
     // tracker saw written are still compared first.
-    const bool raw_pending = trusted && pool.raw_write_gen > s.cpu_full_gen;
+    const bool raw_pending = trusted && check_pool->raw_write_gen > s.cpu_full_gen;
     const bool written =
-        trusted && PoolWrittenSince(pool, s.pool_offset, size, s.cpu_trusted_gen);
+        trusted && PoolWrittenSince(*check_pool, check_offset, size, s.cpu_trusted_gen);
     if (trusted && !written && !raw_pending) {
         stats.cpu_checks_trusted.fetch_add(1, std::memory_order_relaxed);
-        schedule_unchanged();
+        schedule_unchanged(s.dynamic);
         return;
     }
     // The storage's part of pool page `page`, hashed (data = the storage's first byte).
-    const u64 first_page = s.pool_offset / Pool::MIRROR_PAGE;
-    const u64 last_page = (s.pool_offset + size - 1) / Pool::MIRROR_PAGE;
+    const u64 first_page = check_offset / Pool::MIRROR_PAGE;
+    const u64 last_page = (check_offset + size - 1) / Pool::MIRROR_PAGE;
     const auto page_hash = [&](const u8* data, u64 page) {
-        const u64 begin = (std::max)(page * Pool::MIRROR_PAGE, s.pool_offset);
-        const u64 end = (std::min)((page + 1) * Pool::MIRROR_PAGE, s.pool_offset + size);
-        return Common::CityHash64(reinterpret_cast<const char*>(data + (begin - s.pool_offset)),
+        const u64 begin = (std::max)(page * Pool::MIRROR_PAGE, check_offset);
+        const u64 end = (std::min)((page + 1) * Pool::MIRROR_PAGE, check_offset + size);
+        return Common::CityHash64(reinterpret_cast<const char*>(data + (begin - check_offset)),
                                   static_cast<size_t>(end - begin));
     };
     if (written) {
@@ -304,14 +331,14 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     // hashes describe the contents (an upload drops them), so a page that differs means the
     // contents are stale, and equal pages mean the bytes are the trusted ones again.
     if (written && s.page_hashes.size() == last_page - first_page + 1 &&
-        last_page < pool.page_write_gen.size()) {
+        last_page < check_pool->page_write_gen.size()) {
         std::vector<u8> page_scratch;
         const auto page_begin = std::chrono::steady_clock::now();
         if (const u8* bytes = GuestBytes(pool, s.pool_offset, size, page_scratch)) {
             bool differs = false;
             u64 rehashed = 0;
             for (u64 page = first_page; page <= last_page; ++page) {
-                if (pool.page_write_gen[static_cast<size_t>(page)] <= s.cpu_trusted_gen) {
+                if (check_pool->page_write_gen[static_cast<size_t>(page)] <= s.cpu_trusted_gen) {
                     continue;
                 }
                 ++rehashed;
@@ -338,7 +365,7 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
             stats.cpu_checks_pages.fetch_add(1, std::memory_order_relaxed);
             s.cpu_trusted_gen = tracked_gen;
             if (!raw_pending) {
-                schedule_unchanged();
+                schedule_unchanged(true);
                 return;
             }
         }
@@ -351,7 +378,8 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     // whose per-present budget (FULL_HASH_BYTES_PER_PRESENT) the many new textures of a cold
     // start used up first, so glyphs written then stayed blank.
     const bool compressed = s.desc.format != 0 && FormatBlockInfo(s.desc.format).width > 1;
-    const bool every_check = forced || s.dynamic || (size <= SMALL_STORAGE && !compressed);
+    const bool every_check =
+        forced || s.dynamic || ((!trusted || written) && size <= SMALL_STORAGE && !compressed);
     bool full = every_check || tick >= s.next_full_tick;
     if (full && !every_check) {
         // The scheduled full compares of the rest share a byte budget per present (a 2 GB texture
@@ -403,6 +431,7 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
             hashed += size;
             s.next_full_tick = tick + FULL_VERIFY_PRESENTS;
             // Taken before the bytes were read: a write since shows with a later generation.
+            s.cpu_trusted_pool = (!changed && tracked) ? check_pool->serial : 0;
             s.cpu_trusted_gen = (!changed && tracked) ? tracked_gen : 0;
             s.cpu_full_gen = s.cpu_trusted_gen;
             // The bytes are the baseline's again: page hashes taken of it still describe them.
@@ -417,8 +446,8 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
                     s.page_hashes[static_cast<size_t>(page - first_page)] = page_hash(data, page);
                 }
                 hashed += size;
-                TakePoolCpuWrites(pool);
-                if (PoolWrittenSince(pool, s.pool_offset, size, tracked_gen)) {
+                TakePoolCpuWrites(*check_pool);
+                if (PoolWrittenSince(*check_pool, check_offset, size, tracked_gen)) {
                     // CPU wrote memory between full compare and page hashing: drop the baseline.
                     s.cpu_trusted_gen = 0;
                     s.page_hashes.clear();
@@ -452,7 +481,7 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
                  changed, check_ns / 1e6, guest_ns / 1e6);
     }
     if (!changed) {
-        schedule_unchanged();
+        schedule_unchanged(s.dynamic || written || !trusted);
         return;
     }
     stats.cpu_changes.fetch_add(1, std::memory_order_relaxed);
@@ -462,6 +491,16 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
 
 bool Context::Impl::StorageNeedsCommands(Storage& s, bool will_overwrite, u64 seq,
                                          bool scaled_ok) {
+    if (!will_overwrite && !s.sparse && s.image && s.contents_valid && !s.force_upload &&
+        s.checked_seq == seq && s.scale_owner == nullptr &&
+        (scaled_ok || !Rescale::NativeIsStale(s.scale_state)) && s.linear_writeback_seq == 0 &&
+        s.pool_index != nullptr && s.pool_index_epoch == storage_index_epoch &&
+        static_cast<const PoolIndex*>(s.pool_index)->write_gen == s.pool_gen_seen) {
+        return false;
+    }
+    if (s.sparse && s.image && !will_overwrite && s.checked_seq == seq && !s.sparse->HasWork()) {
+        return false;
+    }
     if (!EnsureImage(s)) {
         return false;
     }
@@ -475,7 +514,10 @@ bool Context::Impl::StorageNeedsCommands(Storage& s, bool will_overwrite, u64 se
         return true; // the guest-sized image has to be made from the twin
     }
     if (s.sparse) {
-        VerifySparse(s);
+        if (s.checked_seq != seq) {
+            VerifySparse(s);
+            s.checked_seq = seq;
+        }
         return s.sparse->HasWork();
     }
     if (!s.contents_valid || s.force_upload) {
@@ -580,6 +622,93 @@ void Context::Impl::SetStandin(Storage& s, AstcStandin standin) {
     s.vram_bytes = bytes * s.layers;
 }
 
+vk::Image Context::Impl::TakeRecycledImage(const VkImageCreateInfo& info) {
+    if (image_recycle_count == 0) {
+        return {};
+    }
+    const ImageRecycleKey key{
+        .flags = info.flags,
+        .type = info.imageType,
+        .format = info.format,
+        .width = info.extent.width,
+        .height = info.extent.height,
+        .depth = info.extent.depth,
+        .levels = info.mipLevels,
+        .layers = info.arrayLayers,
+        .samples = info.samples,
+        .usage = info.usage,
+    };
+    const auto it = image_recycle_pool.find(key);
+    if (it == image_recycle_pool.end() || it->second.empty()) {
+        return {};
+    }
+    RecycledImage entry = std::move(it->second.back());
+    it->second.pop_back();
+    if (it->second.empty()) {
+        image_recycle_pool.erase(it);
+    }
+    image_recycle_bytes -= (std::min)(image_recycle_bytes, entry.vram_bytes);
+    --image_recycle_count;
+    stats.storages_recycled.fetch_add(1, std::memory_order_relaxed);
+    return std::move(entry.image);
+}
+
+void Context::Impl::RecycleImage(Storage& s) {
+    if (!s.image || s.sparse || s.vram_bytes == 0 || s.vram_bytes > IMAGE_RECYCLE_MAX_BYTES / 2) {
+        return;
+    }
+    const ImageRecycleKey key{
+        .flags = s.create_flags,
+        .type = s.type,
+        .format = s.host.format,
+        .width = s.extent.width,
+        .height = s.extent.height,
+        .depth = s.extent.depth,
+        .levels = s.levels,
+        .layers = s.layers,
+        .samples = s.samples,
+        .usage = s.usage,
+    };
+    const u64 bytes = s.vram_bytes;
+    image_recycle_pool[key].push_back(RecycledImage{
+        .key = key,
+        .image = std::move(s.image),
+        .vram_bytes = bytes,
+        .lru_tick = ++image_recycle_tick,
+    });
+    s.image = vk::Image{};
+    image_recycle_bytes += bytes;
+    ++image_recycle_count;
+    while (image_recycle_bytes > IMAGE_RECYCLE_MAX_BYTES ||
+           image_recycle_count > IMAGE_RECYCLE_MAX_COUNT) {
+        auto oldest_bucket = image_recycle_pool.end();
+        u64 oldest_tick = ~u64{0};
+        for (auto it = image_recycle_pool.begin(); it != image_recycle_pool.end(); ++it) {
+            if (!it->second.empty() && it->second.front().lru_tick < oldest_tick) {
+                oldest_tick = it->second.front().lru_tick;
+                oldest_bucket = it;
+            }
+        }
+        if (oldest_bucket == image_recycle_pool.end()) {
+            break;
+        }
+        const u64 evicted_bytes = oldest_bucket->second.front().vram_bytes;
+        if (oldest_bucket->second.size() == 1) {
+            image_recycle_pool.erase(oldest_bucket);
+        } else {
+            oldest_bucket->second.erase(oldest_bucket->second.begin());
+        }
+        image_recycle_bytes -= (std::min)(image_recycle_bytes, evicted_bytes);
+        --image_recycle_count;
+    }
+}
+
+void Context::Impl::ClearRecycledImages() {
+    image_recycle_pool.clear();
+    image_recycle_bytes = 0;
+    image_recycle_count = 0;
+}
+
 bool Context::Impl::EnsureImage(Storage& s) {
     if (s.image) {
         return true;
@@ -631,7 +760,10 @@ bool Context::Impl::EnsureImage(Storage& s) {
             s.contents_valid = false;
             s.origin = StorageOrigin::None;
         }
-        s.image = allocator->CreateImage(image_info, false, AllocationKind::StorageImage);
+        s.image = TakeRecycledImage(image_info);
+        if (!s.image) {
+            s.image = allocator->CreateImage(image_info, false, AllocationKind::StorageImage);
+        }
         ++s.image_gen;
     } catch (const vk::Exception& exception) {
         s.image_failed = true;
@@ -839,7 +971,7 @@ void Context::Impl::MapVirtualNow(u64 pool_serial, const std::vector<VC::Virtual
         return;
     }
     Pool& pool = *found->second;
-    if (mario_kart_world && !mappings.empty()) {
+    if (!mappings.empty()) {
         ++mkw_mapping_generation;
     }
     PoolIndex* const index = [&]() -> PoolIndex* {
@@ -917,6 +1049,9 @@ void Context::Impl::MapVirtualNow(u64 pool_serial, const std::vector<VC::Virtual
             storage.gpu_write_gen = 0; // no longer a source for overlapping textures
             storage.linear_writeback_seq = 0;
             storage.force_upload = false;
+            storage.cpu_trusted_gen = 0;
+            storage.cpu_full_gen = 0;
+            storage.page_hashes.clear();
         }
     }
     stats.virtual_maps.fetch_add(1, std::memory_order_relaxed);
@@ -941,9 +1076,11 @@ void Context::Impl::VerifySparse(Storage& s) {
     if (pool_it == pools.end()) {
         return;
     }
+    const Pool& virtual_pool = *pool_it->second;
     // At most this many tiles per present in all, and per call: a 64 KiB gather and a hash each.
     constexpr u32 TILES_PER_TICK = 64;
     constexpr u32 TILES_PER_CALL = 16;
+    constexpr u32 TRACKED_SCAN_PER_CALL = 64;
     const u64 tick = PollTick();
     if (sparse_verify_tick != tick) {
         sparse_verify_tick = tick;
@@ -951,18 +1088,42 @@ void Context::Impl::VerifySparse(Storage& s) {
     }
     thread_local std::vector<u8> bytes;
     bytes.resize(static_cast<size_t>(SPARSE_TILE_BYTES));
-    for (u32 n = 0; n < TILES_PER_CALL && sparse_verify_count < TILES_PER_TICK; ++n) {
+    u32 hashed = 0;
+    for (u32 n = 0; n < TRACKED_SCAN_PER_CALL && hashed < TILES_PER_CALL &&
+                    sparse_verify_count < TILES_PER_TICK;
+         ++n) {
         const u32 id = sparse.NextVerifyTile();
         if (id == ~0u) {
             break;
         }
+        const u64 tile_offset = s.pool_offset + sparse.Layout().TileOffset(id);
+        Pool* phys = nullptr;
+        u64 phys_offset = 0;
+        u32 before_gen = 0;
+        if (tex_hash_tracked &&
+            ResolveVirtualRange(virtual_pool, tile_offset, SPARSE_TILE_BYTES, phys, phys_offset) &&
+            phys != nullptr && (phys->flags & PoolFlag::CpuNoAccess) == 0 &&
+            TakePoolCpuWrites(*phys)) {
+            before_gen = phys->cpu_write_gen;
+            const u32 verified_gen = sparse.TileVerifiedGen(id);
+            const bool same_pool = sparse.TileVerifiedPool(id) == phys->serial;
+            if (same_pool && verified_gen != 0 &&
+                (before_gen == verified_gen ||
+                 (phys->raw_write_gen <= verified_gen &&
+                  !PoolWrittenSince(*phys, phys_offset, SPARSE_TILE_BYTES, verified_gen)))) {
+                sparse.SetTileVerifiedGen(id, phys->serial, before_gen);
+                continue;
+            }
+        }
+        ++hashed;
         ++sparse_verify_count;
         std::fill(bytes.begin(), bytes.end(), u8{0});
-        GatherVirtual(*pool_it->second, s.pool_offset + sparse.Layout().TileOffset(id),
-                      SPARSE_TILE_BYTES, bytes.data());
+        GatherVirtual(virtual_pool, tile_offset, SPARSE_TILE_BYTES, bytes.data());
         if (Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size()) !=
             sparse.TileHash(id)) {
             sparse.MarkTileDirty(id);
+        } else if (before_gen != 0 && phys != nullptr) {
+            sparse.SetTileVerifiedGen(id, phys->serial, before_gen);
         }
     }
 }
@@ -1117,6 +1278,10 @@ void Context::Impl::NotifyCpuWriteNow(u64 address, u64 size, bool host_write) {
                 monitor.notify_dirty.fetch_add(1, std::memory_order_relaxed);
             }
         }
+    }
+    if (runs.empty() && flush_tracked && !host_write && pool.vram_mirror &&
+        pool.mirror_pages.empty()) {
+        return;
     }
     for (const auto& [run_begin, run_end] : runs) {
         MirrorInvalidate(pool, run_begin, run_end - run_begin);
@@ -1328,10 +1493,10 @@ bool Context::Impl::StorageSuperseded(const Storage& s) const {
     return RangesCover(covers, begin, end);
 }
 
-void Context::Impl::TrimStorageCache(bool at_present) {
+void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     // A pass walks the whole cache: it runs when the cache has grown since the last one or after
     // a few presents, not at every storage created.
-    constexpr u64 PASS_INTERVAL_PRESENTS = 30;
+    constexpr u64 PASS_INTERVAL_PRESENTS = 120;
     // Superseded-storage tests per pass (each scans the storages over the tested one's bytes).
     constexpr size_t MAX_SUPERSEDED_TESTS = 1024;
     const u64 presents = stats.presents.load(std::memory_order_relaxed);
@@ -1354,20 +1519,41 @@ void Context::Impl::TrimStorageCache(bool at_present) {
                (storage_cache_bytes < trim_floor_bytes && presents < trim_next_present)) {
         return;
     }
-    // The device over its memory budget (VK_EXT_memory_budget; the allocator's empty block space
-    // counts, the driver counts it too) pages: what the cache can rebuild goes until it is not.
+    // The device near its memory budget (85% soft threshold for MKW, 90% for other titles;
+    // VK_EXT_memory_budget, the allocator's empty block space counts and the driver counts it too)
+    // sheds rebuildable storages before spills begin.
     u64 device_budget = 0;
     trim_device_excess = 0;
+    bool hard_pressure = false;
     if (!trim_legacy) {
         device_budget = device.GetDeviceMemoryBudget();
         if (device_budget != 0) {
             const u64 used = device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack();
-            if (used > device_budget) {
-                trim_device_excess = used - device_budget;
-                stats.storage_trim_pressure_passes.fetch_add(1, std::memory_order_relaxed);
+            const u64 pressure_threshold = mario_kart_world
+                                               ? device_budget - (device_budget * 15) / 100
+                                               : device_budget - device_budget / 10;
+            hard_pressure = mario_kart_world && used > device_budget;
+            if (used > pressure_threshold) {
+                trim_device_excess = used - pressure_threshold;
+                if (!(!at_present && mario_kart_world && !over_budget && !hard_pressure)) {
+                    stats.storage_trim_pressure_passes.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
     }
+    if (!at_present && mario_kart_world && !over_budget && !hard_pressure) {
+        return;
+    }
+    if (trim_device_excess != 0 && image_recycle_count != 0) {
+        const u64 freed = image_recycle_bytes;
+        ClearRecycledImages();
+        trim_device_excess -= (std::min)(trim_device_excess, freed);
+    }
+    constexpr size_t MAX_SOFT_PRESSURE_OPS_PER_PASS = 48;
+    constexpr u64 SOFT_PRESSURE_INTERVAL_PRESENTS = 4;
+    const bool soft_pressure_capped =
+        mario_kart_world && trim_device_excess != 0 && !hard_pressure;
+    size_t pressure_ops = 0;
     const u64 budget_target = storage_cache_budget / 10 * 9;
     u64 target = over_budget ? budget_target : storage_cache_bytes;
     if (trim_device_excess != 0) {
@@ -1433,7 +1619,13 @@ void Context::Impl::TrimStorageCache(bool at_present) {
         } else if (reason == Reason::Aged) {
             stats.storages_aged_evicted.fetch_add(1, std::memory_order_relaxed);
         }
+        if (trim_device_excess == 0 && !storage.sparse && storage.image &&
+            it->second.use_count() == 1 &&
+            storage.last_used_seq <= completed_seq.load(std::memory_order_acquire)) {
+            RecycleImage(storage);
+        }
         storage_cache.erase(it);
+        ++pressure_ops;
     };
     size_t tests = 0;
     // Whether a later GPU write replaced every byte of a GPU-written storage (null: the pass is
@@ -1451,11 +1643,12 @@ void Context::Impl::TrimStorageCache(bool at_present) {
         storage.trim_checked_gen = gen;
         return false;
     };
-    // Below the budget (the device budget's share) the storages of the last presents stay: the
-    // transient targets a game re-creates every frame would otherwise be made again every frame.
+    // Unless under hard device-memory pressure (used > device_budget), storages used in the last
+    // few presents stay: transient/aliased targets a game re-uses every frame would otherwise be
+    // evicted, recreated, and alias-transferred every frame.
     constexpr u64 PRESSURE_KEEP_PRESENTS = 4;
-    const auto kept_under_budget = [&](const Storage& storage) {
-        return storage_cache_bytes <= budget_target && presents >= storage.last_used_present &&
+    const auto kept_recently_used = [&](const Storage& storage) {
+        return !hard_pressure && presents >= storage.last_used_present &&
                presents - storage.last_used_present < PRESSURE_KEEP_PRESENTS;
     };
     // First the render targets the GPU wrote again since (the game re-uses the bytes for other
@@ -1464,11 +1657,12 @@ void Context::Impl::TrimStorageCache(bool at_present) {
     // guest bytes can rebuild: they are kept.
     std::sort(gpu_written.begin(), gpu_written.end(), by_age);
     for (const Candidate& candidate : gpu_written) {
-        if (storage_cache_bytes <= target || tests >= MAX_SUPERSEDED_TESTS) {
+        if (storage_cache_bytes <= target || tests >= MAX_SUPERSEDED_TESTS ||
+            (soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS)) {
             break;
         }
         const auto it = storage_cache.find(candidate.key);
-        if (it != storage_cache.end() && !kept_under_budget(*it->second) &&
+        if (it != storage_cache.end() && !kept_recently_used(*it->second) &&
             superseded(*it->second).value_or(false)) {
             evict(candidate.key, Reason::Superseded);
         }
@@ -1476,12 +1670,66 @@ void Context::Impl::TrimStorageCache(bool at_present) {
     // Then the storages that hold guest bytes (the next use uploads them again).
     std::sort(from_guest.begin(), from_guest.end(), by_age);
     for (const Candidate& candidate : from_guest) {
-        if (storage_cache_bytes <= target) {
+        if (storage_cache_bytes <= target ||
+            (soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS)) {
             break;
         }
         const auto it = storage_cache.find(candidate.key);
-        if (it != storage_cache.end() && !kept_under_budget(*it->second)) {
+        if (it != storage_cache.end() && !kept_recently_used(*it->second)) {
             evict(candidate.key, Reason::Budget);
+        }
+    }
+    // If live CPU-sourced (guest memory) textures keep the cache over target (e.g., MKW keeping
+    // thousands of Texture objects registered), demote the oldest idle images at present boundaries
+    // while keeping the Storage entry intact so EnsureImage can rebuild them on future use.
+    if (at_present && storage_cache_bytes > target && retire_seq != 0 &&
+        !(soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS)) {
+        const u64 done_seq = completed_seq.load(std::memory_order_acquire);
+        constexpr u64 DEMOTE_KEEP_PRESENTS_PRESSURE = 60;
+        constexpr u64 DEMOTE_KEEP_PRESENTS_BUDGET = 180;
+        const u64 demote_keep =
+            trim_device_excess != 0 ? DEMOTE_KEEP_PRESENTS_PRESSURE : DEMOTE_KEEP_PRESENTS_BUDGET;
+        std::vector<Candidate> demotable;
+        for (const auto& [key, storage] : storage_cache) {
+            if (storage.use_count() <= 1 || !storage->image || storage->sparse || storage->scaled ||
+                storage->origin != StorageOrigin::Cpu || storage->last_used_seq > done_seq) {
+                continue;
+            }
+            if (presents >= storage->last_used_present &&
+                presents - storage->last_used_present >= demote_keep) {
+                demotable.push_back({storage->last_used_seq, key});
+            }
+        }
+        std::sort(demotable.begin(), demotable.end(), by_age);
+        for (const Candidate& candidate : demotable) {
+            if (storage_cache_bytes <= target ||
+                (soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS)) {
+                break;
+            }
+            const auto it = storage_cache.find(candidate.key);
+            if (it == storage_cache.end() || !it->second->image) {
+                continue;
+            }
+            Storage& s = *it->second;
+            auto old_image = std::make_shared<vk::Image>(std::move(s.image));
+            auto old_views = std::make_shared<std::vector<vk::ImageView>>(
+                draw_resources ? draw_resources->TakeStorageViews(s)
+                               : std::vector<vk::ImageView>{});
+            retired.push_back({retire_seq, [old_image, old_views]() mutable {
+                                   old_views->clear();
+                                   *old_image = vk::Image{};
+                               }});
+            s.image = vk::Image{};
+            s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            s.contents_valid = false;
+            s.origin = StorageOrigin::None;
+            ++s.image_gen;
+            if (trim_device_excess != 0 || storage_cache_bytes <= budget_target) {
+                stats.storages_pressure_evicted.fetch_add(1, std::memory_order_relaxed);
+            }
+            storage_cache_bytes -= (std::min)(storage_cache_bytes, s.vram_bytes);
+            stats.storages_evicted.fetch_add(1, std::memory_order_relaxed);
+            ++pressure_ops;
         }
     }
     // Under the budget too: render targets nothing used for `trim_age_presents` that cost nothing
@@ -1489,6 +1737,9 @@ void Context::Impl::TrimStorageCache(bool at_present) {
     // only when superseded, never with texels no other storage holds.
     if (trim_for_age) {
         for (const Candidate& candidate : from_guest) {
+            if (soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS) {
+                break;
+            }
             const auto it = storage_cache.find(candidate.key);
             if (it != storage_cache.end() && (it->second->usage & TARGET_USAGE) != 0 &&
                 aged(*it->second)) {
@@ -1496,7 +1747,8 @@ void Context::Impl::TrimStorageCache(bool at_present) {
             }
         }
         for (const Candidate& candidate : gpu_written) {
-            if (tests >= MAX_SUPERSEDED_TESTS) {
+            if (tests >= MAX_SUPERSEDED_TESTS ||
+                (soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS)) {
                 break;
             }
             const auto it = storage_cache.find(candidate.key);
@@ -1507,8 +1759,13 @@ void Context::Impl::TrimStorageCache(bool at_present) {
             }
         }
     }
+    const bool soft_pressure_incomplete = soft_pressure_capped &&
+                                          pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS &&
+                                          storage_cache_bytes > target;
     trim_floor_bytes = storage_cache_bytes + (std::max)(storage_cache_budget / 32, u64{1});
-    trim_next_present = presents + PASS_INTERVAL_PRESENTS;
+    trim_next_present =
+        presents + (soft_pressure_incomplete ? SOFT_PRESSURE_INTERVAL_PRESENTS
+                                             : PASS_INTERVAL_PRESENTS);
     stats.storage_cache_bytes.store(storage_cache_bytes, std::memory_order_relaxed);
 }
 

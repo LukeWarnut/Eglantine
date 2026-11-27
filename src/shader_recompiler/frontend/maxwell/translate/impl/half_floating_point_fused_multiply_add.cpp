@@ -68,7 +68,7 @@ void HFMA2(TranslatorVisitor& v, u64 insn, Merge merge, Swizzle swizzle_a, bool 
         lhs = v.ir.FPConvert(16, lhs);
         rhs = v.ir.FPConvert(16, rhs);
     }
-    v.X(hfma2.dest_reg, MergeResult(v.ir, hfma2.dest_reg, lhs, rhs, merge));
+    v.X(hfma2.dest_reg, MergeResult(v, hfma2.dest_reg, lhs, rhs, merge));
 }
 
 void HFMA2(TranslatorVisitor& v, u64 insn, bool neg_b, bool neg_c, Swizzle swizzle_b,

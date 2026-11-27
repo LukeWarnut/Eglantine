@@ -265,6 +265,11 @@ public:
     /// Notify the cache that a new frame has been queued
     void TickFrame();
 
+    /// Mark guest-backed ASTC textures for re-transcode the next time they are used.
+    size_t InvalidateAstcTranscodes() requires requires(const Runtime& rt, const Image& image) {
+        rt.CanFuseAstc(image);
+    };
+
     /// Return a constant reference to the given image view id
     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
 

@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <QElapsedTimer>
 #include <QListView>
+#include <QPersistentModelIndex>
 #include <QPixmap>
 #include <QString>
 
@@ -13,6 +15,10 @@
 #include "common/common_types.h"
 
 class GameListModel;
+class QLabel;
+class QPushButton;
+class QTimer;
+class QToolButton;
 class QVariantAnimation;
 
 /// The home screen's carousel: one large centered game card with the neighbouring games stacked
@@ -52,10 +58,31 @@ protected:
     QRegion visualRegionForSelection(const QItemSelection& selection) const override;
     void wheelEvent(QWheelEvent* event) override;
     void currentChanged(const QModelIndex& current, const QModelIndex& previous) override;
+    void updateGeometries() override;
+    void scrollContentsBy(int dx, int dy) override;
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
+    bool viewportEvent(QEvent* event) override;
+    void changeEvent(QEvent* event) override;
 
 private:
     int PositionOf(int row) const;
-    void MoveTo(int position);
+    /// The selected game's position, or the centered one's when nothing visible is selected.
+    int CurrentPosition() const;
+    /// Slides to `position`; a negative duration uses the default.
+    void MoveTo(int position, int duration_ms = -1);
+    /// Nudges the strip toward `direction` and back: the end of the list was reached.
+    void Bounce(int direction);
+    void UpdateHover(const QPoint& pos);
+    /// Brings the pager row's labels, enabled states and place under the title up to date.
+    void SyncPager();
+    void Step(int direction);
+    void RetranslatePager();
+    void RefreshPagerPalette();
+    /// Tells screen readers which game is centered and where it sits in the list.
+    void Announce();
     /// Re-applies the stored filter once the model has changed shape.
     void ScheduleRelayout();
 
@@ -68,9 +95,56 @@ private:
     /// The slide's destination position, or -1 when no slide is running.
     int m_pending_center = -1;
     bool m_relayout_queued = false;
+    /// The game centered before the rows were removed, reselected once a reload brings it back.
+    QString m_restore_path;
+    bool m_populating = false;
+    /// Wheel travel not yet turned into a step, in eighths of a degree.
+    int m_wheel_accum = 0;
+
+    // Mouse: a press becomes a drag past the start-drag distance, otherwise a click on release.
+    bool m_pressed = false;
+    bool m_dragging = false;
+    /// The press stopped a moving strip: its release only settles the strip, it clicks nothing.
+    bool m_caught = false;
+    QPoint m_press_pos;
+    /// The card the drag holds, and where its slot center was when the drag began.
+    int m_grab_position = 0;
+    qreal m_grab_x = 0.0;
+    QPersistentModelIndex m_press_index;
+    /// The card the last click landed on, and whether it was the settled center: only that
+    /// card launches on a double-click.
+    QPersistentModelIndex m_last_click_index;
+    bool m_last_click_center = false;
+    /// Holds the backdrop and the screen reader announcement until the strip settles.
+    QTimer* m_settle_timer = nullptr;
+    QElapsedTimer m_drag_clock;
+    struct DragSample {
+        qint64 ms;
+        qreal position;
+    };
+    std::vector<DragSample> m_drag_samples;
+    int m_hover_position = -1;
+
+    /// The row under the title: play time, previous, position, next and Play, all stock
+    /// widgets so the platform style and the theme draw them.
+    QWidget* m_pager = nullptr;
+    /// Equal-width columns either side of the position, so it sits under the card's center
+    /// and no control moves when the play time or the game changes.
+    QWidget* m_pager_left = nullptr;
+    QWidget* m_pager_right = nullptr;
+    QLabel* m_play_time = nullptr;
+    QToolButton* m_prev = nullptr;
+    QLabel* m_count = nullptr;
+    QToolButton* m_next = nullptr;
+    QPushButton* m_play = nullptr;
 
 signals:
     /// The game the backdrop should feature: the slide's destination once one is running, the
     /// settled center otherwise. Emitted on selection changes and relayouts.
     void CenteredGameChanged(u64 program_id);
+    void FilterResultReady(int visible, int total);
+    /// The pager's Play button was clicked.
+    void LaunchRequested(const QModelIndex& index);
+    /// A click, not a drag, that landed on no card.
+    void BackgroundClicked();
 };

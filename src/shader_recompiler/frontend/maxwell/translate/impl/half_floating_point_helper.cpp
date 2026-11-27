@@ -40,8 +40,9 @@ std::pair<IR::F16F32F64, IR::F16F32F64> Extract(IR::IREmitter& ir, IR::U32 value
     throw InvalidArgument("Invalid swizzle {}", swizzle);
 }
 
-IR::U32 MergeResult(IR::IREmitter& ir, IR::Reg dest, const IR::F16& lhs, const IR::F16& rhs,
+IR::U32 MergeResult(TranslatorVisitor& v, IR::Reg dest, const IR::F16& lhs, const IR::F16& rhs,
                     Merge merge) {
+    IR::IREmitter& ir{v.ir};
     switch (merge) {
     case Merge::H1_H0:
         return ir.PackFloat2x16(ir.CompositeConstruct(lhs, rhs));
@@ -49,7 +50,7 @@ IR::U32 MergeResult(IR::IREmitter& ir, IR::Reg dest, const IR::F16& lhs, const I
         return ir.BitCast<IR::U32, IR::F32>(ir.FPConvert(32, lhs));
     case Merge::MRG_H0:
     case Merge::MRG_H1: {
-        const IR::Value vector{ir.UnpackFloat2x16(ir.GetReg(dest))};
+        const IR::Value vector{ir.UnpackFloat2x16(v.X(dest))};
         const bool is_h0{merge == Merge::MRG_H0};
         const IR::F16 insert{ir.FPConvert(16, is_h0 ? lhs : rhs)};
         return ir.PackFloat2x16(ir.CompositeInsert(vector, insert, is_h0 ? 0 : 1));

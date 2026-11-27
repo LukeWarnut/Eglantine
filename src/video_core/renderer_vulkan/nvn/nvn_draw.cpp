@@ -103,6 +103,7 @@ bool DrawContext::OpKeepsPass(VC::Op op) noexcept {
 DrawContext::DrawContext(Context::Impl& impl_, u32 queue_)
     : impl{impl_}, resources{*impl_.draw_resources}, queue{queue_},
       costsplit{impl_.costsplit.get()} {
+    pipeline_memo.resize(1024);
     std::memset(&fixed, 0, sizeof(fixed));
     fixed.blend.fill(VC::BlendState::Defaults());
     fixed.color = VC::ColorState::Defaults();
@@ -155,9 +156,17 @@ void DrawContext::EndSubmission() {
     stage_covered_end = nullptr;
     extra_uses.clear();
     set_pool.reset();
+    if (texture_slots_cleaned_epoch != impl.texture_epoch) {
+        for (TextureSlot& slot : texture_slots) {
+            if (slot.texture && !slot.texture->live) {
+                slot = {};
+            }
+        }
+        texture_slots_cleaned_epoch = impl.texture_epoch;
+    }
 }
 
-void DrawContext::OnSegmentBegin() {
+void DrawContext::OnSegmentBegin(bool keep_shadows) {
     pass_open = false;
     pass_shader_writes = false;
     pass_buffer_writes = false;
@@ -165,7 +174,9 @@ void DrawContext::OnSegmentBegin() {
     pipeline_dirty = true;
     vertex_dirty = true;
     dynamic_dirty = ~0u;
-    shadows.clear();
+    if (!keep_shadows) {
+        shadows.clear();
+    }
     staged_vertex.clear();
     stage_covered_end = nullptr;
     bound_pipeline = VK_NULL_HANDLE;
@@ -767,7 +778,7 @@ void DrawContext::SetRenderTargets(const VC::RecordHeader* header) {
         if (ref.texture.serial != 0) {
             if (const auto it = impl.textures.find(ref.texture.serial); it != impl.textures.end()) {
                 binding.texture = it->second;
-                impl.NoteUse(ref.texture.serial, host->HostFlight().seq);
+                impl.NoteUse(*it->second, host->HostFlight().seq);
                 // A block view of a compressed texture renders into its alias (whole blocks).
                 if (std::shared_ptr<Texture> alias = impl.TargetAlias(*it->second, binding.ref)) {
                     binding.texture = std::move(alias);
@@ -1214,7 +1225,7 @@ bool DrawContext::BeginPass() {
         }
         if (attachment.storage->scale_owner == nullptr) {
             // (A twin has no entry of its own: the game's texture was noted at SetRenderTargets.)
-            impl.NoteUse(attachment.texture->serial, host->HostFlight().seq);
+            impl.NoteUse(*attachment.texture, host->HostFlight().seq);
         }
     }
 
@@ -1792,11 +1803,7 @@ VtxCov DrawContext::VtxCovServeOrMiss(BufferRef& ref, u64 address, u64 size, boo
                 impl.stats.vram_bindings.fetch_add(1, std::memory_order_relaxed);
                 return VtxCov::MirrorBind;
             }
-            mirror->prefetch = true;
-            if (!mirror->wanted) {
-                mirror->wanted = std::make_unique<MirrorPages>(pool.size);
-            }
-            mirror->wanted->Set(ref.pool_offset, size);
+            impl.MirrorMarkPrefetch(pool, ref.pool_offset, size);
             return VtxCov::MirrorStale;
         }
     }
@@ -2054,13 +2061,36 @@ std::optional<RenderPassKey> DrawContext::LookaheadPassKey(const VC::RecordHeade
     return key;
 }
 
+bool DrawContext::QueriesValidFor(const GraphicsPipeline& candidate,
+                                  const std::array<u64, BIND_STAGES>& cached_gen,
+                                  u64 cached_sub_seq, u64 cached_tex_epoch) const noexcept {
+    if (candidate.queries.empty()) {
+        return true;
+    }
+    if (!candidate.queries_handle_bank_only || submission == nullptr ||
+        cached_sub_seq != submission->seq || cached_tex_epoch != impl.texture_change_epoch) {
+        return false;
+    }
+    u32 mask = candidate.query_stage_mask;
+    while (mask != 0) {
+        const u32 stage = static_cast<u32>(std::countr_zero(mask));
+        mask &= mask - 1;
+        if (cached_gen[stage] != handle_gen[stage]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 element_count,
     bool& awaiting_async, const PipelineLookahead* lookahead) {
     const u64 generation = resources.Cache().ShaderGeneration();
     if (!lookahead && shader_generation != generation) {
         pipeline.reset();
-        pipeline_memo = {};
-        pipeline_memo_next = 0;
+        for (PipelineMemo& memo : pipeline_memo) {
+            memo.pipeline.reset();
+        }
+        query_cache = {};
         pipeline_dirty = true;
         bound_pipeline = VK_NULL_HANDLE;
         bound_state.Reset();
@@ -2068,8 +2098,27 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
         shader_generation = generation;
     }
     const DrawOracle oracle{*this};
+    const u64 sub_seq = submission != nullptr ? submission->seq : ~u64{0};
+    const u64 tex_epoch = impl.texture_change_epoch;
+    const auto queries_ok = [&](const GraphicsPipeline& candidate,
+                                std::array<u64, BIND_STAGES>& cached_gen, u64& cached_sub_seq,
+                                u64& cached_tex_epoch) {
+        if (QueriesValidFor(candidate, cached_gen, cached_sub_seq, cached_tex_epoch)) {
+            return true;
+        }
+        if (!candidate.QueriesMatch(oracle)) {
+            return false;
+        }
+        if (!lookahead) {
+            cached_gen = handle_gen;
+            cached_sub_seq = sub_seq;
+            cached_tex_epoch = tex_epoch;
+        }
+        return true;
+    };
     if (!lookahead && !pipeline_dirty && pipeline && mode == last_mode &&
-        pipeline->QueriesMatch(oracle)) {
+        queries_ok(*pipeline, query_cache.handle_gen, query_cache.sub_seq,
+                   query_cache.tex_epoch)) {
         ++counters.pipeline_state_reuses;
         return pipeline;
     }
@@ -2104,19 +2153,34 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
     for (u32 stage = 0; stage < GRAPHICS_STAGE_COUNT; ++stage) {
         programs[stage] = ((stage_mask >> stage) & 1) != 0 ? stages[stage].program_serial : 0;
     }
-    size_t memo_slot = pipeline_memo.size();
-    for (size_t i = 0; !lookahead && i < pipeline_memo.size(); ++i) {
-        const PipelineMemo& memo = pipeline_memo[i];
+    u64 memo_hash = programs[0] ^ (programs[1] * 0x9e3779b97f4a7c15ULL);
+    memo_hash ^= programs[2] * 0xbf58476d1ce4e5b9ULL;
+    memo_hash ^= programs[STAGE_TASK] * 0x517cc1b727220a95ULL;
+    memo_hash ^= programs[7] * 0x94d049bb133111ebULL;
+    memo_hash ^= (static_cast<u64>(static_cast<u32>(targets.color[0])) |
+                  (static_cast<u64>(static_cast<u32>(targets.color[1])) << 32)) *
+                 0xd6e8feb86659fd93ULL;
+    memo_hash ^= (static_cast<u64>(static_cast<u32>(targets.depth)) |
+                  (static_cast<u64>(targets.samples) << 32)) *
+                 0xa0761d6478bd642fULL;
+    memo_hash ^= (static_cast<u64>(input.topology) | (static_cast<u64>(input.polygon) << 32)) *
+                 0xe7037ed1a0b428dbULL;
+    memo_hash ^= (static_cast<u64>(input.color) | (static_cast<u64>(input.depth_stencil) << 32)) *
+                 0x8ebc6af09c88c6e3ULL;
+    memo_hash *= 0x9e3779b97f4a7c15ULL;
+    const size_t memo_slot = static_cast<size_t>(memo_hash >> 54);
+    if (!lookahead) {
+        PipelineMemo& memo = pipeline_memo[memo_slot];
         if (memo.pipeline && memo.programs == programs && memo.targets == targets &&
             std::memcmp(&memo.state, &input, sizeof(input)) == 0) {
-            if (memo.pipeline->QueriesMatch(oracle)) {
+            if (queries_ok(*memo.pipeline, memo.query_handle_gen, memo.query_sub_seq,
+                           memo.query_tex_epoch)) {
                 pipeline = memo.pipeline;
                 last_mode = mode;
                 pipeline_dirty = false;
+                query_cache = {memo.query_sub_seq, memo.query_tex_epoch, memo.query_handle_gen};
                 return pipeline;
             }
-            memo_slot = i; // the textures changed type: the lookup below may find another variant
-            break;
         }
     }
     GraphicsRequest request;
@@ -2178,15 +2242,16 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
     pipeline = result;
     last_mode = mode;
     pipeline_dirty = false;
+    query_cache = {sub_seq, tex_epoch, handle_gen};
     if (memoizable) {
-        if (memo_slot == pipeline_memo.size()) {
-            memo_slot = pipeline_memo_next++ % pipeline_memo.size();
-        }
         PipelineMemo& memo = pipeline_memo[memo_slot];
         memo.programs = programs;
         memo.state = input;
         memo.targets = targets;
         memo.pipeline = result;
+        memo.query_handle_gen = handle_gen;
+        memo.query_sub_seq = sub_seq;
+        memo.query_tex_epoch = tex_epoch;
     }
     return result;
 }
@@ -2454,20 +2519,37 @@ std::optional<u32> DrawContext::ReadUniformWord(u32 stage, u32 slot, u32 byte_of
         return std::nullopt;
     }
     const u64 address = binding.address + byte_offset;
-    for (auto it = inline_updates.rbegin(); it != inline_updates.rend(); ++it) {
-        if (address >= it->address && address + sizeof(u32) <= it->address + it->size) {
-            u32 value;
-            std::memcpy(&value, it->data + (address - it->address), sizeof(value));
-            return value;
+    if (!inline_updates.empty()) {
+        for (auto it = inline_updates.rbegin(); it != inline_updates.rend(); ++it) {
+            if (address >= it->address && address + sizeof(u32) <= it->address + it->size) {
+                u32 value;
+                std::memcpy(&value, it->data + (address - it->address), sizeof(value));
+                return value;
+            }
         }
     }
     u32 value = 0;
-    if (ReadSnapshotBytes(address, &value, sizeof(value))) {
+    if (usnap.Active() && ReadSnapshotBytes(address, &value, sizeof(value))) {
         return value;
     }
-    VC::GuestMemory* memory = impl.guest.load(std::memory_order_acquire);
-    if (!memory || !memory->Read(address, &value, sizeof(value))) {
-        return std::nullopt;
+    bool read_ok = false;
+    const CachedBuffer& cached = uniform_cache[stage][slot];
+    if (cached.ref.pool != nullptr && cached.address == binding.address &&
+        cached.binding_size == binding.size && byte_offset + sizeof(u32) <= cached.ref.range &&
+        cached.pool_gen == impl.pool_generation.load(std::memory_order_acquire) &&
+        cached.mapping_gen == impl.mkw_mapping_generation) {
+        const Pool* const pool = cached.ref.pool;
+        if (!pool->pending.load(std::memory_order_acquire) && pool->host != nullptr &&
+            cached.ref.pool_offset + byte_offset + sizeof(u32) <= pool->size) {
+            std::memcpy(&value, pool->host + cached.ref.pool_offset + byte_offset, sizeof(value));
+            read_ok = true;
+        }
+    }
+    if (!read_ok) {
+        VC::GuestMemory* memory = impl.guest.load(std::memory_order_acquire);
+        if (!memory || !memory->Read(address, &value, sizeof(value))) {
+            return std::nullopt;
+        }
     }
     if (host != nullptr) {
         impl.ApplyPendingInlineWrites(address, reinterpret_cast<u8*>(&value), sizeof(value),

@@ -80,16 +80,22 @@ struct UniformSnapshotPool {
     u64 end{};
     u64 track_id{};
     bool track_tried{};
+    std::shared_ptr<const std::atomic<u64>> write_epoch;
+    u64 epoch_clean{};
 };
 /// Guest VA of the storage -> pool. Owned by the recorder, under its sink mutex.
 using UniformSnapshotPools = std::map<u64, UniformSnapshotPool>;
 
+struct UniformSnapshotPageState {
+    u64 written{}; ///< 1 + present count when last seen CPU-written; 0 = armed, not seen written
+    u64 checked{}; ///< 1 + present count when last checked via TakeWritten
+};
+
 /// The guest CPU's writes to the pages of uniform bindings. Owned by the recorder, under its sink
 /// mutex.
 struct UniformSnapshotCpuPages {
-    /// Page index -> 1 + the present count when a capture last found it written; 0 = armed, not
-    /// seen written yet. A page without an entry is not armed.
-    std::unordered_map<u64, u64> written;
+    /// Page index -> written/checked timestamps. A page without an entry is not armed.
+    std::unordered_map<u64, UniformSnapshotPageState> written;
     /// Presents so far (QueuePresentTexture).
     u64 presents{};
 };

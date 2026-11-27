@@ -21,6 +21,7 @@
 
 namespace FileSys {
 class ExternalContentProvider;
+class ManualContentProvider;
 class CNMT;
 class NCA;
 class NSP;
@@ -219,6 +220,7 @@ private:
 };
 
 enum class ContentProviderUnionSlot {
+    GameArchive,    ///< Content bundled with the selected game archive
     SysNAND,        ///< System NAND
     UserNAND,       ///< User NAND
     SDMC,           ///< SD Card
@@ -233,6 +235,9 @@ public:
     ~ContentProviderUnion() override;
 
     void SetSlot(ContentProviderUnionSlot slot, ContentProvider* provider);
+    void SetGameArchive(std::shared_ptr<ManualContentProvider> provider);
+    [[nodiscard]] ContentProviderUnion WithGameArchive(
+        std::shared_ptr<ManualContentProvider> provider) const;
     void Refresh() override;
     bool HasEntry(u64 title_id, ContentRecordType type) const override;
     std::optional<u32> GetEntryVersion(u64 title_id) const override;
@@ -255,7 +260,8 @@ public:
 
     std::optional<ContentProviderUnionSlot> GetSlotForEntry(u64 title_id, ContentRecordType type) const;
 private:
-    std::array<ContentProvider*, size_t(ContentProviderUnionSlot::Count)> providers;
+    std::array<ContentProvider*, size_t(ContentProviderUnionSlot::Count)> providers{};
+    std::shared_ptr<ManualContentProvider> game_archive;
 };
 
 class ManualContentProvider : public ContentProvider {

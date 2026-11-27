@@ -654,16 +654,19 @@ Id DescType(EmitContext& ctx, Id sampled_type, Id pointer_type, u32 count) {
 // The global memory helpers are kept as calls (DontInline) and route with one switch. Inlined at
 // each of their calls, a program with ~30 candidate buffers took NVIDIA's compiler 2.4 s
 // (Ocarina's foliage compute programs; 0.6 s as calls), and Ocarina's market ran at ~45 instead
-// of ~58 FPS on an RTX 4070 SUPER. Task and mesh programs keep them inlined: as calls, the first
-// of two consecutive loads in Ocarina's tree task program returned 0 on NVIDIA, so every tree
-// cell drew its 256-record cap (a wall of trees in Hyrule Field). EDEN_NX2_LEAN_SSBO=0/1 forces
-// inlined/calls for every stage.
+// of ~58 FPS on an RTX 4070 SUPER. Task programs keep them inlined: as calls, the first of two
+// consecutive loads in Ocarina's tree task program returned 0 on NVIDIA (valid SPIR-V; also with a
+// single return), so every tree cell drew its 256-record cap (a wall of trees in Hyrule Field).
+// Mesh programs are fine as calls and carry the compile time: inlined, Ocarina's mesh pipelines
+// took 1-2.5 s each on NVIDIA and stalled draws that cannot be skipped (102 s for its 1,068
+// task/mesh pipelines, 42 s with calls). EDEN_NX2_LEAN_SSBO=0/1 forces inlined/calls for every
+// stage.
 bool LeanGlobalMemory(Stage stage) {
     static const char* const forced = std::getenv("EDEN_NX2_LEAN_SSBO");
     if (forced != nullptr) {
         return forced[0] != '0';
     }
-    return stage != Stage::Task && stage != Stage::Mesh;
+    return stage != Stage::Task;
 }
 } // Anonymous namespace
 
@@ -2553,7 +2556,8 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         layer = DefineInput(*this, U32[1], false, spv::BuiltIn::Layer);
         Decorate(layer, spv::Decoration::Flat);
     }
-    if (loads.AnyComponent(IR::Attribute::PositionX)) {
+    if (loads.AnyComponent(IR::Attribute::PositionX) ||
+        (stage == Stage::Fragment && runtime_info.screen_linear_generics.any())) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;
@@ -2641,6 +2645,11 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         const bool is_integer = input_type == AttributeType::SignedInt ||
                                 input_type == AttributeType::UnsignedInt;
         if (runtime_info.per_primitive_generics.test(index)) {
+            if (runtime_info.mesh_as_compute) {
+                // Mesh emulation outputs per-primitive attributes per vertex in a vertex shader.
+                Decorate(id, spv::Decoration::Flat);
+                continue;
+            }
             // Written per primitive by a mesh program: constant over the primitive.
             AddExtension("SPV_EXT_mesh_shader");
             AddCapability(spv::Capability::MeshShadingEXT);
@@ -2657,7 +2666,9 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             case Interpolation::Smooth:
                 break;
             case Interpolation::NoPerspective:
-                Decorate(id, spv::Decoration::NoPerspective);
+                if (!runtime_info.screen_linear_generics.test(index)) {
+                    Decorate(id, spv::Decoration::NoPerspective);
+                }
                 break;
             case Interpolation::Flat:
                 Decorate(id, spv::Decoration::Flat);

@@ -348,6 +348,35 @@ TEST_CASE("Debug control hands GPU reads to the rasterizer once", "[core][nx2_de
     VideoCore::Nx2Debug::EndSession();
 }
 
+TEST_CASE("Debug control delivers ASTC fusion requests in order", "[core][nx2_debug_server]") {
+    using namespace VideoCore::Nx2Debug;
+    BeginSession();
+    auto disable = RequestAstcFusion(false);
+    auto query = RequestAstcFusion(std::nullopt);
+    REQUIRE(HasRequests());
+    auto request = TakeAstcFusion();
+    REQUIRE(request);
+    REQUIRE(request->enable == false);
+    request->result.set_value({.supported = true, .enabled = false, .marked_for_refresh = 6});
+    REQUIRE(disable.wait_for(1ms) == std::future_status::ready);
+    REQUIRE(disable.get().marked_for_refresh == 6);
+
+    REQUIRE(HasRequests());
+    request = TakeAstcFusion();
+    REQUIRE(request);
+    REQUIRE_FALSE(request->enable.has_value());
+    request->result.set_value({.supported = true, .enabled = false, .marked_for_refresh = 0});
+    REQUIRE(query.wait_for(1ms) == std::future_status::ready);
+    REQUIRE_FALSE(query.get().enabled);
+    REQUIRE_FALSE(HasRequests());
+
+    auto pending = RequestAstcFusion(true);
+    EndSession();
+    REQUIRE_FALSE(HasRequests());
+    REQUIRE(pending.wait_for(1ms) == std::future_status::ready);
+    REQUIRE_THROWS_AS(pending.get(), std::future_error);
+}
+
 TEST_CASE("Debug server tells a waiting handler that its client left", "[core][nx2_debug_server]") {
     std::atomic<bool> noticed{};
     Handlers handlers{{"wait", [&noticed](const json&, const ClientGone& client_gone) -> json {

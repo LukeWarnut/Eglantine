@@ -247,8 +247,8 @@ void DecodeBlocks(const HostFormat& host, const BlockInfo& block, std::span<cons
 /// EDEN_NX2_NVN_DUMP_ASTC=<dir>: the base level of every decoded ASTC texture of at least 256
 /// texels (TGA, at most 96 files), named by size, format and order, to look at what the decoder
 /// produced.
-void DumpDecodedLevel(const Storage& s, const UploadPlan& plan, const UploadPiece& piece,
-                      const u8* rgba) {
+static void DumpDecodedLevel(const Storage& s, const UploadPlan& plan, const UploadPiece& piece,
+                             const u8* rgba) {
     static const char* const directory = std::getenv("EDEN_NX2_NVN_DUMP_ASTC");
     static std::atomic<u32> written{0};
     if (directory == nullptr || *directory == 0 || plan.decode != UploadPlan::Decode::Astc ||

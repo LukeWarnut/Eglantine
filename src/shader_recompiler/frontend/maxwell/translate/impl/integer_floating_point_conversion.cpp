@@ -148,7 +148,7 @@ void TranslatorVisitor::I2F_reg(u64 insn) {
             u64 raw;
             BitField<20, 8, IR::Reg> reg;
         } const value{insn};
-        const IR::Value regs{ir.CompositeConstruct(ir.GetReg(value.reg), ir.GetReg(value.reg + 1))};
+        const IR::Value regs{ir.CompositeConstruct(X(value.reg), X(value.reg + 1))};
         I2F(*this, insn, ir.PackUint2x32(regs));
     } else {
         I2F(*this, insn, GetReg20(insn));

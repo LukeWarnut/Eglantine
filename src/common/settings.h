@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -693,7 +694,14 @@ struct Values {
                                                        "mesh_shader_mode",
                                                        Category::RendererAdvanced};
 
-    // Linux: the GPU driver's shader cache in a folder of our own (ConfigureDriverShaderCache),
+    // VK_EXT_graphics_pipeline_library: graphics pipelines that share shaders link library
+    // parts compiled once (vk_pipeline_library). Off while it is measured; EDEN_NX2_GPL=0/1
+    // overrides it. Applied when the Vulkan device is created (game start).
+    SwitchableSetting<bool> graphics_pipeline_library{linkage, false, "graphics_pipeline_library",
+                                                      Category::RendererAdvanced};
+
+    // Linux: the NVIDIA or Mesa driver's shader cache in a folder of our own
+    // (ConfigureDriverShaderCache),
     // with its size limit in GiB. Applied at startup, before anything loads a driver.
     Setting<bool> private_driver_shader_cache{linkage, true, "private_driver_shader_cache",
                                               Category::RendererAdvanced, Specialization::Paired};
@@ -733,6 +741,8 @@ struct Values {
     SwitchableSetting<bool> hyrule_dynamic_fps{linkage, false, "hyrule_dynamic_fps",
                                                Category::RendererAdvanced};
     SwitchableSetting<bool> hyrule_30fps{linkage, false, "hyrule_30fps", Category::RendererAdvanced};
+    SwitchableSetting<bool> yoshi_sync_movie_submits{
+        linkage, true, "yoshi_sync_movie_submits", Category::RendererAdvanced};
 
     SwitchableSetting<bool> use_reactive_flushing{linkage,
 #ifdef __ANDROID__
@@ -896,7 +906,7 @@ struct Values {
                                     linkage, 0,    "rng_seed",       Category::System, Specialization::Hex,
                                     true,    true, &rng_seed_enabled};
     Setting<std::string> device_name{
-        linkage, "Eden", "device_name", Category::System, Specialization::Default, true, true};
+        linkage, "Eglantine", "device_name", Category::System, Specialization::Default, true, true};
 
     Setting<s32> current_user{linkage, 0, "current_user", Category::System};
 
@@ -936,6 +946,69 @@ struct Values {
                                               Category::Controls};
     SwitchableSetting<bool> enable_accurate_vibrations{linkage, false, "enable_accurate_vibrations",
                                                        Category::Controls};
+
+    // RenHDrum HD Rumble (Switch Pro Controller / Joy-Con) and DualSense haptics. Defaults are
+    // Ryuhdr 0.2.6's recommended mode. Read by the SDL driver on every vibration, so a change in
+    // the HD Rumble dialog applies to connected controllers right away.
+    Setting<bool> hd_rumble_enabled{linkage, true, "hd_rumble_enabled", Category::Controls};
+    // Switch 2 rumble Mode last sent by the guest (commands 213 / 214): 2 = Mode 2, anything else
+    // is played as Switch 1. Written by the HID service, read by the RenHDrum pad driver. Not a
+    // user setting and not saved.
+    std::atomic<int> nx2_active_mode{0};
+    // Set by the input layer when the RenHDrum library is actually loaded; never saved. HD Rumble
+    // can be enabled in the config with no library next to the emulator, in which case the standard
+    // rumble runs and the 15 ms packet filter has to stay in place.
+    Setting<bool> renhdrum_available{linkage, false, "renhdrum_available", Category::Controls,
+                                     Specialization::Default, false};
+    // Amplitude gain in percent for everything RenHDrum plays. Switchable: some Switch 2 games
+    // (Ocarina of Time) send amplitudes below 0.1 that the Joy-Con 2 still plays strongly.
+    SwitchableSetting<int> hd_rumble_gain{linkage, 100, "hd_rumble_gain", Category::Controls};
+    // 0-100: lifts weak vibrations more than strong ones (power curve after the gain).
+    SwitchableSetting<int> hd_rumble_low_boost{linkage, 0, "hd_rumble_low_boost",
+                                               Category::Controls};
+    Setting<int> hd_rumble_usb_interval_ms{linkage, 15, "hd_rumble_usb_interval_ms", Category::Controls};
+    Setting<bool> hd_rumble_envelope_5ms{linkage, true, "hd_rumble_envelope_5ms",
+                                         Category::Controls};
+    Setting<bool> hd_rumble_frequency_in_packet{linkage, true, "hd_rumble_frequency_in_packet",
+                                                Category::Controls};
+    Setting<bool> hd_rumble_crisp_notes{linkage, true, "hd_rumble_crisp_notes",
+                                        Category::Controls};
+    Setting<int> hd_rumble_bluetooth_level{linkage, 3, "hd_rumble_bluetooth_level", Category::Controls};
+    Setting<bool> hd_rumble_bt_after_input{linkage, true, "hd_rumble_bt_after_input",
+                                           Category::Controls};
+    Setting<bool> hd_rumble_bt_fast{linkage, true, "hd_rumble_bt_fast", Category::Controls};
+    Setting<bool> hd_rumble_bt_crisp_notes{linkage, true, "hd_rumble_bt_crisp_notes",
+                                           Category::Controls};
+    // RenHDrum 0.5.0 options-table rows that had no Eglantine setting yet.
+    // Bluetooth basic mode: 0 = Detailed (5 ms envelope), 1 = Compatible (plain, every adapter).
+    Setting<int> hd_rumble_bt_mode{linkage, 0, "hd_rumble_bt_mode", Category::Controls};
+    // Transport switches. usb_no_queue and auto_slow only bite with the patched SDL transport;
+    // with stock SDL the driver clears them, as it already does for the transport modes.
+    Setting<bool> hd_rumble_usb_no_queue{linkage, true, "hd_rumble_usb_no_queue",
+                                         Category::Controls};
+    Setting<bool> hd_rumble_frequency_both_bands{linkage, true, "hd_rumble_frequency_both_bands",
+                                                 Category::Controls};
+    Setting<bool> hd_rumble_usb_auto_slow{linkage, true, "hd_rumble_usb_auto_slow",
+                                          Category::Controls};
+    // RenHDrum 0.5.0 HD Haptics: the controller speaker and the L2/R2 trigger kick react to the
+    // rumble. Host-side only: the speaker and trigger blocks are sent by the pad driver.
+    Setting<bool> dualsense_hd_haptics{linkage, true, "dualsense_hd_haptics", Category::Controls};
+    Setting<int> dualsense_speaker_volume{linkage, 60, "dualsense_speaker_volume",
+                                          Category::Controls};
+    Setting<bool> dualsense_haptics_enabled{linkage, true, "dualsense_haptics_enabled",
+                                            Category::Controls};
+    Setting<int> dualsense_haptics_volume{linkage, 100, "dualsense_haptics_volume", Category::Controls};
+    Setting<bool> dualsense_crisp_notes{linkage, true, "dualsense_crisp_notes",
+                                        Category::Controls};
+    Setting<bool> xbox_rumble_enabled{linkage, true, "xbox_rumble_enabled", Category::Controls};
+    Setting<int> xbox_motor_strength{linkage, 100, "xbox_motor_strength", Category::Controls};
+    // 0: RenHDrum's four-motor mix, 1: direct (low band to the big motor, high band to the small)
+    Setting<int> xbox_rumble_mode{linkage, 0, "xbox_rumble_mode", Category::Controls};
+    // Direct mode: share of the high band added to the big motor, and the kick on a sudden rise
+    Setting<int> xbox_detail_mix{linkage, 50, "xbox_detail_mix", Category::Controls};
+    Setting<int> xbox_hit_accents{linkage, 50, "xbox_hit_accents", Category::Controls};
+    // Direct mode: share of the high band sent to the trigger motors (left side LT, right RT)
+    Setting<int> xbox_trigger_mix{linkage, 20, "xbox_trigger_mix", Category::Controls};
 
     SwitchableSetting<bool> motion_enabled{linkage, true, "motion_enabled", Category::Controls};
     Setting<std::string> udp_input_servers{linkage, "127.0.0.1:26760", "udp_input_servers",

@@ -14,7 +14,10 @@
 #include <vector>
 #include "common/container/unordered_map.h"
 
+#include <span>
+
 #include "common/common_types.h"
+#include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/shader_info.h"
 #include "shader_recompiler/stage.h"
@@ -106,6 +109,13 @@ public:
     /// raw 8-byte arguments in constant buffers, without the NVN descriptor layout.
     [[nodiscard]] virtual bool IsNativeProgram() const { return false; }
 
+    /// Native programs: the register remaps of the lowered code (Ampere::NativeRegisterRemap),
+    /// ordered by address. An environment holding lowered code must return them, or the
+    /// translator reads the low quartets themselves.
+    [[nodiscard]] virtual std::span<const Ampere::NativeRegisterRemap> NativeRegisterRemaps() const {
+        return {};
+    }
+
     /// Native programs: whether the 8-byte constant at (index, offset) is a mapped GPU address.
     /// Native argument tables mix pointers with scalars (sizes, strides).
     [[nodiscard]] virtual bool IsCbufStorageBufferPointer(u32, u32) { return true; }
@@ -118,6 +128,12 @@ public:
 
     /// Native programs: (index, offset) slots classified as non-pointers because they were null.
     [[nodiscard]] virtual std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const {
+        return {};
+    }
+
+    /// Native programs: pointer-table entries classified as non-pointers because they were not
+    /// mapped, as the keys of their classification.
+    [[nodiscard]] virtual std::vector<u64> UnmappedStoragePointerTableKeys() const {
         return {};
     }
 

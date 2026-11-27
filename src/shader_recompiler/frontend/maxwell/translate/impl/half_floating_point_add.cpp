@@ -47,7 +47,7 @@ void HADD2(TranslatorVisitor& v, u64 insn, Merge merge, bool ftz, bool sat, bool
         lhs = v.ir.FPConvert(16, lhs);
         rhs = v.ir.FPConvert(16, rhs);
     }
-    v.X(hadd2.dest_reg, MergeResult(v.ir, hadd2.dest_reg, lhs, rhs, merge));
+    v.X(hadd2.dest_reg, MergeResult(v, hadd2.dest_reg, lhs, rhs, merge));
 }
 
 void HADD2(TranslatorVisitor& v, u64 insn, bool sat, bool abs_b, bool neg_b, Swizzle swizzle_b,

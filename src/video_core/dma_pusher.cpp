@@ -217,8 +217,33 @@ bool DmaPusher::Step() {
                     LOG_DEBUG(HW_GPU, "  previous entry ends {:08x}; next entry starts {:08x}",
                               fmt::join(prev_words, " "), fmt::join(next_words, " "));
                 }
-                if (park_split_methods) {
-                    ResolveSplitMethod(header.addr);
+                // Without the variable, an entry elsewhere is still a call when the split method
+                // is a register write (not a macro), the entry cannot be its rest, and the rest
+                // comes later in this submission right where the split entry ended: the call of
+                // #926 (OoT on Intel, method 0x4c7) was 6 words against 4 left. Macro parameters
+                // do stream through entries elsewhere: title 4's 5-word subroutine entry, and
+                // MKW's macro 0xe59, whose 381 words come in 1-, 5- and 24-word entries.
+                const bool park_call =
+                    park_split_methods ||
+                    (dma_state.method_count != 0 && dma_state.method < MacroRegistersStart &&
+                     header.addr != split_method_end &&
+                     header.size != dma_state.method_count &&
+                     SplitResumesLater(command_list, dma_pushbuffer_subindex + 1));
+                if (park_call) {
+                    if (!park_split_methods) {
+                        static std::atomic<u32> reported{};
+                        if (reported.fetch_add(1) < 8) {
+                            LOG_INFO(HW_GPU,
+                                     "Split method {:#x} ({} left) on ch {}: entry {:#x}+{} is a "
+                                     "call, the method resumes at {:#x}",
+                                     dma_state.method, dma_state.method_count,
+                                     channel_state.bind_id, u64{header.addr}, u64{header.size},
+                                     split_method_end);
+                        }
+                    }
+                    ResolveSplitMethod(header.addr, true);
+                } else if (!parked_methods.empty()) {
+                    ResolveSplitMethod(header.addr, false);
                 }
             }
             if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
@@ -762,7 +787,7 @@ void DmaPusher::VerifyFrontRun(Engines::Maxwell3D& maxwell3d,
 // buffer (e.g. a compute dispatch) before the entry that carries the rest, which starts right
 // where the first one ended. An entry starting anywhere else is such a call: run it with a clean
 // method state and resume the unfinished method when the stream continues at that address.
-void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address, bool park) {
     const auto continued = std::ranges::find(parked_methods, entry_address,
                                              &ParkedMethod::resume_address);
     std::optional<ParkedMethod> resume;
@@ -770,7 +795,7 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
         resume = *continued;
         parked_methods.erase(continued);
     }
-    if (dma_state.method_count != 0 && entry_address != split_method_end) {
+    if (park && dma_state.method_count != 0 && entry_address != split_method_end) {
         if (parked_methods.size() == MaxParkedMethods) {
             static std::atomic<u32> reported{};
             if (reported.fetch_add(1) < 8) {
@@ -800,6 +825,15 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
         dma_state.non_incrementing = resume->non_incrementing;
         dma_increment_once = resume->increment_once;
     }
+}
+
+bool DmaPusher::SplitResumesLater(const CommandList& list, size_t from) const {
+    for (size_t i = from; i < list.command_lists.size(); ++i) {
+        if (list.command_lists[i].size > 0 && list.command_lists[i].addr == split_method_end) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void DmaPusher::SetState(const CommandHeader& command_header) {

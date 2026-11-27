@@ -46,6 +46,7 @@
 #include <QFuture>
 #include <QFutureWatcher>
 #include "frontend_common/update_checker.h"
+#include "updater/tester_build_monitor.h"
 #endif
 
 class QtConfig;
@@ -62,6 +63,7 @@ class QPushButton;
 class QProgressDialog;
 class NupProgressDialog;
 class ShaderWarmDialog;
+class NxTools;
 class QSlider;
 class QHBoxLayout;
 class WaitTreeWidget;
@@ -465,10 +467,12 @@ private slots:
 #ifdef ENABLE_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
     void OnCheckForUpdates();
+    void OnVersionManager();
 #endif
 
 private:
     void OpenConfigureDialog(bool select_profiles);
+    bool PrepareNxWrite();
     void RemovePlayTimeData(u64 program_id);
     bool SelectRomFSDumpTarget(const FileSys::ContentProvider&, u64 program_id,
                                u64* selected_title_id, u8* selected_content_record_type);
@@ -530,6 +534,8 @@ private:
     bool update_check_running{};
     // Set when the user asked for the check, so the result is always reported
     bool update_check_manual{};
+    // Only inside a tester build, which follows a branch or pull request instead of releases
+    std::unique_ptr<TesterBuildMonitor> tester_monitor;
 #endif
 
     MultiplayerState* multiplayer_state = nullptr;
@@ -581,6 +587,7 @@ private:
     bool emulation_running = false;
     bool boot_in_progress = false;
     bool close_pending = false;
+    bool close_confirming = false;
 
     /// Starts the built-in MCP server if enabled by setting or command line (no-op without it).
     void MaybeStartMcpServer(bool cli_enable, std::optional<u16> cli_port, bool cli_allow_writes);
@@ -660,6 +667,8 @@ private:
     std::shared_ptr<std::atomic_bool> nup_cancel;
     bool nup_running{};
     QPointer<ShaderWarmDialog> shader_warm_dialog;
+    NxTools* nx_tools = nullptr;
+    bool nx_write_in_progress = false;
     std::string nup_source_path;
 
     // Last game booted, used for multi-process apps

@@ -269,3 +269,28 @@ TEST_CASE("Built-in Max Resolution patch is listed and loaded for Ocarina's main
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution}};
     REQUIRE_FALSE(builtin_enabled());
 }
+
+TEST_CASE("Add-on content packed with a game is listed as one DLC entry", "[patch_manager]") {
+    PatchManagerTestContext context;
+    const std::vector<std::pair<u64, u32>> packed{{0x0100ABCD00011001ULL, 65536},
+                                                 {0x0100ABCD00011002ULL, 1}};
+
+    SECTION("Listed with the packed source and the DLC index list") {
+        const auto patches = context.Manager().GetPatches(nullptr, packed);
+        const auto it = std::ranges::find(patches, "DLC", &FileSys::Patch::name);
+        REQUIRE(it != patches.end());
+        REQUIRE(it->type == FileSys::PatchType::DLC);
+        REQUIRE(it->source == FileSys::PatchSource::Packed);
+        REQUIRE(it->title_id == 0x0100ABCD00011002ULL);
+        REQUIRE(it->version == "1, 2");
+        REQUIRE(it->enabled);
+    }
+
+    SECTION("The DLC toggle key the aoc:u service honours disables it") {
+        Settings::values.disabled_addons[OcarinaTitleId] = {std::string{"DLC"}};
+        const auto patches = context.Manager().GetPatches(nullptr, packed);
+        const auto it = std::ranges::find(patches, "DLC", &FileSys::Patch::name);
+        REQUIRE(it != patches.end());
+        REQUIRE_FALSE(it->enabled);
+    }
+}

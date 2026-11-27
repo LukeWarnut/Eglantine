@@ -78,14 +78,17 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
             R_SUCCEED();
         case InfoType::Nx2RegionAddress:
         case InfoType::Nx2RegionSize: {
-            // Looks like the region Switch 2 VAMM reserves address space in (a title asks for a
-            // ~7.5 GiB reservation). VAMM backs it with MapPhysicalMemory, which only works in
-            // the alias region here, so hand out the upper half of the alias region.
+            // Looks like the region Switch 2 VAMM reserves address space in (titles ask for
+            // 7.5 to 60 GiB). VAMM backs it with MapPhysicalMemory, which only works in the
+            // alias region here, so hand out everything above the lower half of the base alias
+            // region, including the extra alias space Switch 2 processes get.
             auto& page_table = process->GetPageTable();
-            const u64 half = page_table.GetAliasRegionSize() / 2;
+            const u64 base_size =
+                page_table.GetAliasRegionSize() - page_table.GetAliasRegionExtraSize();
+            const u64 offset = base_size / 2;
             *result = info_id_type == InfoType::Nx2RegionAddress
-                          ? GetInteger(page_table.GetAliasRegionStart()) + half
-                          : half;
+                          ? GetInteger(page_table.GetAliasRegionStart()) + offset
+                          : page_table.GetAliasRegionSize() - offset;
             LOG_WARNING(Kernel_SVC, "(STUBBED) Switch 2 InfoType {}, returning {:#x}",
                         static_cast<u32>(info_id_type), *result);
             R_SUCCEED();
@@ -157,7 +160,10 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
         case InfoType::AliasRegionExtraSize: {
             R_UNLESS(info_sub_id == 0, ResultInvalidCombination);
             KProcess* current_process = GetCurrentProcessPointer(system.Kernel());
-            *result = current_process->GetPageTable().GetAliasRegionExtraSize();
+            // On Switch 2 the extra alias space is the VAMM region (ids 29/30), not the SDK's.
+            *result = current_process->IsSwitch2()
+                          ? 0
+                          : current_process->GetPageTable().GetAliasRegionExtraSize();
             R_SUCCEED();
         }
         default:

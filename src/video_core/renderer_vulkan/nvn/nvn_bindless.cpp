@@ -168,7 +168,9 @@ bool DrawContext::BindlessReady() {
             const VkImageView dummy =
                 resources.DummyView(BindlessViewType(TypeOfBinding(binding)));
             state.dummy[binding] = dummy;
-            state.written[binding].assign(Shader::BINDLESS_TEXTURE_CAPACITY, dummy);
+            state.written[binding].assign(
+                Shader::BINDLESS_TEXTURE_CAPACITY,
+                BindlessState::WrittenEntry{dummy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
         }
         // One binding at a time: the infos are a copy of the binding's stand-in.
         for (u32 binding = 1; binding < Shader::BINDLESS_BINDING_COUNT; ++binding) {
@@ -312,10 +314,14 @@ void DrawContext::BindlessSync(bool force) {
         entry = {};
         entry.serial = serial;
         if (serial != 0) {
-            const std::shared_ptr<Texture>& texture = TextureOfId(id);
-            if (texture) {
-                // (TextureOfId returns the node of Impl::textures)
-                entry.texture = &texture;
+            const auto tex_it = impl.textures.find(serial);
+            const std::shared_ptr<Texture>* const texture_ptr =
+                tex_it != impl.textures.end() ? &tex_it->second : nullptr;
+            const std::shared_ptr<Texture>& texture =
+                texture_ptr != nullptr ? *texture_ptr : TextureOfId(0);
+            if (texture_ptr != nullptr && texture) {
+                // Stable pointer to the Impl::textures map node (never a replaceable cache slot).
+                entry.texture = texture_ptr;
                 entry.storage = texture->storage.get();
             }
             if (texture && texture->storage) {
@@ -365,10 +371,11 @@ void DrawContext::BindlessSync(bool force) {
             }
         }
         for (u32 binding = 1; binding <= TEXTURE_BINDINGS; ++binding) {
-            if (state.written[binding][id] == want[binding]) {
+            const BindlessState::WrittenEntry desired{want[binding], want_layout[binding]};
+            if (state.written[binding][id] == desired) {
                 continue;
             }
-            state.written[binding][id] = want[binding];
+            state.written[binding][id] = desired;
             infos.push_back({VK_NULL_HANDLE, want[binding], want_layout[binding]});
             runs.push_back({binding, id, static_cast<u32>(infos.size() - 1), 1});
         }
@@ -407,6 +414,7 @@ void DrawContext::BindlessSync(bool force) {
     state.synced_count = static_cast<u32>(std::min<size_t>(texture_ids.size(),
                                                             Shader::BINDLESS_TEXTURE_CAPACITY));
     state.storages = std::move(storages);
+    ++state.storages_gen;
     if (state.sync_logs++ % 600 == 0) {
         u32 registered = 0;
         for (u32 id = 1; id < texture_ids.size() && id < Shader::BINDLESS_TEXTURE_CAPACITY; ++id) {
@@ -417,8 +425,8 @@ void DrawContext::BindlessSync(bool force) {
         for (u32 id = 0; id < state.synced_count; ++id) {
             const u32 cube_binding = Shader::BindlessTextureBinding(Shader::TextureType::ColorCube, 0);
             const u32 d2_binding = Shader::BindlessTextureBinding(Shader::TextureType::Color2D, 0);
-            cube += state.written[cube_binding][id] != state.dummy[cube_binding];
-            d2 += state.written[d2_binding][id] != state.dummy[d2_binding];
+            cube += state.written[cube_binding][id].view != state.dummy[cube_binding];
+            d2 += state.written[d2_binding][id].view != state.dummy[d2_binding];
         }
         LOG_INFO(Render_Vulkan,
                  "[nvn] bindless table: {} textures registered, {} 2D and {} cube entries hold an "
@@ -548,9 +556,20 @@ bool DrawContext::BindlessPrepare(DrawPlan& plan) {
     }
     BindlessSync();
     BindlessPrime(plan);
+    const u64 seq = host->HostFlight().seq;
+    const u64 pass_breaks = counters.pass_breaks.load(std::memory_order_relaxed);
+    const u64 pass_begins = counters.pass_begins.load(std::memory_order_relaxed);
+    if (pass_open && !bindless.dirty && bindless.prepared_seq == seq &&
+        bindless.prepared_write_clock == impl.write_clock &&
+        bindless.prepared_pass_breaks == pass_breaks &&
+        bindless.prepared_pass_begins == pass_begins &&
+        bindless.prepared_storages_gen == bindless.storages_gen) {
+        return true;
+    }
     // A shader may read any entry: the images of the table must be in the layout the descriptors
     // name. Those a render pass or a copy left in another layout are moved like any sampled image
     // (a render target of this very draw stays: it cannot be both).
+    bool any_transition = false;
     for (const std::shared_ptr<Storage>& storage : bindless.storages) {
         Storage& s = *storage;
         if (!s.image) {
@@ -561,6 +580,14 @@ bool DrawContext::BindlessPrepare(DrawPlan& plan) {
             continue;
         }
         plan.UseImage(storage, wanted, true);
+        any_transition = true;
+    }
+    if (pass_open && !bindless.dirty && !any_transition) {
+        bindless.prepared_seq = seq;
+        bindless.prepared_write_clock = impl.write_clock;
+        bindless.prepared_pass_breaks = pass_breaks;
+        bindless.prepared_pass_begins = pass_begins;
+        bindless.prepared_storages_gen = bindless.storages_gen;
     }
     return true;
 }
@@ -573,11 +600,31 @@ void DrawContext::BindlessBind(PipelineBase& pipe, VkPipelineBindPoint bind_poin
         // The plan created images before this draw recorded: their entries are written before
         // the set is bound (update after bind), so this very draw reads them.
         bindless.dirty = false;
+        bindless.bound_cmd = VK_NULL_HANDLE;
         BindlessSync(true);
     }
+    const vk::CommandBuffer cmd = host->HostCmd();
+    const VkCommandBuffer cmd_handle = *cmd;
+    const u64 seq = host->HostFlight().seq;
+    const u64 pass_begins = counters.pass_begins.load(std::memory_order_relaxed);
+    const u64 draw_seq = counters.draws.load(std::memory_order_relaxed);
+    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && pass_open &&
+        !Debug::Get().no_state_elide && bindless.bound_cmd == cmd_handle &&
+        bindless.bound_seq == seq && bindless.bound_pass_begins == pass_begins &&
+        bindless.bound_layout == *pipe.layout && bindless.bound_point == bind_point &&
+        bindless.bound_draw + 1 == draw_seq) {
+        bindless.bound_draw = draw_seq;
+        return;
+    }
     const VkDescriptorSet set = bindless.set;
-    host->HostCmd().BindDescriptorSets(bind_point, *pipe.layout, Shader::BINDLESS_SET,
-                                       std::span{&set, 1}, {});
+    cmd.BindDescriptorSets(bind_point, *pipe.layout, Shader::BINDLESS_SET,
+                           std::span{&set, 1}, {});
+    bindless.bound_cmd = cmd_handle;
+    bindless.bound_layout = *pipe.layout;
+    bindless.bound_point = bind_point;
+    bindless.bound_seq = seq;
+    bindless.bound_pass_begins = pass_begins;
+    bindless.bound_draw = draw_seq;
 }
 
 } // namespace Vulkan::Nvn

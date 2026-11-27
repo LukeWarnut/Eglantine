@@ -322,6 +322,10 @@ struct PipelineBase {
     VC::ComputeDriverLayout compute_layout;
     /// Texture types the shaders were translated for; revalidated with the oracle per draw.
     std::vector<TextureQuery> queries;
+    /// True when every query reads only HandleBank (c2) of a stage < 8.
+    bool queries_handle_bank_only{true};
+    /// Bitmask of NVNshaderStage values present in `queries`.
+    u32 query_stage_mask{0};
     /// Shader log: set at creation while the log is on, otherwise null. `logged` is claimed by
     /// the first lookup that returns the pipeline to a draw/dispatch after the log started.
     std::shared_ptr<PipelineLogInfo> log;

@@ -173,6 +173,7 @@ ENUM(ColdHintMode, Off, WhenRamIsLow, Always);
 ENUM(MeshShaderMode, Auto, Native, ComputeFallback);
 ENUM(UpdateChannel, Unset, Stable, ReleaseCandidate, Daily);
 ENUM(ConsoleTheme, BasicWhite, BasicBlack);
+ENUM(UpdateVariant, Auto, Standard, Pgo);
 
 template <typename Type>
 inline std::string_view CanonicalizeEnum(Type id) {

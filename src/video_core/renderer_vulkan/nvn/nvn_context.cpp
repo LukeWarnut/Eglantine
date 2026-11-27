@@ -19,6 +19,7 @@
 #include "common/game_presets.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/game_frame_size.h"
@@ -418,28 +419,43 @@ BcGpuEncoder* Context::Impl::BcEncoder() {
 
 std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height, u32 layers) {
     const bool bc7 = astc_standin == AstcStandin::Bc7;
-    if (bc_scratch && bc_scratch->Fits(width, height, layers, bc7)) {
-        return bc_scratch;
+    for (size_t i = 0; i < bc_scratches.size(); ++i) {
+        if (bc_scratches[i] && bc_scratches[i]->Fits(width, height, layers, bc7)) {
+            if (i != 0) {
+                std::rotate(bc_scratches.begin(), bc_scratches.begin() + static_cast<std::ptrdiff_t>(i),
+                            bc_scratches.begin() + static_cast<std::ptrdiff_t>(i + 1));
+            }
+            return bc_scratches.front();
+        }
     }
     const auto texel_bytes = [](u32 w, u32 h, u32 l) { return u64{w} * h * l * 4; };
     u32 w = width;
     u32 h = height;
     u32 l = layers;
-    if (bc_scratch) {
+    bool replace_front = false;
+    if (!bc_scratches.empty() && bc_scratches.front()) {
         // Grow to cover both shapes while that stays in the budget, else take the new shape.
-        const u32 grown_w = (std::max)(bc_scratch->width, width);
-        const u32 grown_h = (std::max)(bc_scratch->height, height);
-        const u32 grown_l = (std::max)(bc_scratch->layers, layers);
+        const u32 grown_w = (std::max)(bc_scratches.front()->width, width);
+        const u32 grown_h = (std::max)(bc_scratches.front()->height, height);
+        const u32 grown_l = (std::max)(bc_scratches.front()->layers, layers);
         if (texel_bytes(grown_w, grown_h, grown_l) <= BC_SCRATCH_BUDGET) {
             w = grown_w;
             h = grown_h;
             l = grown_l;
+            replace_front = true;
         }
     }
     try {
         auto scratch = MakeBcScratch(device, *allocator, w, h, l, bc7);
         if (texel_bytes(w, h, l) <= BC_SCRATCH_BUDGET) {
-            bc_scratch = scratch;
+            if (replace_front) {
+                bc_scratches.front() = scratch;
+            } else {
+                bc_scratches.insert(bc_scratches.begin(), scratch);
+                if (bc_scratches.size() > 4) {
+                    bc_scratches.pop_back();
+                }
+            }
         }
         return scratch;
     } catch (const vk::Exception& exception) {
@@ -639,6 +655,7 @@ Context::Impl::~Impl() {
     draw_resources.reset();
     storage_index.clear();
     storage_cache.clear();
+    ClearRecycledImages();
     textures.clear();
     target_aliases.clear();
     pools_by_address.clear();
@@ -670,7 +687,7 @@ Context::Impl::~Impl() {
     final_fsr.reset();
     upscaler_fsr.reset();
     mirror_merge_stats = {}; // allocator-owned, like the pool buffers above
-    bc_scratch.reset();
+    bc_scratches.clear();
     staging_cache = {};
     quad_indirect.reset();
     allocator.reset();
@@ -697,7 +714,32 @@ void Context::Impl::Enqueue(Command&& command, std::shared_ptr<InFlight> flight)
 }
 
 void Context::Impl::ReplayMain() {
+    submit_batch.batching = true;
+    SCOPE_EXIT {
+        submit_batch.batching = false;
+        try {
+            FlushSubmitBatch();
+        } catch (const std::exception&) {
+        }
+    };
     for (;;) {
+        if (!submit_batch.entries.empty() || !submit_batch.marks.empty()) {
+            bool idle_wait = false;
+            {
+                std::scoped_lock lock{state_mutex};
+                idle_wait = !stopping && commands.empty();
+            }
+            if (idle_wait) {
+                replay_stage.store("submit", std::memory_order_relaxed);
+                try {
+                    FlushSubmitBatch();
+                } catch (const std::exception& exception) {
+                    stats.ops_failed.fetch_add(1, std::memory_order_relaxed);
+                    LOG_ERROR(Render_Vulkan, "[nvn] batched submit failed: {}", exception.what());
+                    NoteIfDeviceLost("a batched submit");
+                }
+            }
+        }
         Command command;
         const bool streams_waiting = !streams.Idle();
         {
@@ -793,6 +835,33 @@ void Context::Impl::Dispatch(Command& command) {
                 std::getenv("EDEN_NX2_TRY_BARRIER_MERGE") == nullptr) {
                 impl.barrier_merge = BarrierMergeMask(impl.mario_kart_world ? 1 : 0);
             }
+            if (!impl.options.dispatch_order_by_barriers.has_value() &&
+                std::getenv("EDEN_NX2_TRY_DISPATCH_ORDER") == nullptr) {
+                impl.dispatch_order_by_barriers = impl.mario_kart_world;
+            }
+            if (impl.mario_kart_world && !impl.options.storage_trim_age_presents.has_value() &&
+                std::getenv("EDEN_NX2_NVN_TRIM_AGE_PRESENTS") == nullptr &&
+                impl.trim_age_presents == 0) {
+                impl.trim_age_presents = 300;
+                LOG_INFO(Render_Vulkan,
+                         "[nvn] Mario Kart World: aging idle render targets after {} presents "
+                         "(EDEN_NX2_NVN_TRIM_AGE_PRESENTS)",
+                         impl.trim_age_presents);
+            }
+            if (impl.mario_kart_world && !impl.options.storage_cache_budget_bytes.has_value() &&
+                Debug::Get().storage_budget_bytes == 0) {
+                if (const u64 device_budget = impl.device.GetDeviceMemoryBudget();
+                    device_budget != 0) {
+                    const u64 scaled = device_budget / 10 * 6;
+                    if (scaled > impl.storage_cache_budget) {
+                        impl.storage_cache_budget = scaled;
+                        LOG_INFO(Render_Vulkan,
+                                 "[nvn] Mario Kart World: storage cache budget {} MiB (60% of {} "
+                                 "MiB device budget; EDEN_NX2_NVN_STORAGE_BUDGET_MIB overrides)",
+                                 impl.storage_cache_budget >> 20, device_budget >> 20);
+                    }
+                }
+            }
             impl.draw_resources->OpenCache(c.title_id);
         }
         void operator()(CmdPresent& c) const {
@@ -815,6 +884,7 @@ void Context::Impl::Dispatch(Command& command) {
             impl.NotifyTextureWrittenNow(c.serial);
         }
         void operator()(CmdFlushTexture& c) const {
+            impl.FlushSubmitBatch();
             impl.FlushTextureNow(c);
         }
         void operator()(CmdTextureHolders& c) const {
@@ -1280,7 +1350,13 @@ void Context::Impl::CompleteMain() {
             counters_engine->Complete(*flight->counters, guest.load(std::memory_order_acquire));
         }
         if (flight->raw_writes) {
-            split_raw_epoch.fetch_add(1, std::memory_order_release);
+            const u64 next_epoch = split_raw_epoch.load(std::memory_order_relaxed) + 1;
+            if (flight->raw_writes_unaliased) {
+                // Publish unaliased epoch before split_raw_epoch (release) so observing the new
+                // split_raw_epoch (acquire) guarantees observing its unaliased update.
+                split_raw_epoch_unaliased.store(next_epoch, std::memory_order_release);
+            }
+            split_raw_epoch.store(next_epoch, std::memory_order_release);
         }
         if (flight->gpu_prof && gpu_profiler) {
             // Timestamps: read after the timeline value was reached, never on the replay thread.
@@ -2082,13 +2158,13 @@ std::string Context::DescribeState() const {
     }
     const auto& s = impl->stats;
     text += fmt::format(
-        " mem(storages new/reuse/evict={}/{}/{} split_import(pools/runs)={}/{} uploads={} MB={} "
+        " mem(storages new/reuse/evict={}/{}/{} recycled={} split_import(pools/runs)={}/{} uploads={} MB={} "
         "cpu check/trusted/pages/change={}/{}/{}/{} pages_rehashed={} "
         "hash_ms={} hash_MB={} (compressed {} dynamic {}) decode_ms={} decode_MB={} alias_xfer={} "
         "alias_seen={} virt={} astc gpu/fallback/bc={}/{}/{} untile gpu/direct/fallback={}/{}/{} "
         "untile_gpu_MB={} storage_cache(MB/superseded/aged/pressure_evicted)={}/{}/{}/{})",
         s.storages_created.load(), s.storages_reused.load(), s.storages_evicted.load(),
-        s.pools_split_imported.load(), s.split_runs.load(),
+        s.storages_recycled.load(), s.pools_split_imported.load(), s.split_runs.load(),
         s.uploads.load(), s.upload_bytes.load() >> 20, s.cpu_checks.load(),
         s.cpu_checks_trusted.load(), s.cpu_checks_pages.load(), s.cpu_changes.load(),
         s.cpu_pages_rehashed.load(), s.hash_ns.load() / 1'000'000, s.hash_bytes.load() >> 20,

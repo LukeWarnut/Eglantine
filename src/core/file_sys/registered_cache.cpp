@@ -1147,6 +1147,23 @@ void ContentProviderUnion::SetSlot(ContentProviderUnionSlot slot, ContentProvide
     providers[size_t(slot)] = provider;
 }
 
+void ContentProviderUnion::SetGameArchive(std::shared_ptr<ManualContentProvider> provider) {
+    game_archive = std::move(provider);
+    SetSlot(ContentProviderUnionSlot::GameArchive, game_archive.get());
+}
+
+ContentProviderUnion ContentProviderUnion::WithGameArchive(
+    std::shared_ptr<ManualContentProvider> provider) const {
+    ContentProviderUnion content;
+    for (size_t i = 0; i < providers.size(); ++i) {
+        if (i != size_t(ContentProviderUnionSlot::GameArchive)) {
+            content.providers[i] = providers[i];
+        }
+    }
+    content.SetGameArchive(std::move(provider));
+    return content;
+}
+
 void ContentProviderUnion::Refresh() {
     for (auto e : providers)
         if (e != nullptr)

@@ -19,6 +19,8 @@
 #include <vector>
 #include "common/common_types.h"
 #include "common/net/net.h"
+#include "common/scm_rev.h"
+#include "common/settings_enums.h"
 
 namespace UpdateChecker {
 
@@ -143,8 +145,22 @@ std::optional<Common::Net::Release> SelectUpdate(
     std::string_view current_commit, Channel channel, std::string_view platform,
     Common::Net::LinuxPackage package = Common::Net::LinuxPackage::Any);
 
-// Queries the releases of the running build's repository.
-CheckResult Check(Channel channel);
+// The release asset platform to download for `variant`: `build_platform` with "-pgo" added or
+// removed. Empty when the build has no release platform.
+std::string DownloadPlatform(Settings::UpdateVariant variant,
+                             std::string_view build_platform = Common::g_build_release_platform);
+
+// The channel a release channel setting checks. Stable (nx2) follows the versioned releases,
+// release candidates included, since those are what nx2 ships; Daily is the nightly build of
+// nx2-experimental.
+Channel ChannelOfSetting(Settings::UpdateChannel setting);
+
+// The build type of this build, for a setting still at Auto.
+Settings::UpdateVariant ThisBuildVariant(
+    std::string_view build_platform = Common::g_build_release_platform);
+
+// Queries the releases of the running build's repository. `platform` is the one to download.
+CheckResult Check(Channel channel, std::string_view platform = Common::g_build_release_platform);
 
 std::optional<Common::Net::Release> GetUpdate();
 

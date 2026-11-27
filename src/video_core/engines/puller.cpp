@@ -32,6 +32,36 @@
 #include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
 
+namespace Tegra {
+
+std::string Nx2SemaphoreWaiters::Describe(u64 device_address) const {
+    static constexpr std::array<const char*, 3> names{"queued", "written", "dropped"};
+    const u64 block = device_address & ~u64{0xf};
+    const u64 head = history_head.load(std::memory_order_relaxed);
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count());
+    std::string text;
+    u32 shown = 0;
+    for (u64 i = 0; i < history.size() && i < head && shown < 8; ++i) {
+        const auto& slot = history[(head - 1 - i) % history.size()];
+        const u64 address = slot.address.load(std::memory_order_relaxed);
+        if ((address & ~u64{0xf}) != block) {
+            continue;
+        }
+        const u32 event = slot.event.load(std::memory_order_relaxed);
+        const u64 ns = slot.ns.load(std::memory_order_relaxed);
+        text += fmt::format("{}{} {:#x} at +{:#x} {} ms ago", shown == 0 ? "" : "; ",
+                            event < names.size() ? names[event] : "?",
+                            slot.value.load(std::memory_order_relaxed), address & 0xf,
+                            now > ns ? (now - ns) / 1'000'000 : 0);
+        ++shown;
+    }
+    return text.empty() ? std::string{"none in the last 512 releases"} : text;
+}
+
+} // namespace Tegra
+
 namespace Tegra::Engines {
 
 namespace {
@@ -305,6 +335,12 @@ bool Puller::PollAcquire(DmaPusher& dma_pusher) {
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 4),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 8),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 12));
+        if (device) {
+            // A release queued but never written waits on a host fence; none queued was never
+            // issued (or went another way); a dropped one was invalidated before its write.
+            LOG_WARNING(HW_GPU, "  recent releases there: {}",
+                        Nx2SemaphoreWaiters::Get().Describe(*device));
+        }
     }
     return false;
 }

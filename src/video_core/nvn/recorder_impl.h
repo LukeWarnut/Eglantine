@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -259,6 +260,8 @@ struct SamplerObject : SinkObject {
 
 struct BufferObject : Object {
     u64 pool_serial = 0;
+    u64 gpu_begin = 0;
+    u64 gpu_end = 0;
 };
 
 struct ProgramObject : SinkObject {
@@ -433,8 +436,11 @@ struct Recorder::Impl {
         u64 end;
         u64 serial;
     };
-    std::mutex buffer_spans_mutex;
-    std::vector<BufferSpan> buffer_spans;
+    static constexpr u64 BUFFER_SPAN_CHUNK_SHIFT = 20; // 1 MiB buckets
+    static constexpr u64 BUFFER_SPAN_LARGE_LIMIT = u64{16} << 20;
+    std::shared_mutex buffer_spans_mutex;
+    std::unordered_map<u64, std::vector<BufferSpan>> buffer_span_chunks;
+    std::vector<BufferSpan> buffer_spans_large;
     /// Bytes from `address` to the end of the largest live buffer object that holds it, saturated
     /// to 32 bits; 0 when none does.
     [[nodiscard]] u32 BufferBytesFrom(u64 address);
@@ -477,6 +483,8 @@ struct Recorder::Impl {
     UniformSnapshotTotals snapshot_totals;
     u64 snapshot_submissions = 0;
     u64 snapshot_ns = 0;
+    size_t last_expanded_words = 4096;
+    u64 expand_submit_count = 0;
     std::chrono::steady_clock::time_point snapshot_log_time{};
     /// Requires sink_mutex: the submission's uniform snapshot, when the switch is on.
     void CaptureUniformsLocked(Submission& submission);
@@ -496,6 +504,7 @@ struct Recorder::Impl {
     // Handle -> recorded list
     std::mutex lists_mutex;
     std::map<u64, ListEntry> lists;
+    std::unordered_map<u64, ListEntry*> lists_by_handle;
     /// Synthetic lists by last use (stamp -> handle): the least recently submitted goes first when
     /// the cap is reached.
     std::map<u64, u64> synthetic_lru;
@@ -552,9 +561,9 @@ struct Recorder::Impl {
     u64 AnonymousSamplerSerial(const SamplerDesc& desc);
 
     // ---- submission -----------------------------------------------------------------------------
-    [[nodiscard]] std::shared_ptr<const List> FindList(u64 handle);
-    bool Expand(u64 handle, std::vector<u64>& out, std::vector<Action>& actions,
-                std::vector<u64>& refs, u32 depth);
+    [[nodiscard]] const List* FindListLocked(u64 handle, u64 presents);
+    bool ExpandLocked(u64 handle, std::vector<u64>& out, std::vector<Action>& actions,
+                      std::vector<u64>& refs, u32 depth, u64 presents);
     void ResolveDeferred(u64* record);
     u64 FinishSubmitLocked(QueueObject& queue, Submission&& submission,
                            std::vector<Action>&& actions, std::vector<u64>&& refs);

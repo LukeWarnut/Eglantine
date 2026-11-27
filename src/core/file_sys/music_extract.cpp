@@ -1064,8 +1064,8 @@ u32 OggCrcUpdate(u32 crc, const u8* data, std::size_t size) {
 // pages with the continued flag; audio packets (20 ms each) never span.
 class OggWriter {
 public:
-    OggWriter(std::ofstream& out, u32 serial, u16 preskip)
-        : out(out), serial(serial), preskip(preskip) {}
+    OggWriter(std::ofstream& file, u32 stream_serial, u16 pre_skip)
+        : out(file), serial(stream_serial), preskip(pre_skip) {}
 
     // A header packet (OpusHead, OpusTags); its pages carry granule 0.
     bool WriteHeader(std::string_view packet) {

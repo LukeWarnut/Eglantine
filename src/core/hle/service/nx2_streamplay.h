@@ -6,41 +6,67 @@
 
 #pragma once
 
-#include "core/hle/kernel/k_event.h"
+#include <cstring>
+
+#include "core/core.h"
+#include "core/hle/kernel/k_shared_memory.h"
 #include "core/hle/service/ipc_helpers.h"
-#include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/service.h"
 
 namespace Service {
 
-// User service returned by stpl:u 0 (nn::streamplay::detail::GetUserService). The SDK attaches a
-// system event to the handle command 300 returns right after opening it, so that one needs a real
-// event; everything else falls through to the nx2 auto stub (zero sizes, nothing streaming).
+// User service returned by stpl:u 0 (nn::streamplay::detail::GetUserService). Right after opening
+// it the SDK calls command 300 for the streaming HID shared memory: a copy handle plus a
+// HidSharedMemoryConfig (u64 size, u64 offset). HidApplicationResourceHolder attaches and maps it
+// read-only, then reads three input rings from base + offset + 0x6c000 + n * 0x6000. Zeroed memory
+// means no remote players; a missing size aborts the boot (SMBW, 0xCA01). Everything else falls
+// through to the nx2 auto stub (zero sizes, nothing streaming).
 class INx2StreamPlayUserService final : public ServiceFramework<INx2StreamPlayUserService> {
 public:
     explicit INx2StreamPlayUserService(Core::System& system_)
-        : ServiceFramework{system_, "nx2:stpl:u::0"}, service_context{system_, "stpl:u"} {
+        : ServiceFramework{system_, "nx2:stpl:u::0"} {
         static const FunctionInfo functions[] = {
-            {300, &INx2StreamPlayUserService::GetEvent, "GetEvent (guessed)"},
+            {300, &INx2StreamPlayUserService::GetHidSharedMemory, "GetHidSharedMemory (guessed)"},
         };
         RegisterHandlers(functions);
-        event = service_context.CreateEvent("INx2StreamPlayUserService:Event");
     }
 
     ~INx2StreamPlayUserService() override {
-        service_context.CloseEvent(event);
+        if (hid_memory != nullptr) {
+            hid_memory->Close(system.Kernel());
+        }
     }
 
 private:
-    void GetEvent(HLERequestContext& ctx) {
-        LOG_WARNING(Service, "(STUBBED) stpl:u::0 {}, returning an event", ctx.GetCommand());
-        IPC::ResponseBuilder rb{ctx, 2, 1};
+    static constexpr u64 HidSharedMemorySize = 0x80000;
+
+    void GetHidSharedMemory(HLERequestContext& ctx) {
+        LOG_WARNING(Service, "(STUBBED) stpl:u::0 {}, returning {:#x} bytes of HID shared memory",
+                    ctx.GetCommand(), HidSharedMemorySize);
+        if (hid_memory == nullptr) {
+            auto* const memory = Kernel::KSharedMemory::Create(kernel);
+            if (const Result result = memory->Initialize(
+                    kernel, system.DeviceMemory(), nullptr, Kernel::Svc::MemoryPermission::None,
+                    Kernel::Svc::MemoryPermission::Read, HidSharedMemorySize);
+                result.IsError()) {
+                LOG_ERROR(Service, "Failed to make the stpl:u HID shared memory: {:#x}", result.raw);
+                memory->Close(kernel);
+                IPC::ResponseBuilder rb{ctx, 2};
+                rb.Push(result);
+                return;
+            }
+            Kernel::KSharedMemory::Register(kernel, memory);
+            std::memset(memory->GetPointer(), 0, HidSharedMemorySize);
+            hid_memory = memory;
+        }
+        IPC::ResponseBuilder rb{ctx, 6, 1};
         rb.Push(ResultSuccess);
-        rb.PushCopyObjects(ctx, event->GetReadableEvent());
+        rb.Push<u64>(HidSharedMemorySize);
+        rb.Push<u64>(0);
+        rb.PushCopyObjects(ctx, *hid_memory);
     }
 
-    KernelHelpers::ServiceContext service_context;
-    Kernel::KEvent* event;
+    Kernel::KSharedMemory* hid_memory{};
 };
 
 // Switch 2 stream play (GameShare), stpl:u. Command 0 (u32 0x12) opens the user service the SDK

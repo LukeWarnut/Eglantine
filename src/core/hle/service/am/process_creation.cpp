@@ -33,6 +33,7 @@ namespace {
         return FileSys::StorageId::NandSystem;
     case FileSys::ContentProviderUnionSlot::SDMC:
         return FileSys::StorageId::SdCard;
+    case FileSys::ContentProviderUnionSlot::GameArchive:
     case FileSys::ContentProviderUnionSlot::FrontendManual:
         return FileSys::StorageId::Host;
     default:

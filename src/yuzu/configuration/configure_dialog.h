@@ -78,6 +78,10 @@ private slots:
 signals:
     void LanguageChanged(const QString& locale);
     void ExternalContentDirsChanged();
+    // Emitted before the dialog closes as if OK was pressed.
+    void OpenVersionManagerRequested();
+    // Emitted before the dialog closes as if OK was pressed.
+    void LaunchExperimentalBuildRequested(const QString& install_dir);
 
 private:
     void changeEvent(QEvent* event) override;

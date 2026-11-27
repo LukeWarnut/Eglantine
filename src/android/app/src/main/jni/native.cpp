@@ -1562,7 +1562,10 @@ jobjectArray Java_org_yuzu_yuzu_1emu_NativeLibrary_getPatchesForFile(JNIEnv* env
     FileSys::VirtualFile update_raw;
     loader->ReadUpdateRaw(update_raw);
 
-    auto patches = pm.GetPatches(update_raw);
+    std::vector<std::pair<u64, u32>> packed_add_ons;
+    loader->ReadAddOnContent(packed_add_ons);
+
+    auto patches = pm.GetPatches(update_raw, packed_add_ons);
     jobjectArray jpatchArray =
         env->NewObjectArray(patches.size(), Common::Android::GetPatchClass(), nullptr);
     int i = 0;

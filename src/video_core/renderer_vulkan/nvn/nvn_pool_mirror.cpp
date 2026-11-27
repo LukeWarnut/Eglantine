@@ -368,6 +368,7 @@ void Context::Impl::MirrorCollectCpuWrites(Pool& pool, PoolMirror& mirror, u64 o
         const u64 first = (std::max)(begin, pool.address);
         if (end > first) {
             mirror.pages.Invalidate(first - pool.address, end - first);
+            mirror.wanted_dirty = true;
         }
     }
     if (mirror.write_epoch) {
@@ -388,15 +389,39 @@ void Context::Impl::MirrorTakeStale(Pool& pool, u64 offset, u64 size,
     MirrorArmRuns(pool, *mirror, memory, first_new, runs);
 }
 
+void Context::Impl::MirrorMarkPrefetch(Pool& pool, u64 offset, u64 size) {
+    PoolMirror* const mirror = pool.vram_mirror.get();
+    if (mirror == nullptr) {
+        return;
+    }
+    if (!mirror->wanted) {
+        mirror->wanted = std::make_unique<MirrorPages>(pool.size);
+    }
+    if (!mirror->prefetch) {
+        mirror->prefetch = true;
+        vram_prefetch_mirrors.push_back({&pool, mirror, mirror->write_epoch.get()});
+    }
+    if (!mirror->wanted->AllValid(offset, size)) {
+        mirror->wanted->Set(offset, size);
+        mirror->wanted_dirty = true;
+    }
+}
+
 void Context::Impl::MirrorTakeStaleWanted(Pool& pool, std::vector<std::pair<u64, u64>>& runs) {
     PoolMirror* const mirror = pool.vram_mirror.get();
     if (mirror == nullptr || !mirror->wanted) {
+        return;
+    }
+    if (mirror->write_epoch &&
+        mirror->write_epoch->load(std::memory_order_acquire) == mirror->epoch_clean &&
+        !mirror->wanted_dirty) {
         return;
     }
     VC::GuestMemory* const memory = guest.load(std::memory_order_acquire);
     MirrorCollectCpuWrites(pool, *mirror, 0, pool.size);
     const size_t first_new = runs.size();
     mirror->pages.TakeInvalidWithin(*mirror->wanted, runs);
+    mirror->wanted_dirty = false;
     MirrorArmRuns(pool, *mirror, memory, first_new, runs);
 }
 
@@ -421,6 +446,7 @@ void Context::Impl::MirrorArmRuns(Pool& pool, PoolMirror& mirror, VC::GuestMemor
 void Context::Impl::MirrorInvalidate(Pool& pool, u64 offset, u64 size) {
     if (pool.vram_mirror) {
         pool.vram_mirror->pages.Invalidate(offset, (std::max<u64>)(size, 1));
+        pool.vram_mirror->wanted_dirty = true;
     }
 }
 
@@ -439,6 +465,7 @@ void Context::Impl::MirrorInvalidateReadOnly(bool written_through) {
             through_read_only = true;
         } else {
             mirror.pages.InvalidateAll();
+            mirror.wanted_dirty = true;
             any = true;
         }
     }
@@ -456,6 +483,7 @@ void Context::Impl::MirrorInvalidateAll() {
     }
     for (Pool* const pool : vram_mirrored) {
         pool->vram_mirror->pages.InvalidateAll();
+        pool->vram_mirror->wanted_dirty = true;
     }
     stats.vram_invalidate_all.fetch_add(1, std::memory_order_relaxed);
 }
@@ -468,6 +496,8 @@ void Context::Impl::ReleaseVramMirror(Pool& pool) {
         memory->Untrack(pool.vram_mirror->track_id);
     }
     std::erase(vram_mirrored, &pool);
+    std::erase_if(vram_prefetch_mirrors,
+                  [&](const PrefetchMirrorEntry& e) { return e.pool == &pool; });
     ++ro_alias_generation; // the alias table loses this mirror
     vram_mirror_bytes -= pool.size;
     // The buffer goes with the pool, after the last submission that used it completed.

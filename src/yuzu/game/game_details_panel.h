@@ -13,9 +13,11 @@
 #include <QString>
 
 #include "common/common_types.h"
+#include "yuzu/game/game_details_info.h"
 #include "yuzu/game/home_side_panel.h"
 
-class IconSearch;
+class AddOnList;
+class GameArtwork;
 class QCheckBox;
 class QGridLayout;
 class QHBoxLayout;
@@ -23,38 +25,6 @@ class QMenu;
 class QPushButton;
 class QToolButton;
 class QVBoxLayout;
-
-struct GameDetailsInfo {
-    QString path;
-    u64 program_id = 0;
-    QString title;
-    QString developer;
-    QString version;
-    QString file_type;
-    QString size;
-    QString play_time;
-    QPixmap icon;
-    bool favorite = false;
-};
-
-struct GameAddOn {
-    QString name;
-    QString version;
-    /// Entry used in Settings::values.disabled_addons when this add-on is off.
-    QString key;
-    bool is_update = false;
-    bool enabled = true;
-};
-
-/// Details that need disk access, loaded off the UI thread after the panel opens.
-struct GameDetailsExtras {
-    u64 program_id = 0;
-    QString path;
-    std::vector<GameAddOn> add_ons;
-    u64 pipeline_cache_bytes = 0;
-    bool shaders_precompiled = false;
-    bool custom_config = false;
-};
 
 /// Banner across the top with the game icon overlapping its lower edge, title and developer
 /// beside the icon. While the game's artwork can be changed, buttons to change the banner and
@@ -176,13 +146,6 @@ private:
     void RefreshArtworkMenus();
     void ReloadHero();
     QImage LoadHero(u64 program_id);
-    void OnAddOnToggled(size_t index, bool enabled);
-
-    void FindArt(bool hero);
-    void ChooseArtFile(bool hero);
-    void ResetArt(bool hero);
-    void SaveHero(u64 program_id, const QByteArray& image);
-    void SaveIcon(u64 program_id, const QByteArray& png);
 
     GameDetailsInfo game;
     GameDetailsExtras extras;
@@ -192,9 +155,7 @@ private:
     QLayout* chip_row = nullptr;
 
     QLabel* add_ons_heading = nullptr;
-    QWidget* add_ons_box = nullptr;
-    QVBoxLayout* add_ons_layout = nullptr;
-    std::vector<QCheckBox*> add_on_checks;
+    AddOnList* add_on_list = nullptr;
 
     QLabel* shaders_heading = nullptr;
     QWidget* shaders_box = nullptr;
@@ -217,9 +178,7 @@ private:
     QMenu* banner_menu = nullptr;
     QMenu* icon_menu = nullptr;
 
-    IconSearch* icon_search = nullptr;
-    bool searching_hero = false;
-    u64 search_program_id = 0;
+    GameArtwork* artwork = nullptr;
 
     /// Decoded banners by program ID, cost in KiB.
     QCache<u64, QImage> hero_cache{48 * 1024};

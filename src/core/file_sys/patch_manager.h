@@ -70,6 +70,7 @@ public:
     // Currently tracked ExeFS patches:
     // - Game Updates
     [[nodiscard]] VirtualDir PatchExeFS(VirtualDir exefs) const;
+    [[nodiscard]] VirtualDir PatchExeFSMods(VirtualDir exefs) const;
 
     // Currently tracked NSO patches:
     // - IPS
@@ -94,8 +95,11 @@ public:
                                          VirtualFile packed_update_raw = nullptr,
                                          bool apply_layeredfs = true) const;
 
-    // Returns a vector of patches
-    [[nodiscard]] std::vector<Patch> GetPatches(VirtualFile update_raw = nullptr) const;
+    // Returns a vector of patches. `packed_add_ons` lists add-on content shipped inside the
+    // game's own file (pairs of title ID and version), as reported by its loader.
+    [[nodiscard]] std::vector<Patch> GetPatches(
+        VirtualFile update_raw = nullptr,
+        const std::vector<std::pair<u64, u32>>& packed_add_ons = {}) const;
 
     // If the game update exists, returns the u32 version field in its Meta-type NCA. If that fails,
     // it will fallback to the Meta-type NCA of the base game. If that fails, the result will be
@@ -108,6 +112,7 @@ public:
 
     // Version of GetControlMetadata that takes an arbitrary NCA
     [[nodiscard]] Metadata ParseControlNCA(const NCA& nca) const;
+    [[nodiscard]] static Metadata ParseControlRomFS(const VirtualFile& romfs);
 
     /// @brief Gets NACP metadata (accounting for any patches or updates)
     [[nodiscard]] static PatchManager::Metadata GetMetadataFromBaseOrUpdate(Core::System& system, u64 application_id) noexcept;

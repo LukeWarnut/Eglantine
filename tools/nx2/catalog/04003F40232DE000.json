@@ -1,0 +1,13 @@
+{
+ "title": "04003F40232DE000",
+ "game": "Hyrule Warriors: Age of Imprisonment",
+ "notes": "",
+ "programs": [
+  {"key": "fed969f5c41bb131", "stage": "pixel", "object": "Gloom decal: blends the gloom layer onto the G-buffer (albedo, decal mask = array layer 0, normals, emissive) over ground and rocks", "group": "gloom", "how": "Purging the Shadows outposts: log 'Draw skipped ... stage-rejected' (rt0 = G-buffer albedo) and the 4-RT blended pass in the live pushbuffer; rejected at op f55 before the gloom-decal lowering fix", "source": "tester save past the gloom outposts, daily-20261121", "updated": "2026-11-22T01:57:14Z"},
+  {"key": "e4e941de3e723c27", "stage": "pixel", "object": "Sun shadow / world light mask into layer 3 of the 1600x900x4 RGBA8 array", "group": "lighting", "how": "Frame dump pass after the G-buffer: samples the shadow maps, the 1024x1024 world light map, depth and normals", "updated": "2026-11-22T01:57:14Z"},
+  {"key": "caeb08210b7f0c1e", "hash": "8720ef04ff87b97d", "stage": "pixel", "object": "Boulders (G-buffer)", "group": "scenery", "how": "Live reject_shaders on the gloom outpost scene", "updated": "2026-11-22T01:57:14Z"},
+  {"key": "a23b29735fa4a7e9", "stage": "pixel", "object": "Large rock pillar (G-buffer)", "group": "scenery", "how": "Live reject_shaders on the gloom outpost scene", "updated": "2026-11-22T01:57:14Z"},
+  {"key": "8587452259b9cbf0", "hash": "66ad3dd3e225f388", "stage": "pixel", "object": "Gloom terrain chunks (G-buffer), drawn after scenery", "group": "terrain", "how": "Live reject_shaders: ground turns black", "updated": "2026-11-22T01:57:14Z"},
+  {"key": "054f88ed9fd9e277", "hash": "2d19d4a744671907", "stage": "pixel", "object": "Terrain chunks with the level splat map (G-buffer)", "group": "terrain", "how": "Frame dump: samples the 1024x1024 level map; alternates with 8587452259b9cbf0", "updated": "2026-11-22T01:57:14Z"}
+ ]
+}

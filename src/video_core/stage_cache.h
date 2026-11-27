@@ -7,9 +7,13 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <functional>
 #include <optional>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -57,6 +61,9 @@ public:
 
         mutable std::mutex emitted_mutex;
         mutable std::vector<std::shared_ptr<const Emitted>> emitted;
+
+        mutable std::atomic<u64> last_used{}; ///< use_clock when last found or inserted
+        mutable std::atomic<size_t> bytes{};  ///< Accounted to it, emitted stages included
     };
 
     /// Records the reads translation makes through it, forwarding everything to `inner`.
@@ -67,6 +74,7 @@ public:
         u64 ReadInstruction(u32 address) override;
         u32 TranslateProgramAddress(u32 address) const override;
         bool IsNativeProgram() const override;
+        std::span<const Shader::Ampere::NativeRegisterRemap> NativeRegisterRemaps() const override;
         bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
         bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) override;
         u32 ReadCbufValue(u32 index, u32 offset) override;
@@ -94,6 +102,24 @@ public:
         std::unordered_set<u64> logged;
     };
 
+    /// Signatures a thread is translating and will Insert. Released when this goes.
+    class InFlight {
+    public:
+        InFlight() = default;
+        InFlight(StageCache* cache, std::vector<u64> hashes);
+        ~InFlight();
+        InFlight(InFlight&& other) noexcept;
+        InFlight& operator=(InFlight&& other) noexcept;
+        InFlight(const InFlight&) = delete;
+        InFlight& operator=(const InFlight&) = delete;
+
+        void Release();
+
+    private:
+        StageCache* cache{};
+        std::vector<u64> hashes;
+    };
+
     StageCache();
 
     [[nodiscard]] bool Enabled() const noexcept {
@@ -109,6 +135,18 @@ public:
     /// the settings the recompiler reads.
     [[nodiscard]] static std::vector<u8> Signature(Shader::Environment& env, u64 unique_hash,
                                                    size_t slot);
+
+    [[nodiscard]] static u64 SignatureHash(const std::vector<u8>& signature);
+
+    /// Waits up to `limit` until no other thread is translating any of `hashes`. The caller must
+    /// hold no InFlight itself, or two threads could wait for each other. True when it waited.
+    /// `help`, when given, runs other work while the stages are busy and returns false when it
+    /// found none (the wait then sleeps as without it).
+    bool WaitForInFlight(std::span<const u64> hashes, std::chrono::milliseconds limit,
+                         const std::function<bool()>& help = {});
+
+    /// Marks the `hashes` no other thread is translating as translated by the caller.
+    [[nodiscard]] InFlight ClaimInFlight(std::span<const u64> hashes);
 
     /// A translation of `signature` whose reads `env` answers the same way, or null.
     [[nodiscard]] std::shared_ptr<const Translation> Find(const std::vector<u8>& signature,
@@ -138,9 +176,10 @@ public:
     void CountReuse(bool emitted);
     void CountTranslated();
     void CountVerifyMismatch(u64 unique_hash);
+    void CountInFlightWait(size_t stages, size_t reused);
 
 private:
-    void Account(size_t bytes);
+    void Account(const Translation& translation, size_t added);
     void Log();
 
     bool enabled{};
@@ -154,6 +193,17 @@ private:
     std::atomic<u64> reused_translation{};
     std::atomic<u64> translated{};
     std::atomic<u64> verify_mismatches{};
+    std::atomic<u64> use_clock{};
+    std::atomic<u64> evicted{};
+    std::atomic<u64> deduplicated{};
+    std::atomic<u64> in_flight_waits{};
+    std::atomic<u64> in_flight_waited_stages{};
+    std::atomic<u64> in_flight_reused{};
+    std::atomic<u64> in_flight_helped{};
+
+    std::mutex in_flight_mutex;
+    std::condition_variable in_flight_cv;
+    std::unordered_set<u64> in_flight;
     std::atomic<s64> last_log{};
 };
 

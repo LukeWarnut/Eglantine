@@ -68,9 +68,6 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
 
     override var themeId: Int = 0
 
-    private val CHECKED_DECRYPTION = "CheckedDecryption"
-    private var checkedDecryption = false
-
     override fun attachBaseContext(base: Context) {
         super.attachBaseContext(YuzuApplication.applyLanguage(base))
     }
@@ -98,18 +95,6 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
         }
 
         setContentView(binding.root)
-
-        if (savedInstanceState != null) {
-            checkedDecryption = savedInstanceState.getBoolean(CHECKED_DECRYPTION)
-        }
-        if (!checkedDecryption) {
-            val firstTimeSetup = PreferenceManager.getDefaultSharedPreferences(applicationContext)
-                .getBoolean(Settings.PREF_FIRST_APP_LAUNCH, true)
-            if (!firstTimeSetup) {
-                checkKeys()
-            }
-            checkedDecryption = true
-        }
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
@@ -308,11 +293,6 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
             ).show(supportFragmentManager, MessageDialogFragment.TAG)
         }
     }
-    override fun onSaveInstanceState(outState: Bundle) {
-        super.onSaveInstanceState(outState)
-        outState.putBoolean(CHECKED_DECRYPTION, checkedDecryption)
-    }
-
     fun finishSetup(navController: NavController) {
         navController.navigate(R.id.action_firstTimeSetupFragment_to_gamesFragment)
     }

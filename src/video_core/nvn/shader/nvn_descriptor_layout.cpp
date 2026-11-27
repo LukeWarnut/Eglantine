@@ -182,7 +182,7 @@ DescriptorLayout BuildDescriptorLayout(std::span<const StageInfo> stages,
             u32 slot = 0;
             switch (desc.index) {
             case DriverBank:
-                role = DescriptorRole::DriverBank;
+                role = DescriptorRole::DriverTable;
                 break;
             case ProgramBank:
                 role = DescriptorRole::ProgramConstants;
@@ -364,7 +364,7 @@ namespace {
 
 std::string_view RoleName(DescriptorRole role) {
     switch (role) {
-    case DescriptorRole::DriverBank:
+    case DescriptorRole::DriverTable:
         return "driver-bank";
     case DescriptorRole::ProgramConstants:
         return "program-constants";

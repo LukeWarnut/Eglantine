@@ -213,6 +213,8 @@ private:
     void FrameDumpPass(const Framebuffer* framebuffer);
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
+    /// Records the arguments and the index and vertex buffers of the current draw.
+    bool FrameDumpDrawInputs(bool is_indexed, std::span<const u64> shader_hashes);
 
     /// Records the dynamic state of the draw being prepared with `pipeline` (null for
     /// DrawTexture's blit).
@@ -302,6 +304,10 @@ private:
     u32 submit_waited_draws{64};
     u32 submit_idle_draws{128};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+    /// The draw being prepared, for the frame dump: its instance count (direct draws) and its
+    /// indirect arguments (indirect draws).
+    u32 dump_instance_count{};
+    const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams* dump_indirect{};
     /// Fragment output components the dynamic color write mask was last recorded with
     u32 last_color_output_mask{};
 

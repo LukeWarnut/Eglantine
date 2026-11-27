@@ -84,3 +84,18 @@ TEST_CASE("geometry_consistency and build_order_priority: on by default", "[nx2_
     REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::BuildOrderPriority)));
     REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::ReplayDiskRecordings)));
 }
+
+TEST_CASE("shader compile scheduling switches: on by default", "[nx2_perf]") {
+    REQUIRE(opt_names[Index(Opt::QueueDeferredTranslation)] == "queue_deferred_translation");
+    REQUIRE(opt_names[Index(Opt::StageInFlight)] == "stage_in_flight");
+    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::QueueDeferredTranslation)));
+    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::StageInFlight)));
+    REQUIRE(opt_names[Index(Opt::SharedPipelineLayouts)] == "shared_pipeline_layouts");
+    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::SharedPipelineLayouts)));
+    REQUIRE(opt_names[Index(Opt::TranslationPriority)] == "translation_priority");
+    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::TranslationPriority)));
+    REQUIRE(opt_names[Index(Opt::SavedPipelineLayouts)] == "saved_pipeline_layouts");
+    REQUIRE(opt_names[Index(Opt::HelpWhileInFlight)] == "help_while_in_flight");
+    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::SavedPipelineLayouts)));
+    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::HelpWhileInFlight)));
+}

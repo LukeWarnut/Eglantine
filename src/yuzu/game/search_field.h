@@ -23,6 +23,8 @@ public:
 
     void clear();
     void setFocus();
+    /// Places a widget at the bar's end, before the close button.
+    void AddTrailingWidget(QWidget* widget);
 
 private:
     void changeEvent(QEvent*) override;

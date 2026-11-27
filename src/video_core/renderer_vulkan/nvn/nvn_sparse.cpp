@@ -442,6 +442,8 @@ bool SparseBacking::Attach(Context::Impl& impl, const Storage& s, const char*& r
     }
     tile_pages_.assign(static_cast<size_t>(layout_.TileCount()) * host_per_x_ * host_per_y_,
                        SparsePagePool::NoPage);
+    tile_verified_pool_.assign(layout_.TileCount(), 0);
+    tile_verified_gen_.assign(layout_.TileCount(), 0);
     tail_pages_.assign(layout_.layers, {});
     tail_plan_ = PlanSparseTail(s, layout_);
     if (tail_plan_.unsupported) {
@@ -491,6 +493,10 @@ void SparseBacking::Queue(u8& flags, u32 id, bool tail) {
 }
 
 void SparseBacking::SetMapped(u8& flags, u32 id, bool tail, bool mapped) {
+    if (!tail && id < tile_verified_gen_.size()) {
+        tile_verified_pool_[id] = 0;
+        tile_verified_gen_[id] = 0;
+    }
     const bool was = (flags & Mapped) != 0;
     if (mapped) {
         if (!was) {
@@ -530,6 +536,10 @@ void SparseBacking::ContentChanged(u64 begin, u64 end) {
     layout_.ForEachUnit(
         begin, end,
         [&](u32 id) {
+            if (id < tile_verified_gen_.size()) {
+                tile_verified_pool_[id] = 0;
+                tile_verified_gen_[id] = 0;
+            }
             if ((tile_flags_[id] & Mapped) != 0) {
                 tile_flags_[id] |= Dirty;
                 if ((tile_flags_[id] & Bound) != 0) {
@@ -551,6 +561,10 @@ void SparseBacking::MarkAllDirty() {
 }
 
 void SparseBacking::MarkTileDirty(u32 id) {
+    if (id < tile_verified_gen_.size()) {
+        tile_verified_pool_[id] = 0;
+        tile_verified_gen_[id] = 0;
+    }
     if ((tile_flags_[id] & Mapped) != 0) {
         tile_flags_[id] |= Dirty;
         if ((tile_flags_[id] & Bound) != 0) {
@@ -842,6 +856,9 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
     starved_only_ = starved_ != 0;
     starved_generation_ = generation;
     if (!image_binds.empty() || !opaque_binds.empty()) {
+        // Flush any queued replay draws before binding sparse memory so `mkw_last_submit_*`
+        // covers every prior draw that may sample this atlas.
+        impl.FlushSubmitBatch();
         if (impl.mario_kart_world) {
             CompactSparseImageBinds(image_binds, granule_x_, granule_y_);
         }

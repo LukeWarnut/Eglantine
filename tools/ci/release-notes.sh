@@ -99,5 +99,12 @@ EOF2
 
   if [[ -n "$x_pgo$a_pgo$w_pgo" ]]; then
     echo "The PGO builds are the same programs compiled with profile-guided optimization (clang plus Eglantine's profile); prefer them when your CPU supports it."
+    printf '\n'
   fi
+
+  cat <<'EOF2'
+## Support Eglantine
+
+Eglantine is free and open source. If you would like to help with build machines, hosting and development, you can donate on [Open Collective](https://opencollective.com/eglantine-community).
+EOF2
 } > "$out"

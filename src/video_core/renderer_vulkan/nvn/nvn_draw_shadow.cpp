@@ -106,6 +106,20 @@ DrawContext::ShadowDecision DrawContext::ClassifyShadows(const DrawPlan& plan) {
             const bool inside = use.info_index != DrawPlan::RangeUse::NO_INFO &&
                                 use.offset >= shadow.begin && use_end <= shadow.end;
             if (!inside) {
+                const bool mirror_ro =
+                    shadow.mirror && use.shadowable && !use.write &&
+                    use.info_index != DrawPlan::RangeUse::NO_INFO &&
+                    std::ranges::none_of(plan.ranges, [&](const DrawPlan::RangeUse& other) {
+                        return other.write && other.pool == use.pool &&
+                               Overlaps(use.offset, use_end, other.offset,
+                                        other.offset + other.size);
+                    });
+                if (mirror_ro) {
+                    if (pass_open && !impl.MirrorCurrent(*use.pool, use.offset, use.size)) {
+                        decision.need_outside_pass = true;
+                    }
+                    continue;
+                }
                 decision.flush_mask.set(i);
                 decision.flush_needed = true;
             }
@@ -378,11 +392,7 @@ void DrawContext::ApplyMirrors(DrawPlan& plan, bool allow_create) {
         }
         if (use.creates_mirror) {
             // The pages uniform bindings use: PrefetchMirrors keeps them current from now on.
-            mirror->prefetch = true;
-            if (!mirror->wanted) {
-                mirror->wanted = std::make_unique<MirrorPages>(use.pool->size);
-            }
-            mirror->wanted->Set(use.offset, use.size);
+            impl.MirrorMarkPrefetch(*use.pool, use.offset, use.size);
         }
         if (!allow_create) {
             if (impl.MirrorCurrent(*use.pool, use.offset, use.size)) {
@@ -523,15 +533,16 @@ void DrawContext::PrefetchMirrors() {
     if (!impl.ubo_mirror && (impl.vtxcov & (VTXCOV_INPASS | VTXCOV_SHADER_WRITES)) == 0) {
         return;
     }
-    for (Pool* const pool : impl.vram_mirrored) {
-        PoolMirror* const mirror = pool->vram_mirror.get();
-        if (!mirror->prefetch) {
+    for (const auto& entry : impl.vram_prefetch_mirrors) {
+        if (entry.write_epoch != nullptr &&
+            entry.write_epoch->load(std::memory_order_acquire) == entry.mirror->epoch_clean &&
+            !entry.mirror->wanted_dirty) {
             continue;
         }
         mirror_runs.clear();
-        impl.MirrorTakeStaleWanted(*pool, mirror_runs);
+        impl.MirrorTakeStaleWanted(*entry.pool, mirror_runs);
         for (const auto& [begin, end] : mirror_runs) {
-            mirror_copies.push_back({pool, begin, end});
+            mirror_copies.push_back({entry.pool, begin, end});
         }
     }
     // Before the barrier flush of the pass begin: its barrier orders the copies before the draws'
@@ -899,7 +910,7 @@ void DrawContext::ResolveIndirectSource(BufferRef& ref, u64 size) {
         bool serve = FindShadow(*ref.pool, ref.pool_offset, end) != shadows.size();
         if (!serve && impl.MirrorCurrent(*ref.pool, ref.pool_offset, size)) {
             serve = std::ranges::none_of(shadows, [&](const Shadow& entry) {
-                return entry.pool == ref.pool &&
+                return !entry.mirror && entry.pool == ref.pool &&
                        Overlaps(ref.pool_offset, end, entry.begin, entry.end);
             });
         }

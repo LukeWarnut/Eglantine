@@ -74,6 +74,7 @@ void ControllerNavigation::ControllerUpdateButton() {
         TriggerButton(Settings::NativeButton::B, Qt::Key_Escape);
         TriggerButton(Settings::NativeButton::X, Qt::Key_Settings);
         TriggerButton(Settings::NativeButton::Y, Qt::Key_Favorites);
+        TriggerButton(Settings::NativeButton::Plus, Qt::Key_Menu);
         TriggerButton(Settings::NativeButton::DDown, Qt::Key_Down);
         TriggerButton(Settings::NativeButton::DLeft, Qt::Key_Left);
         TriggerButton(Settings::NativeButton::DRight, Qt::Key_Right);

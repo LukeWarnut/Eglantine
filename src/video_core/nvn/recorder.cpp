@@ -404,19 +404,20 @@ u64 Recorder::Impl::AnonymousSamplerSerial(const SamplerDesc& desc) {
 
 // ---- Handle -> list map -----------------------------------------------------------------------------
 
-std::shared_ptr<const List> Recorder::Impl::FindList(u64 handle) {
-    std::lock_guard lock{lists_mutex};
-    const auto it = lists.find(handle);
-    if (it == lists.end()) {
+const List* Recorder::Impl::FindListLocked(u64 handle, u64 presents) {
+    const auto it = lists_by_handle.find(handle);
+    if (it == lists_by_handle.end()) {
         return nullptr;
     }
-    it->second.last_used_present = stats.presents.load(std::memory_order_relaxed);
-    if (handle >= SYNTHETIC_BASE) {
-        synthetic_lru.erase(it->second.stamp);
-        it->second.stamp = ++lru_clock;
-        synthetic_lru.emplace(it->second.stamp, handle);
+    ListEntry& entry = *it->second;
+    entry.last_used_present = presents;
+    if (handle >= SYNTHETIC_BASE &&
+        (synthetic_cap_bytes != 0 || synthetic_lru.size() >= MAX_SYNTHETIC_LISTS / 2)) {
+        synthetic_lru.erase(entry.stamp);
+        entry.stamp = ++lru_clock;
+        synthetic_lru.emplace(entry.stamp, handle);
     }
-    return it->second.list;
+    return entry.list.get();
 }
 
 void Recorder::Impl::NoteCalleesLocked(const List& list, bool add) {
@@ -446,6 +447,7 @@ std::map<u64, ListEntry>::iterator Recorder::Impl::EraseListLocked(
         NoteCalleesLocked(*it->second.list, false);
     }
     removed.push_back(std::move(it->second.list));
+    lists_by_handle.erase(it->first);
     return lists.erase(it);
 }
 
@@ -506,7 +508,9 @@ void Recorder::Impl::InsertList(u64 handle, const std::vector<std::pair<u64, u64
             EraseListLocked(existing, removed);
         }
         const List& inserted = *list;
-        ListEntry& entry = lists[handle];
+        auto [inserted_it, inserted_ok] = lists.try_emplace(handle);
+        ListEntry& entry = inserted_it->second;
+        lists_by_handle[handle] = &entry;
         entry.end = ranges.front().second;
         entry.bytes = ListBytes(inserted);
         entry.last_used_present = stats.presents.load(std::memory_order_relaxed);
@@ -604,10 +608,10 @@ void Recorder::Impl::ResolveDeferred(u64* record) {
     }
 }
 
-bool Recorder::Impl::Expand(u64 handle, std::vector<u64>& out, std::vector<Action>& actions,
-                            std::vector<u64>& refs, u32 depth) {
-    const std::shared_ptr<const List> list = FindList(handle);
-    if (!list) {
+bool Recorder::Impl::ExpandLocked(u64 handle, std::vector<u64>& out, std::vector<Action>& actions,
+                                  std::vector<u64>& refs, u32 depth, u64 presents) {
+    const List* const list = FindListLocked(handle, presents);
+    if (list == nullptr) {
         return false;
     }
     refs.insert(refs.end(), list->refs.begin(), list->refs.end());
@@ -617,7 +621,9 @@ bool Recorder::Impl::Expand(u64 handle, std::vector<u64>& out, std::vector<Actio
     }
     size_t action_index = 0;
     const auto copy = [&](size_t begin, size_t end) {
-        out.insert(out.end(), words.begin() + begin, words.begin() + end);
+        if (end > begin) {
+            out.insert(out.end(), words.data() + begin, words.data() + end);
+        }
     };
     const auto expand_record = [&](size_t offset) {
         const auto* header = reinterpret_cast<const RecordHeader*>(&words[offset]);
@@ -630,7 +636,7 @@ bool Recorder::Impl::Expand(u64 handle, std::vector<u64>& out, std::vector<Actio
             const u64 callee = RecordPayload<CallListPayload>(header)->handle;
             if (depth + 1 > MAX_CALL_DEPTH) {
                 ++stats.call_depth_exceeded;
-            } else if (!Expand(callee, out, actions, refs, depth + 1)) {
+            } else if (!ExpandLocked(callee, out, actions, refs, depth + 1, presents)) {
                 NVN_WARN_LIMITED(stats.unknown_call_handle,
                                  "[nvn] CallList of unknown command handle {:#x}", callee);
             }
@@ -999,16 +1005,30 @@ u64 Recorder::QueueSubmitCommands(u64 queue_va, std::span<const u64> handles) {
     Submission submission{};
     std::vector<Action> actions;
     std::vector<u64> refs;
-    for (const u64 handle : handles) {
-        std::vector<u64> words;
-        if (!impl->Expand(handle, words, actions, refs, 0)) {
-            NVN_WARN_LIMITED(impl->stats.unknown_call_handle,
-                             "[nvn] QueueSubmitCommands of unknown command handle {:#x}", handle);
-            continue;
+    actions.reserve(64);
+    refs.reserve(256);
+    {
+        std::lock_guard lists_lock{impl->lists_mutex};
+        const u64 presents = impl->stats.presents.load(std::memory_order_relaxed);
+        for (const u64 handle : handles) {
+            std::vector<u64> words;
+            words.reserve(impl->last_expanded_words);
+            if (!impl->ExpandLocked(handle, words, actions, refs, 0, presents)) {
+                NVN_WARN_LIMITED(impl->stats.unknown_call_handle,
+                                 "[nvn] QueueSubmitCommands of unknown command handle {:#x}",
+                                 handle);
+                continue;
+            }
+            if (++impl->expand_submit_count % 64 == 0) {
+                impl->last_expanded_words =
+                    (std::max<size_t>)(4096, impl->last_expanded_words * 15 / 16);
+            }
+            impl->last_expanded_words = (std::min<size_t>)(
+                (std::max)(words.size() + 1, impl->last_expanded_words), size_t{4} << 20);
+            words.push_back(0); // End record: op 0, flags 0, size 8
+            words.back() = u64{8} << 32;
+            submission.lists.push_back(std::move(words));
         }
-        words.push_back(0); // End record: op 0, flags 0, size 8
-        words.back() = u64{8} << 32;
-        submission.lists.push_back(std::move(words));
     }
     if (submission.lists.empty()) {
         return queue->last_seq.load();
@@ -1596,10 +1616,21 @@ bool Recorder::BufferInitialize(u64 buffer_va, u64 memory_pool_va, u64 offset, u
         impl->Release(ObjectKind::Buffer, buffer_va, buffer->serial);
         return false;
     }
-    {
-        const std::scoped_lock lock{impl->buffer_spans_mutex};
-        const u64 begin = pool->address + offset;
-        impl->buffer_spans.push_back({begin, begin + size, buffer->serial});
+    const u64 begin = pool->address + offset;
+    const u64 end = begin + size;
+    buffer->gpu_begin = begin;
+    buffer->gpu_end = end;
+    if (size != 0) {
+        const std::unique_lock lock{impl->buffer_spans_mutex};
+        if (size > Impl::BUFFER_SPAN_LARGE_LIMIT) {
+            impl->buffer_spans_large.push_back({begin, end, buffer->serial});
+        } else {
+            const u64 first_chunk = begin >> Impl::BUFFER_SPAN_CHUNK_SHIFT;
+            const u64 last_chunk = (end - 1) >> Impl::BUFFER_SPAN_CHUNK_SHIFT;
+            for (u64 chunk = first_chunk; chunk <= last_chunk; ++chunk) {
+                impl->buffer_span_chunks[chunk].push_back({begin, end, buffer->serial});
+            }
+        }
     }
     return true;
 }
@@ -1607,20 +1638,52 @@ bool Recorder::BufferInitialize(u64 buffer_va, u64 memory_pool_va, u64 offset, u
 void Recorder::BufferFinalize(u64 buffer_va) {
     if (const BufferObject* buffer =
             impl->Lookup(impl->buffers, ObjectKind::Buffer, buffer_va, __func__)) {
-        {
-            const std::scoped_lock lock{impl->buffer_spans_mutex};
-            std::erase_if(impl->buffer_spans, [&](const Impl::BufferSpan& span) {
-                return span.serial == buffer->serial;
-            });
+        const u64 begin = buffer->gpu_begin;
+        const u64 end = buffer->gpu_end;
+        const u64 serial = buffer->serial;
+        if (end > begin) {
+            const auto erase_serial = [serial](std::vector<Impl::BufferSpan>& spans) {
+                for (size_t i = spans.size(); i-- > 0;) {
+                    if (spans[i].serial == serial) {
+                        spans[i] = spans.back();
+                        spans.pop_back();
+                    }
+                }
+            };
+            const std::unique_lock lock{impl->buffer_spans_mutex};
+            if (end - begin > Impl::BUFFER_SPAN_LARGE_LIMIT) {
+                erase_serial(impl->buffer_spans_large);
+            } else {
+                const u64 first_chunk = begin >> Impl::BUFFER_SPAN_CHUNK_SHIFT;
+                const u64 last_chunk = (end - 1) >> Impl::BUFFER_SPAN_CHUNK_SHIFT;
+                for (u64 chunk = first_chunk; chunk <= last_chunk; ++chunk) {
+                    const auto it = impl->buffer_span_chunks.find(chunk);
+                    if (it == impl->buffer_span_chunks.end()) {
+                        continue;
+                    }
+                    erase_serial(it->second);
+                    if (it->second.empty()) {
+                        impl->buffer_span_chunks.erase(it);
+                    }
+                }
+            }
         }
-        impl->Release(ObjectKind::Buffer, buffer_va, buffer->serial);
+        impl->Release(ObjectKind::Buffer, buffer_va, serial);
     }
 }
 
 u32 Recorder::Impl::BufferBytesFrom(u64 address) {
-    const std::scoped_lock lock{buffer_spans_mutex};
+    const std::shared_lock lock{buffer_spans_mutex};
     u64 end = 0;
-    for (const BufferSpan& span : buffer_spans) {
+    if (const auto it = buffer_span_chunks.find(address >> BUFFER_SPAN_CHUNK_SHIFT);
+        it != buffer_span_chunks.end()) {
+        for (const BufferSpan& span : it->second) {
+            if (span.begin <= address && address < span.end) {
+                end = (std::max)(end, span.end);
+            }
+        }
+    }
+    for (const BufferSpan& span : buffer_spans_large) {
         if (span.begin <= address && address < span.end) {
             end = (std::max)(end, span.end);
         }

@@ -87,6 +87,8 @@ public:
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
 
     [[nodiscard]] bool IsNativeProgram() const override;
+    [[nodiscard]] std::span<const Shader::Ampere::NativeRegisterRemap> NativeRegisterRemaps()
+        const override;
 
     [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
@@ -94,6 +96,8 @@ public:
                                                           u32 indirect) override;
 
     [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
+
+    [[nodiscard]] std::vector<u64> UnmappedStoragePointerTableKeys() const override;
 
     [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const override;
 
@@ -155,6 +159,8 @@ protected:
     GPUVAddr program_base{};
 
     std::vector<u64> code;
+    /// Parsed from `code` when first asked for.
+    mutable std::optional<std::vector<Shader::Ampere::NativeRegisterRemap>> register_remaps;
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     ::Common::unordered_map<u64, u32> cbuf_values;
@@ -205,8 +211,10 @@ public:
     /// Copies the 3D engine state translation reads and stops using the engine, so the program
     /// can be translated on a worker thread while the GPU thread moves on. Returns false, leaving
     /// the environment unchanged, when the texture pool isn't one contiguous device range or the
-    /// GPU has written it.
-    [[nodiscard]] bool Detach(Tegra::MaxwellDeviceMemoryManager& device_memory);
+    /// GPU has written it. pool_checked: another stage of the same pipeline (same engine state)
+    /// passed those checks already.
+    [[nodiscard]] bool Detach(Tegra::MaxwellDeviceMemoryManager& device_memory,
+                              bool pool_checked = false);
 
     /// Bytes of constant buffer contents copied by Detach (0 if not detached).
     [[nodiscard]] size_t SnapshotSizeBytes() const noexcept;
@@ -323,13 +331,19 @@ public:
     FileEnvironment& operator=(const FileEnvironment&) = delete;
     FileEnvironment(const FileEnvironment&) = delete;
 
-    void Deserialize(std::ifstream& file, bool with_mesh_state = false);
+    /// `remaining` is the number of bytes left in the file. Every length in a record comes out of
+    /// that file, so a damaged or stale cache can otherwise choose its own allocation size; the
+    /// budget refuses such a record before anything is sized. The default is unbounded, which is
+    /// what callers reading records this build wrote get.
+    void Deserialize(std::ifstream& file, bool with_mesh_state = false, u64 remaining = ~u64{0});
 
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
 
     [[nodiscard]] bool IsNativeProgram() const override;
+    [[nodiscard]] std::span<const Shader::Ampere::NativeRegisterRemap> NativeRegisterRemaps()
+        const override;
 
     [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
@@ -337,6 +351,8 @@ public:
                                                           u32 indirect) override;
 
     [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
+
+    [[nodiscard]] std::vector<u64> UnmappedStoragePointerTableKeys() const override;
 
     [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const override;
 
@@ -369,6 +385,8 @@ public:
 
 private:
     std::vector<u64> code;
+    /// Parsed from `code` when first asked for.
+    mutable std::optional<std::vector<Shader::Ampere::NativeRegisterRemap>> register_remaps;
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     ::Common::unordered_map<u64, u32> cbuf_values;
@@ -407,8 +425,9 @@ struct CacheUpgrade {
 };
 
 /// Loads the records of a pipeline cache file. A file from min_compatible_version up to the
-/// expected version is loaded too when `upgrade` is given (its records are kept there); older or
-/// broken files are deleted.
+/// expected version is loaded too when `upgrade` is given (its records are kept there); broken
+/// files are deleted. A file of another version is set aside as <name>.v<version> (the two newest
+/// are kept), and one this version set aside earlier takes its place.
 void LoadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,

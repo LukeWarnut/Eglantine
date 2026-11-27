@@ -4,11 +4,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 #include "common/cityhash.h"
 #include "common/logging.h"
@@ -30,8 +32,10 @@ enum ReadKind : u8 {
     Replacement,
 };
 
-// Past this, the cache starts over (translations hold program metadata and SPIR-V).
+// Past this, the least recently used translations are dropped down to EvictTo (translations hold
+// program metadata and SPIR-V).
 constexpr size_t MaxBytes = 256ULL << 20;
+constexpr size_t EvictTo = MaxBytes / 4 * 3;
 
 class Writer {
 public:
@@ -81,6 +85,11 @@ u32 StageCache::Recorder::TranslateProgramAddress(u32 address) const {
 
 bool StageCache::Recorder::IsNativeProgram() const {
     return inner.IsNativeProgram();
+}
+
+std::span<const Shader::Ampere::NativeRegisterRemap> StageCache::Recorder::NativeRegisterRemaps()
+    const {
+    return inner.NativeRegisterRemaps();
 }
 
 bool StageCache::Recorder::IsCbufStorageBufferPointer(u32 index, u32 offset) {
@@ -186,10 +195,90 @@ std::vector<u8> StageCache::Signature(Shader::Environment& env, u64 unique_hash,
     return std::move(writer.bytes);
 }
 
+StageCache::InFlight::InFlight(StageCache* cache_, std::vector<u64> hashes_)
+    : cache{cache_}, hashes{std::move(hashes_)} {}
+
+StageCache::InFlight::~InFlight() {
+    Release();
+}
+
+StageCache::InFlight::InFlight(InFlight&& other) noexcept
+    : cache{std::exchange(other.cache, nullptr)}, hashes{std::move(other.hashes)} {}
+
+StageCache::InFlight& StageCache::InFlight::operator=(InFlight&& other) noexcept {
+    if (this != &other) {
+        Release();
+        cache = std::exchange(other.cache, nullptr);
+        hashes = std::move(other.hashes);
+    }
+    return *this;
+}
+
+void StageCache::InFlight::Release() {
+    if (cache == nullptr) {
+        return;
+    }
+    if (!hashes.empty()) {
+        {
+            std::scoped_lock lock{cache->in_flight_mutex};
+            for (const u64 hash : hashes) {
+                cache->in_flight.erase(hash);
+            }
+        }
+        cache->in_flight_cv.notify_all();
+    }
+    cache = nullptr;
+    hashes.clear();
+}
+
+u64 StageCache::SignatureHash(const std::vector<u8>& signature) {
+    return Common::CityHash64(reinterpret_cast<const char*>(signature.data()), signature.size());
+}
+
+bool StageCache::WaitForInFlight(std::span<const u64> hashes, std::chrono::milliseconds limit,
+                                 const std::function<bool()>& help) {
+    const auto busy = [&] {
+        for (const u64 hash : hashes) {
+            if (in_flight.contains(hash)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::unique_lock lock{in_flight_mutex};
+    if (!busy()) {
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (help && busy() && std::chrono::steady_clock::now() < deadline) {
+        lock.unlock();
+        const bool helped = help();
+        lock.lock();
+        if (!helped) {
+            break;
+        }
+        in_flight_helped.fetch_add(1, std::memory_order_relaxed);
+    }
+    in_flight_cv.wait_until(lock, deadline, [&] { return !busy(); });
+    return true;
+}
+
+StageCache::InFlight StageCache::ClaimInFlight(std::span<const u64> hashes) {
+    std::vector<u64> claimed;
+    {
+        std::scoped_lock lock{in_flight_mutex};
+        for (const u64 hash : hashes) {
+            if (in_flight.insert(hash).second) {
+                claimed.push_back(hash);
+            }
+        }
+    }
+    return InFlight{this, std::move(claimed)};
+}
+
 std::shared_ptr<const StageCache::Translation> StageCache::Find(const std::vector<u8>& signature,
                                                                 Shader::Environment& env) {
-    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(signature.data()),
-                                        signature.size());
+    const u64 hash = SignatureHash(signature);
     std::vector<std::shared_ptr<const Translation>> candidates;
     {
         std::scoped_lock lock{mutex};
@@ -245,6 +334,8 @@ std::shared_ptr<const StageCache::Translation> StageCache::Find(const std::vecto
             same = false;
         }
         if (same) {
+            candidate->last_used.store(use_clock.fetch_add(1, std::memory_order_relaxed) + 1,
+                                       std::memory_order_relaxed);
             return candidate;
         }
     }
@@ -264,18 +355,45 @@ std::shared_ptr<const StageCache::Emitted> StageCache::FindEmitted(
 
 void StageCache::Insert(std::shared_ptr<Translation> translation,
                         std::shared_ptr<const Emitted> emitted) {
-    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(translation->signature.data()),
-                                        translation->signature.size());
+    const u64 hash = SignatureHash(translation->signature);
+    const auto same_reads = [&](const Translation& other) {
+        return other.signature == translation->signature &&
+               std::ranges::equal(other.reads, translation->reads,
+                                  [](const Translation::Read& a, const Translation::Read& b) {
+                                      return a.kind == b.kind && a.a == b.a && a.b == b.b &&
+                                             a.c == b.c && a.value == b.value;
+                                  });
+    };
+    std::shared_ptr<const Translation> existing;
+    {
+        std::scoped_lock lock{mutex};
+        auto& bucket{translations[hash]};
+        // Another thread translated the same stage meanwhile: keep one, with both emissions.
+        for (const auto& candidate : bucket) {
+            if (same_reads(*candidate)) {
+                existing = candidate;
+                break;
+            }
+        }
+        if (!existing) {
+            translation->emitted.push_back(emitted);
+            translation->last_used.store(use_clock.fetch_add(1, std::memory_order_relaxed) + 1,
+                                         std::memory_order_relaxed);
+            bucket.push_back(translation);
+        }
+    }
+    CountTranslated();
+    if (existing) {
+        deduplicated.fetch_add(1, std::memory_order_relaxed);
+        if (!FindEmitted(*existing, emitted->runtime_key)) {
+            AddEmitted(*existing, std::move(emitted));
+        }
+        return;
+    }
     const size_t size = translation->reads.size() * sizeof(Translation::Read) +
                         translation->signature.size() + sizeof(Translation) +
                         emitted->spirv.size() * sizeof(u32) + sizeof(Emitted);
-    translation->emitted.push_back(std::move(emitted));
-    {
-        std::scoped_lock lock{mutex};
-        translations[hash].push_back(std::move(translation));
-    }
-    Account(size);
-    CountTranslated();
+    Account(*translation, size);
 }
 
 void StageCache::AddEmitted(const Translation& translation, std::shared_ptr<const Emitted> emitted) {
@@ -284,17 +402,50 @@ void StageCache::AddEmitted(const Translation& translation, std::shared_ptr<cons
         std::scoped_lock lock{translation.emitted_mutex};
         translation.emitted.push_back(std::move(emitted));
     }
-    Account(size);
+    Account(translation, size);
 }
 
-void StageCache::Account(size_t added) {
+void StageCache::Account(const Translation& translation, size_t added) {
+    translation.bytes.fetch_add(added, std::memory_order_relaxed);
     std::scoped_lock lock{mutex};
     bytes += added;
-    if (bytes > MaxBytes) {
-        // Translations in use elsewhere stay alive through their shared pointers.
-        translations.clear();
-        bytes = 0;
+    if (bytes <= MaxBytes) {
+        return;
     }
+    // Translations in use elsewhere stay alive through their shared pointers.
+    struct Entry {
+        u64 last_used;
+        u64 hash;
+        const Translation* translation;
+    };
+    std::vector<Entry> entries;
+    for (const auto& [hash, bucket] : translations) {
+        for (const auto& candidate : bucket) {
+            entries.push_back({candidate->last_used.load(std::memory_order_relaxed), hash,
+                               candidate.get()});
+        }
+    }
+    std::ranges::sort(entries, {}, &Entry::last_used);
+    size_t dropped{};
+    for (const Entry& entry : entries) {
+        if (bytes <= EvictTo) {
+            break;
+        }
+        // Read the size first: erasing may destroy the translation.
+        const size_t size = entry.translation->bytes.load(std::memory_order_relaxed);
+        auto& bucket{translations[entry.hash]};
+        std::erase_if(bucket, [&](const auto& candidate) {
+            return candidate.get() == entry.translation;
+        });
+        if (bucket.empty()) {
+            translations.erase(entry.hash);
+        }
+        bytes -= (std::min)(bytes, size);
+        ++dropped;
+    }
+    evicted.fetch_add(dropped, std::memory_order_relaxed);
+    LOG_INFO(Render_Vulkan, "Stage cache: over {} MiB, dropped the {} least recently used stages",
+             MaxBytes >> 20, dropped);
 }
 
 std::vector<u8> StageCache::RuntimeKey(const Shader::RuntimeInfo& info,
@@ -311,6 +462,8 @@ std::vector<u8> StageCache::RuntimeKey(const Shader::RuntimeInfo& info,
         writer.Put(word);
     }
     writer.Put(static_cast<u32>(info.per_primitive_generics.to_ulong()));
+    writer.Put(info.mesh_as_compute);
+    writer.Put(static_cast<u32>(info.screen_linear_generics.to_ulong()));
     writer.Put(static_cast<u32>(info.previous_stage_legacy_stores_mapping.size()));
     for (const auto& [from, to] : info.previous_stage_legacy_stores_mapping) {
         writer.Put(from);
@@ -382,6 +535,12 @@ void StageCache::CountVerifyMismatch(u64 unique_hash) {
               unique_hash);
 }
 
+void StageCache::CountInFlightWait(size_t stages, size_t reused) {
+    in_flight_waits.fetch_add(1, std::memory_order_relaxed);
+    in_flight_waited_stages.fetch_add(stages, std::memory_order_relaxed);
+    in_flight_reused.fetch_add(reused, std::memory_order_relaxed);
+}
+
 void StageCache::Log() {
     const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
@@ -394,8 +553,13 @@ void StageCache::Log() {
         return;
     }
     LOG_INFO(Render_Vulkan,
-             "Stage cache: {} stages reused whole, {} translations reused, {} translated{}",
+             "Stage cache: {} stages reused whole, {} translations reused, {} translated; "
+             "{} pipelines waited for {} stages another thread was translating, {} of them "
+             "reused, {} translations run while waiting; {} duplicates merged, {} evicted{}",
              reused_emitted.load(), reused_translation.load(), translated.load(),
+             in_flight_waits.load(), in_flight_waited_stages.load(), in_flight_reused.load(),
+             in_flight_helped.load(),
+             deduplicated.load(), evicted.load(),
              verify ? fmt::format(", {} verify mismatches", verify_mismatches.load())
                     : std::string{});
 }

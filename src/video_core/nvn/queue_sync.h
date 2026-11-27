@@ -127,7 +127,7 @@ public:
 
     /// `timeout`: how long a front item may be blocked without progress before Pump(release=true)
     /// releases it.
-    explicit StreamScheduler(Clock::duration timeout) : timeout{timeout} {}
+    explicit StreamScheduler(Clock::duration timeout_duration) : timeout{timeout_duration} {}
 
     void Push(u32 queue, std::unique_ptr<StreamItem> item, Clock::time_point now);
 

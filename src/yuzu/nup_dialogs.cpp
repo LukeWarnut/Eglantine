@@ -245,12 +245,21 @@ NupMetadataDialog::NupMetadataDialog(const std::filesystem::path& source,
     icon_hint->setWordWrap(true);
     icon_hint->setEnabled(false);
     auto* choose_icon = new QPushButton(tr("Choose Icon..."));
+    find_icon = new QPushButton(tr("Find Icon Online..."));
     reset_icon = new QPushButton(tr("Use Detected"));
+    icon_search = new IconSearch(this);
     connect(choose_icon, &QPushButton::clicked, this, &NupMetadataDialog::ChooseIcon);
+    connect(find_icon, &QPushButton::clicked, this, &NupMetadataDialog::FindIcon);
+    connect(icon_search, &IconSearch::RunningChanged, this, [this](bool running) {
+        find_icon->setEnabled(!running);
+        find_icon->setText(running ? tr("Searching...") : tr("Find Icon Online..."));
+    });
+    connect(icon_search, &IconSearch::IconSelected, this, &NupMetadataDialog::OnIconFound);
     connect(reset_icon, &QPushButton::clicked, this, &NupMetadataDialog::ResetIcon);
 
     auto* icon_buttons = new QVBoxLayout;
     icon_buttons->addWidget(choose_icon);
+    icon_buttons->addWidget(find_icon);
     if (!detected.icon.empty()) {
         icon_buttons->addWidget(reset_icon);
     } else {
@@ -296,6 +305,7 @@ NupMetadataDialog::NupMetadataDialog(const std::filesystem::path& source,
     form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     form->setHorizontalSpacing(16);
     form->setVerticalSpacing(14);
+    form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     form->addRow(tr("Icon"), icon_row);
     form->addRow(tr("Name"), name_edit);
     form->addRow(tr("Publisher"), publisher_edit);
@@ -393,6 +403,23 @@ void NupMetadataDialog::SetIconFromFile(const QString& path) {
         return;
     }
     custom_icon = encoded;
+    UpdateIconPreview();
+}
+
+void NupMetadataDialog::FindIcon() {
+    icon_search->Start(name_edit->text());
+}
+
+void NupMetadataDialog::OnIconFound(const QByteArray& png, const QString& resolved_title) {
+    const auto encoded = EncodeIconData(png);
+    if (encoded.isEmpty()) {
+        icon_hint->setText(tr("The icon that was found could not be read."));
+        return;
+    }
+    custom_icon = encoded;
+    if (!resolved_title.isEmpty()) {
+        name_edit->setText(resolved_title);
+    }
     UpdateIconPreview();
 }
 
@@ -502,6 +529,23 @@ void NupProgressDialog::SetProgress(const FileSys::Nup::PackProgress& progress) 
                     .arg(rate / (1024 * 1024), 0, 'f', 0)
                     .arg(remaining / 60)
                     .arg(remaining % 60, 2, 10, QLatin1Char('0'));
+    }
+    details->setText(text);
+}
+
+void NupProgressDialog::SetByteProgress(u64 done, u64 total, const QString& timing) {
+    if (cancelling) {
+        return;
+    }
+    const double fraction = total == 0 ? 0.0 : double(done) / total;
+    bar->setRange(0, total == 0 || done >= total ? 0 : 1000);
+    bar->setValue(static_cast<int>(std::min(999.0, fraction * 1000)));
+    status->setText(total == 0 ? tr("Preparing...")
+                              : done >= total ? tr("Finishing...")
+                                              : tr("%1%").arg(fraction * 100, 0, 'f', 1));
+    QString text = timing;
+    if (total != 0) {
+        text.prepend(tr("%1 / %2 MB\n").arg(Megabytes(done), Megabytes(total)));
     }
     details->setText(text);
 }

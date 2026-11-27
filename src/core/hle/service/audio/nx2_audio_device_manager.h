@@ -771,7 +771,15 @@ private:
         const auto size = rp.Pop<u64>();
         const auto name = Common::StringFromBuffer(ctx.ReadBuffer(0));
         auto stream = std::make_shared<Nx2SysmixStream>();
-        stream->kind = kind;
+        // The name carries the direction ('OutputStream-<n>=>...', 'InputStream-<n><=...'); the first
+        // word does not always: Xenoblade Chronicles 2 creates its output stream with 1 there.
+        if (name.starts_with("OutputStream-")) {
+            stream->kind = 0;
+        } else if (name.starts_with("InputStream-")) {
+            stream->kind = 1;
+        } else {
+            stream->kind = kind;
+        }
         stream->buffer = buffer;
         stream->size = size;
         // 'InputStream-<n><=<format><=<device>': the device an input stream carries.
@@ -784,8 +792,9 @@ private:
             stream->owner = session_id;
             streams->streams.emplace(stream->id, stream);
         }
-        LOG_INFO(Service_Audio, "stream {} '{}': kind {}, flags {:#x}, buffer {:#x} size {:#x}",
-                 stream->id, name, kind, flags, buffer, size);
+        LOG_INFO(Service_Audio,
+                 "stream {} '{}': kind {} ({}), flags {:#x}, buffer {:#x} size {:#x}", stream->id,
+                 name, kind, stream->kind ? "input" : "output", flags, buffer, size);
         IPC::ResponseBuilder rb{ctx, 3, 0, 1};
         rb.Push(ResultSuccess);
         rb.Push(stream->id);

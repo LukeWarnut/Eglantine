@@ -21,6 +21,8 @@ inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
 inline constexpr u64 HyruleWarriorsProgramId = 0x04003F40232DE000ULL;
 inline constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
 
+inline constexpr u64 YoshiProgramId = 0x0400245021D2C000ULL;
+
 struct RecommendedSetting {
     std::string key;
     std::string value;
@@ -74,6 +76,8 @@ inline const std::map<u64, GamePreset> game_presets{
     // Its dynamic resolution follows the GPU time it measures: with Boost it reads ~4x too little
     // and keeps 2096x1179 in busy areas (host GPU at 99%); with Normal it steps down to 1440x810
     // there, as the console does. Sync memory operations waited for a GPU fence 7-8 times a frame.
+    // It resets its GPU-written terrain draw records with the GPU's own writes, which Skip CPU
+    // Inner Invalidation would drop; with it on it was only ~3% faster.
     {DonkeyKongBananzaProgramId,
      {"Donkey Kong Bananza",
       {{"backend", RendererBackend::Vulkan},
@@ -88,13 +92,15 @@ inline const std::map<u64, GamePreset> game_presets{
        {"scaling_filter", ScalingFilter::ScaleForce},
        {"anti_aliasing", AntiAliasing::Fxaa},
        {"fast_gpu_time", GpuClock::Normal},
-       {"sync_memory_operations", false}}}},
+       {"sync_memory_operations", false},
+       {"skip_cpu_inner_invalidation", false}}}},
 };
 
 // Settings that only affect one game. Per-game configuration shows them in that game's Tweaks tab.
 inline const std::map<u64, std::vector<std::string>> game_tweaks{
     {MarioKartWorldProgramId, {"mkw_30fps", "mkw_dynamic_fps"}},
     {HyruleWarriorsProgramId, {"hyrule_dynamic_fps", "hyrule_30fps"}},
+    {YoshiProgramId, {"yoshi_sync_movie_submits"}},
 };
 
 inline const std::vector<std::string>* FindGameTweaks(u64 program_id) {

@@ -36,6 +36,10 @@ on:
         description: none or both
         type: string
         default: none
+      follow_branch:
+        description: Branch this build follows for tester builds; empty for builds that do not
+        type: string
+        default: ""
       save_cache:
         description: Force-save the compiler and CPM caches at the end of the job
         type: boolean
@@ -44,12 +48,22 @@ on:
 permissions:
   contents: read
 
+# HD Rumble is not linked in: it is a prebuilt library shipped beside the executable. Pin the
+# upstream release so every Windows build carries the same one, and check the hash against the
+# release's own SHA256SUMS.txt — a supported feature should not depend on whatever a tester has
+# lying around. Users can still drop a different renhdrum.dll next to eglantine.exe, or point
+# RENHDRUM_LIBRARY at one.
+env:
+  RENHDRUM_VERSION: v0.5.0
+
 jobs:
   msvc:
     name: windows-x86_64
     if: inputs.pgo != 'only'
     runs-on: windows-2025
     env:
+      # Followed-branch builds check for updates too.
+      UPDATE_CHECKER: ${{ (inputs.release || startsWith(inputs.tag, 'daily-')) && 'ON' || (inputs.follow_branch != '' && 'ON') || 'OFF' }}
       PLATFORM: windows-x86_64
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
       SCCACHE_CACHE_SIZE: 1000M
@@ -114,8 +128,29 @@ jobs:
         shell: pwsh
         run: glslangValidator --version
 
+      - name: Bundle the RenHDrum library
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'renhdrum'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $base = "https://github.com/trzz1214/RenHDrum/releases/download/$env:RENHDRUM_VERSION"
+          $dll = Join-Path $dir 'renhdrum.dll'
+          $sums = Join-Path $dir 'SHA256SUMS.txt'
+          Invoke-WebRequest -OutFile $dll "$base/renhdrum.dll"
+          Invoke-WebRequest -OutFile $sums "$base/SHA256SUMS.txt"
+          $entry = Get-Content $sums | Where-Object { $_ -match 'renhdrum\.dll$' }
+          if (-not $entry) { throw 'SHA256SUMS.txt lists no renhdrum.dll' }
+          $expected = ($entry -split '\s+')[0].ToLower()
+          $actual = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "renhdrum.dll hash mismatch: $actual != $expected" }
+          # CMake is driven from bash/msys2 below, so hand it a forward-slash path.
+          "RENHDRUM_DLL=$(($dll -replace '\\', '/'))" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      # The branch name is only ever read from the environment, never pasted into the script.
       - name: Configure
         shell: bash
+        env:
+          FOLLOW_BRANCH: ${{ inputs.follow_branch }}
         run: >-
           cmake -S . -B build/release -G Ninja
           -DCMAKE_BUILD_TYPE=Release
@@ -127,11 +162,13 @@ jobs:
           -DYUZU_USE_BUNDLED_QT=OFF
           -DYUZU_USE_BUNDLED_SDL3=ON
           -DENABLE_QT_TRANSLATION=ON
-          -DENABLE_UPDATE_CHECKER=${{ (inputs.release || startsWith(inputs.tag, 'daily-')) && 'ON' || 'OFF' }}
+          -DENABLE_UPDATE_CHECKER=$UPDATE_CHECKER
           -DEGLANTINE_UPDATE_REPO=${{ github.repository }}
           -DEGLANTINE_RELEASE_PLATFORM=windows-x86_64
+          "-DEGLANTINE_FOLLOW_BRANCH=$FOLLOW_BRANCH"
           -DUSE_DISCORD_PRESENCE=ON
           -DNIGHTLY_BUILD=${{ inputs.nightly && 'ON' || 'OFF' }}
+          -DRENHDRUM_DLL="$RENHDRUM_DLL"
           -DCMAKE_C_COMPILER_LAUNCHER=sccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
@@ -143,8 +180,8 @@ jobs:
         shell: bash
         run: |
           targets="yuzu yuzu-cmd"
-          # The updater helper only exists in release and daily builds, where the update checker is on.
-          if [ "${{ inputs.release || startsWith(inputs.tag, 'daily-') }}" = "true" ]; then targets="$targets eglantine-updater"; fi
+          # The updater helper only exists where the update checker is on.
+          if [ "$UPDATE_CHECKER" = "ON" ]; then targets="$targets eglantine-updater"; fi
           cmake --build build/release --target $targets --parallel
           sccache --show-stats
 
@@ -173,6 +210,8 @@ jobs:
     if: inputs.pgo == 'both' || inputs.pgo == 'only'
     runs-on: windows-2025
     env:
+      # Followed-branch builds check for updates too.
+      UPDATE_CHECKER: ${{ (inputs.release || startsWith(inputs.tag, 'daily-')) && 'ON' || (inputs.follow_branch != '' && 'ON') || 'OFF' }}
       PLATFORM: windows-x86_64-pgo
     steps:
       - name: Check out source
@@ -234,10 +273,30 @@ jobs:
             libusb:p unordered_dense:p jbigkit:p xz:p libdeflate:p bzip2:p
             lerc:p graphite2:p libwebp:p libtiff:p brotli:p ccache:p
 
+      - name: Bundle the RenHDrum library
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'renhdrum'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $base = "https://github.com/trzz1214/RenHDrum/releases/download/$env:RENHDRUM_VERSION"
+          $dll = Join-Path $dir 'renhdrum.dll'
+          $sums = Join-Path $dir 'SHA256SUMS.txt'
+          Invoke-WebRequest -OutFile $dll "$base/renhdrum.dll"
+          Invoke-WebRequest -OutFile $sums "$base/SHA256SUMS.txt"
+          $entry = Get-Content $sums | Where-Object { $_ -match 'renhdrum\.dll$' }
+          if (-not $entry) { throw 'SHA256SUMS.txt lists no renhdrum.dll' }
+          $expected = ($entry -split '\s+')[0].ToLower()
+          $actual = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "renhdrum.dll hash mismatch: $actual != $expected" }
+          # CMake is driven from bash/msys2 below, so hand it a forward-slash path.
+          "RENHDRUM_DLL=$(($dll -replace '\\', '/'))" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
       # MinGW build: system Qt and libraries from MSYS2, clang plus the repo's PGO profile. The profile
       # path is converted to its Windows form because clang runs with the MSYS mount underneath.
       - name: Configure
         shell: msys2 {0}
+        env:
+          FOLLOW_BRANCH: ${{ inputs.follow_branch }}
         run: |
           set -euo pipefail
           profile="-fprofile-use=$(cygpath -m "$PWD/eglantine.profdata") -Wno-backend-plugin \
@@ -255,12 +314,14 @@ jobs:
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
             -DENABLE_QT_TRANSLATION=ON \
-            -DENABLE_UPDATE_CHECKER=${{ (inputs.release || startsWith(inputs.tag, 'daily-')) && 'ON' || 'OFF' }} \
+            "-DENABLE_UPDATE_CHECKER=$UPDATE_CHECKER" \
             -DEGLANTINE_UPDATE_REPO=${{ github.repository }} \
             -DEGLANTINE_RELEASE_PLATFORM=windows-x86_64-pgo \
+            "-DEGLANTINE_FOLLOW_BRANCH=$FOLLOW_BRANCH" \
             -DUSE_DISCORD_PRESENCE=ON \
             -DUSE_CCACHE=ON \
             -DNIGHTLY_BUILD=${{ inputs.nightly && 'ON' || 'OFF' }} \
+            -DRENHDRUM_DLL="$RENHDRUM_DLL" \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
@@ -279,8 +340,8 @@ jobs:
         run: |
           ccache --zero-stats
           targets="yuzu yuzu-cmd"
-          # The updater helper only exists in release and daily builds, where the update checker is on.
-          if [ "${{ inputs.release || startsWith(inputs.tag, 'daily-') }}" = "true" ]; then targets="$targets eglantine-updater"; fi
+          # The updater helper only exists where the update checker is on.
+          if [ "$UPDATE_CHECKER" = "ON" ]; then targets="$targets eglantine-updater"; fi
           cmake --build build/release --target $targets --parallel
           ccache --show-stats
 

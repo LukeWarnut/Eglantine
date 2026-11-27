@@ -177,10 +177,10 @@
         <item name="colorSurface">@color/eden_card_background</item>
         <item name="colorSurfaceContainerHigh">@color/eden_card_background</item>
         <item name="colorOnSurface">@color/eden_on_surface</item>
-        <item name="colorOnSurfaceVariant">@color/eden_on_surface</item>
+        <item name="colorOnSurfaceVariant">@color/eden_on_surface_variant</item>
         <item name="colorSecondary">@color/eden_secondary</item>
         <item name="android:textColorPrimary">@color/eden_on_surface</item>
-        <item name="android:textColorSecondary">@color/eden_on_surface</item>
+        <item name="android:textColorSecondary">@color/eden_on_surface_variant</item>
         <item name="android:colorBackground">@color/eden_card_background</item>
         <item name="buttonBarPositiveButtonStyle">@style/EdenButton.Dialog</item>
         <item name="buttonBarNegativeButtonStyle">@style/EdenButton.Dialog</item>

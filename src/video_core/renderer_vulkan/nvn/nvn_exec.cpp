@@ -347,13 +347,16 @@ public:
     void HostNoteMirrorWriteBack(Pool& pool, u64 offset, u64 size) override {
         NotePoolWrite(pool, offset, size, false);
     }
-    void HostNoteRawGlobalWrite() override {
+    void HostNoteRawGlobalWrite(bool written_through) override {
         // Raw global tables resolve every VRAM-mirrored pool to its device-local mirror; writes to
         // non-mirrored pools never make a mirror stale. Keep mirror pages current instead of
         // copying their GPU-written contents back in from stale guest memory.
         condition_prefetch.Clear();
         host_barrier_needed = true;
         flight.raw_writes = true;
+        if (!written_through) {
+            flight.raw_writes_unaliased = true;
+        }
         // A raw pointer reaches any range of the table: no submit-time uniform copy of them.
         impl.uniform_snapshots.NoteRawWrite(impl.raw_table.generation, impl.raw_table.entries,
                                             flight.seq);
@@ -590,8 +593,8 @@ private:
         return segments.back().cmd;
     }
 
-    void BeginSegment();
-    void EndSegment();
+    void BeginSegment(bool keep_shadows = false);
+    void EndSegment(bool flush_shadows = true);
     void Abort();
 
     /// Ends the render pass the draw path left open, if there is one. The only place that ends it:
@@ -818,7 +821,7 @@ private:
     /// part of a big submission while the rest is still recorded. Called between ops only.
     void MaybeSubmitEarly();
     /// Ends the current command buffer, submits everything recorded so far and starts a new one.
-    void SubmitPiece();
+    void SubmitPiece(bool flush_shadows = true);
 
     Context::Impl& impl;
     u32 queue_index;
@@ -855,6 +858,7 @@ private:
     /// call).
     std::vector<VkImageMemoryBarrier> image_barriers;
     bool host_barrier_needed{false};
+    bool segment_signaled{false};
 
     enum class RenderState { Enabled, Disabled, Conditional };
     RenderState render_state{RenderState::Enabled};
@@ -880,6 +884,7 @@ private:
     u32 early_pieces{0};
     size_t flushed_arena{0};   ///< flight.arena chunks before this index were flushed already
     size_t flushed_staging{0}; ///< the same for flight.staging
+    std::shared_ptr<ShadowChunk> alias_scratch;
     std::vector<std::pair<u64, u64>> mirror_pending_writes;
     std::vector<std::pair<VkBuffer, u64>> deferred_zero; ///< (buffer, offset) of 8-byte zero-fills
     const VC::Submission* lookahead_submission{};
@@ -906,7 +911,7 @@ private:
     std::unordered_set<Storage*> touched_set;
 };
 
-void Recorder::BeginSegment() {
+void Recorder::BeginSegment(bool keep_shadows) {
     Segment segment;
     segment.raw = impl.AcquireCommandBuffer();
     flight.command_buffers.push_back(segment.raw);
@@ -932,14 +937,17 @@ void Recorder::BeginSegment() {
     barrier_pending = true;
     buffer_ops.Clear();
     condition_prefetch.Clear();
-    draw.OnSegmentBegin();
+    segment_signaled = false;
+    draw.OnSegmentBegin(keep_shadows);
 }
 
-void Recorder::EndSegment() {
+void Recorder::EndSegment(bool flush_shadows) {
     EndRenderCondition();
     EndDrawPass(BreakCause::SegmentEnd);
     // Storage shadows go back to their pools before the host barrier below.
-    draw.FlushShadows();
+    if (flush_shadows || segment_signaled) {
+        draw.FlushShadows();
+    }
     FlushLinearWritebacks();
     // Queries cannot span command buffers: fold the samples counted so far into the queue's
     // accumulator (the next draw of the next segment starts a new query); in-pass queries: the
@@ -1001,11 +1009,15 @@ void Recorder::Abort() {
             segment.ended = true;
         }
     }
-    if (submitted_segments != 0) {
+    std::erase_if(impl.submit_batch.entries,
+                  [&](const Context::Impl::SubmitBatch::Entry& e) { return e.flight_seq == flight.seq; });
+    std::erase_if(impl.submit_batch.marks,
+                  [&](const Context::Impl::SubmitBatch::Mark& m) { return m.flight == &flight; });
+    if (flight.gpu_submitted_value != 0) {
         // Early pieces of this submission are on the GPU and use its arena, staging and
         // resources, which a failed flight releases at once: let them finish first.
         const VkSemaphore semaphore = *queue.timeline;
-        const u64 value = segments[submitted_segments - 1].signal_value;
+        const u64 value = flight.gpu_submitted_value;
         const VkSemaphoreWaitInfo wait_info{
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
             .pNext = nullptr,
@@ -1228,6 +1240,12 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
     if (pool.backing != Pool::Backing::Mirror || size == 0 || offset >= pool.size) {
         return false;
     }
+    if (!pool.buffer || pool.mirror_pages.empty()) {
+        impl.EnsureBacking(pool);
+        if (!pool.buffer || pool.mirror_pages.empty()) {
+            return false;
+        }
+    }
     const bool tracked = MirrorTakeCpuWrites(pool);
     bool pending_read = false;
     const u32 stamp = static_cast<u32>(flight.seq) + 1;
@@ -1239,8 +1257,10 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
     bool dirty = false;
     for (u64 index = first; index <= last / Pool::MIRROR_PAGE; ++index) {
         Pool::MirrorPage& page = pool.mirror_pages[static_cast<size_t>(index)];
-        const bool current_epoch = !impl.mario_kart_world || pool.split_runs.empty() ||
-                                   page.raw_epoch == pool.split_raw_epoch_seen;
+        const bool current_epoch =
+            !impl.mario_kart_world || pool.split_runs.empty() ||
+            (pool.raw_written_through ? page.raw_epoch >= pool.split_raw_epoch_unaliased_seen
+                                      : page.raw_epoch == pool.split_raw_epoch_seen);
         if (page.valid && page.checked == stamp && current_epoch) {
             continue;
         }
@@ -1280,6 +1300,12 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
     if (pool.backing != Pool::Backing::Mirror || size == 0 || offset >= pool.size) {
         return;
     }
+    if (!pool.buffer || pool.mirror_pages.empty()) {
+        impl.EnsureBacking(pool);
+        if (!pool.buffer || pool.mirror_pages.empty()) {
+            return;
+        }
+    }
     // The guest pages of the range that differ from what the mirror holds (all of them the first
     // time), as runs of consecutive pages. The mirror is made equal to these pages from here on,
     // so the bookkeeping is updated now.
@@ -1294,8 +1320,10 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
     std::vector<std::pair<u64, u64>> parts;
     for (u64 index = first; index <= last / Pool::MIRROR_PAGE; ++index) {
         Pool::MirrorPage& page = pool.mirror_pages[static_cast<size_t>(index)];
-        const bool current_epoch = !impl.mario_kart_world || pool.split_runs.empty() ||
-                                   page.raw_epoch == pool.split_raw_epoch_seen;
+        const bool current_epoch =
+            !impl.mario_kart_world || pool.split_runs.empty() ||
+            (pool.raw_written_through ? page.raw_epoch >= pool.split_raw_epoch_unaliased_seen
+                                      : page.raw_epoch == pool.split_raw_epoch_seen);
         if (page.valid && page.checked == stamp && current_epoch) {
             continue;
         }
@@ -1427,9 +1455,11 @@ void Recorder::NotePoolWrite(Pool& pool, u64 offset, u64 size, bool invalidate_m
         }
         // The write-back (and a report's timestamp) reaches the guest bytes untracked: the pages
         // are hashed again once it is done (MirrorPageWrites).
-        if (size != 0 && offset < pool.size) {
+        if (size != 0 && offset < pool.size && !pool.mirror_pages.empty()) {
             const u64 end = (std::min)(offset + size, pool.size);
-            for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {
+            const size_t limit = pool.mirror_pages.size();
+            for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end && page < limit;
+                 ++page) {
                 Pool::MirrorPage& mirror_page = pool.mirror_pages[static_cast<size_t>(page)];
                 mirror_page.trusted = false;
                 mirror_page.valid = false;
@@ -1523,7 +1553,7 @@ bool Recorder::ResolveRef(const VC::TextureRef& ref, Storage*& storage,
                                layer));
         return false;
     }
-    impl.NoteUse(ref.serial, flight.seq);
+    impl.NoteUse(*texture, flight.seq);
     NoteTouched(owner);
     return true;
 }
@@ -1543,7 +1573,7 @@ bool Recorder::ResolvePoolRange(u64 address, u64 size, Pool*& pool, u64& offset,
         Unsupported(op, fmt::format("pool {:#x} has no backing", pool->address));
         return false;
     }
-    impl.NoteUse(pool->serial, flight.seq);
+    impl.NoteUse(*pool, flight.seq);
     if (!linear_writebacks.empty() && !draw.PassOpen()) {
         const u64 clamped = (std::min)(pool->size - offset, (std::max<u64>)(size, 1));
         FlushLinearWritebacks(pool, offset, offset + clamped);
@@ -1939,7 +1969,7 @@ void Recorder::FlushLinearWritebacks(const Pool* filter_pool, u64 filter_begin, 
             s.linear_writeback_seq = 0;
             continue;
         }
-        impl.NoteUse(pool->serial, flight.seq);
+        impl.NoteUse(*pool, flight.seq);
         if (draw.HasShadows()) {
             draw.FlushShadowsOverlapping(*pool, s.pool_offset, geometry.span);
         }
@@ -2093,6 +2123,24 @@ void Recorder::UploadStorage(Storage& s) {
     if (size == 0) {
         return;
     }
+    const bool cpu_visible = pool.IsVirtual() || (pool.flags & PoolFlag::CpuNoAccess) == 0;
+    u64 upload_tracked_pool = 0;
+    u32 upload_tracked_gen = 0;
+    if (cpu_visible && impl.tex_hash_tracked) {
+        // Sample the physical pool's write generation before GuestBytes gathers the data so any
+        // concurrent CPU write after the gather shows a strictly newer generation.
+        Pool* track_pool = &pool;
+        u64 track_offset = s.pool_offset;
+        const bool resolved =
+            !pool.IsVirtual() ||
+            (impl.ResolveVirtualRange(pool, track_offset, size, track_pool, track_offset) &&
+             track_pool != nullptr);
+        if (resolved && (track_pool->flags & PoolFlag::CpuNoAccess) == 0 &&
+            impl.TakePoolCpuWrites(*track_pool)) {
+            upload_tracked_pool = track_pool->serial;
+            upload_tracked_gen = track_pool->cpu_write_gen;
+        }
+    }
     const auto log_begin = std::chrono::steady_clock::now();
     std::vector<u8> scratch;
     const u8* data = impl.GuestBytes(pool, s.pool_offset, size, scratch);
@@ -2117,13 +2165,14 @@ void Recorder::UploadStorage(Storage& s) {
     }
     // Hash before the fill: bytes a decoder rewrites meanwhile must look changed at the next check
     // (the image holds what the fill read, the hash must not describe newer bytes).
-    const bool cpu_visible = pool.IsVirtual() || (pool.flags & PoolFlag::CpuNoAccess) == 0;
     const auto log_planned = std::chrono::steady_clock::now();
     if (cpu_visible) {
         const auto begin = std::chrono::steady_clock::now();
         s.guest_hash = HashGuestBytes(data, size);
         s.sample_hash = SampleGuestBytes(data, size, impl.mario_kart_world);
-        s.cpu_trusted_gen = 0;
+        s.cpu_trusted_pool = upload_tracked_pool;
+        s.cpu_trusted_gen = upload_tracked_gen;
+        s.cpu_full_gen = upload_tracked_gen;
         s.page_hashes.clear();
         impl.stats.hash_ns.fetch_add(
             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2323,6 +2372,22 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
             ++next_tail;
         }
         const StagingRange staging = AllocStaging(total, 64);
+        std::vector<u64> tile_pools(tile_offsets.size(), 0);
+        std::vector<u32> tile_gens(tile_offsets.size(), 0);
+        if (impl.tex_hash_tracked) {
+            for (size_t i = 0; i < tile_offsets.size(); ++i) {
+                const u32 id = uploads.tiles[first_tile + i];
+                Pool* phys = nullptr;
+                u64 phys_offset = 0;
+                if (impl.ResolveVirtualRange(pool, s.pool_offset + layout.TileOffset(id),
+                                             SPARSE_TILE_BYTES, phys, phys_offset) &&
+                    phys != nullptr && (phys->flags & PoolFlag::CpuNoAccess) == 0 &&
+                    impl.TakePoolCpuWrites(*phys)) {
+                    tile_pools[i] = phys->serial;
+                    tile_gens[i] = phys->cpu_write_gen;
+                }
+            }
+        }
         std::vector<u64> hashes(tile_offsets.size());
         const auto log_begin = std::chrono::steady_clock::now();
         RunParallel(tile_offsets.size(), [&](size_t i) {
@@ -2356,6 +2421,7 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
                 .imageExtent = {rect.width, rect.height, 1},
             });
             sparse.SetTileHash(id, hashes[i]);
+            sparse.SetTileVerifiedGen(id, tile_pools[i], tile_gens[i]);
         }
         for (size_t i = 0; i < tail_offsets.size(); ++i) {
             const u32 layer = uploads.tails[first_tail + i];
@@ -2489,7 +2555,7 @@ bool Recorder::UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool, c
         // from mirrored pools to keep the CPU replay thread out of large RGBA8 decodes.
         constexpr u64 MinStagedAstcBytes = u64{64} << 10;
         constexpr u64 MaxStagedAstcBytes = u64{64} << 20;
-        if (!impl.mario_kart_world || s.sparse || !IsAstc8x8(s.host.pixel_format) ||
+        if (!impl.mario_kart_world || s.sparse ||
             size < MinStagedAstcBytes || size > MaxStagedAstcBytes ||
             size > impl.device.GetMaxStorageBufferRange() ||
             !AstcGpuLevels(s, plan, 0, *decoder, levels)) {
@@ -2533,7 +2599,7 @@ bool Recorder::UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool,
         input_size = pool.size - s.pool_offset;
     } else {
         // Keep MKW's streaming sources on the GPU decode path with mirrored guest pools too.
-        if (!impl.mario_kart_world || !IsAstc8x8(s.host.pixel_format) || size < (u64{64} << 10) ||
+        if (!impl.mario_kart_world || size < (u64{64} << 10) ||
             size > (u64{64} << 20) || size > impl.device.GetMaxStorageBufferRange() ||
             !AstcGpuLevels(s, plan, 0, *decoder, levels)) {
             return false;
@@ -3494,12 +3560,16 @@ bool Recorder::TransferOverlapBytes(Storage& source, Storage& destination, const
         why = "the shared bytes do not fit the transfer scratch buffer";
         return false;
     }
-    std::shared_ptr<ShadowChunk> scratch = impl.draw_resources->AcquireShadow(total);
-    if (!scratch) {
-        why = "no scratch memory for the transfer";
-        return false;
+    const bool reused_scratch = alias_scratch && alias_scratch->size >= total;
+    if (!reused_scratch) {
+        std::shared_ptr<ShadowChunk> scratch = impl.draw_resources->AcquireShadow(total);
+        if (!scratch) {
+            why = "no scratch memory for the transfer";
+            return false;
+        }
+        flight.shadow.push_back(scratch);
+        alias_scratch = std::move(scratch);
     }
-    flight.shadow.push_back(scratch);
 
     NoteTouched(source.shared_from_this());
     const bool saved = track_writes;
@@ -3508,7 +3578,21 @@ bool Recorder::TransferOverlapBytes(Storage& source, Storage& destination, const
                    {&destination, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}});
     track_writes = saved;
     vk::CommandBuffer cmd = Cmd();
-    const VkBuffer buffer = *scratch->buffer;
+    const auto barrier = [&cmd](VkPipelineStageFlags from, VkAccessFlags written,
+                                VkPipelineStageFlags to, VkAccessFlags used) {
+        cmd.PipelineBarrier(from, to, 0,
+                            VkMemoryBarrier{
+                                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                .pNext = nullptr,
+                                .srcAccessMask = written,
+                                .dstAccessMask = used,
+                            });
+    };
+    if (reused_scratch) {
+        barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    }
+    const VkBuffer buffer = *alias_scratch->buffer;
     const auto regions = [](const std::vector<AliasPiece>& pieces) {
         std::vector<VkBufferImageCopy> out;
         out.reserve(pieces.size());
@@ -3522,16 +3606,6 @@ bool Recorder::TransferOverlapBytes(Storage& source, Storage& destination, const
                           regions(source_pieces));
     cmd.CopyImageToBuffer(*destination.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer,
                           destination_regions);
-    const auto barrier = [&cmd](VkPipelineStageFlags from, VkAccessFlags written,
-                                VkPipelineStageFlags to, VkAccessFlags used) {
-        cmd.PipelineBarrier(from, to, 0,
-                            VkMemoryBarrier{
-                                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                                .pNext = nullptr,
-                                .srcAccessMask = written,
-                                .dstAccessMask = used,
-                            });
-    };
     constexpr VkAccessFlags SHADER_ACCESS = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     const auto to_shader = [&] {
         barrier(VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -4006,7 +4080,7 @@ bool Recorder::DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
         const std::vector<BcChunk> chunks =
             SplitBcLayers(level, first_layer, slices, width, height, x, y);
         const bool recorded =
-            RecordBcUpload(s, chunks, false, [&](const BcChunk& chunk, BcScratch& scratch) {
+            RecordBcUpload(s, chunks, false, [&](const BcChunk& chunk, BcScratch& bc_scratch) {
                 const VkBufferImageCopy region{
                     .bufferOffset =
                         staging.offset + u64{chunk.first_layer - first_layer} * layer_bytes,
@@ -4016,7 +4090,7 @@ bool Recorder::DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
                     .imageOffset = {0, 0, 0},
                     .imageExtent = {width, height, 1},
                 };
-                Cmd().CopyBufferToImage(staging.buffer, *scratch.image, VK_IMAGE_LAYOUT_GENERAL,
+                Cmd().CopyBufferToImage(staging.buffer, *bc_scratch.image, VK_IMAGE_LAYOUT_GENERAL,
                                         region);
             });
         if (!recorded) {
@@ -4321,6 +4395,7 @@ void Recorder::FenceSync(const VC::FenceSyncPayload& p) {
     impl.NoteUse(p.sync_serial, flight.seq);
     impl.syncs[p.sync_serial] =
         SyncPoint{*queue.timeline, segments.back().signal_value, queue_index};
+    segment_signaled = true;
 }
 
 void Recorder::WaitSync(const VC::WaitSyncPayload& p) {
@@ -4333,9 +4408,10 @@ void Recorder::WaitSync(const VC::WaitSyncPayload& p) {
     if (it->second.queue == queue_index) {
         return; // one NVN queue is one ordered stream
     }
-    EndSegment();
+    const bool flush = segment_signaled;
+    EndSegment(flush);
     pending_waits.emplace_back(it->second.semaphore, it->second.value);
-    BeginSegment();
+    BeginSegment(!flush);
 }
 
 void Recorder::SignalEvent(const VC::SignalEventPayload& p) {
@@ -4344,6 +4420,7 @@ void Recorder::SignalEvent(const VC::SignalEventPayload& p) {
     // against. The signal executes with the segment that contains it.
     impl.events.Signal(p.event_address, p.mode, p.value,
                        VC::SignalPoint{queue_index, segments.back().signal_value});
+    segment_signaled = true;
     impl.stats.event_signals.fetch_add(1, std::memory_order_relaxed);
     if (Debug::Timeline()) {
         Debug::TimelineEvent("signal", flight.seq,
@@ -4404,7 +4481,8 @@ bool Recorder::WaitEvent(const VC::WaitEventPayload& p, bool& release) {
     if (!foreign) {
         return true;
     }
-    EndSegment();
+    const bool flush = segment_signaled;
+    EndSegment(flush);
     for (const VC::SignalPoint& dep : event_deps) {
         if (dep.queue == queue_index) {
             continue;
@@ -4418,7 +4496,7 @@ bool Recorder::WaitEvent(const VC::WaitEventPayload& p, bool& release) {
             pending_waits.emplace_back(semaphore, dep.value);
         }
     }
-    BeginSegment();
+    BeginSegment(!flush);
     return true;
 }
 
@@ -4938,7 +5016,7 @@ bool Recorder::ResolveReportPairQuietly(u64 address, Pool*& pool_a, u64& offset_
         if (pool->backing == Pool::Backing::None || pool->backing == Pool::Backing::Mirror) {
             return false;
         }
-        impl.NoteUse(pool->serial, flight.seq);
+        impl.NoteUse(*pool, flight.seq);
         if (draw.HasShadows()) {
             // The copies read the bytes through host memory.
             draw.FlushShadowsOverlapping(*pool, offset, sizeof(u64));
@@ -6228,7 +6306,11 @@ void Recorder::Finish(std::span<const VkSemaphore> binary_signals) {
     draw.EndSubmission();
     SubmitSegments(binary_signals);
     finished = true;
-    impl.MarkSubmitted(flight, *queue.timeline, segments.back().signal_value);
+    if (impl.submit_batch.batching && binary_signals.empty() && !impl.submit_batch.entries.empty()) {
+        impl.submit_batch.marks.push_back({&flight, *queue.timeline, segments.back().signal_value});
+    } else {
+        impl.MarkSubmitted(flight, *queue.timeline, segments.back().signal_value);
+    }
 }
 
 void Recorder::SubmitSegments(std::span<const VkSemaphore> binary_signals) {
@@ -6245,14 +6327,56 @@ void Recorder::SubmitSegments(std::span<const VkSemaphore> binary_signals) {
 
     constexpr size_t MaxSignals = MaxPresentSignals + 1; // + the queue's timeline semaphore
     ASSERT(binary_signals.size() <= MaxPresentSignals);
+    const size_t first = submitted_segments;
+    const size_t count = segments.size() - first;
+    if (impl.submit_batch.batching && !Debug::Get().upload_log) {
+        for (size_t k = 0; k < count; ++k) {
+            const Segment& segment = segments[first + k];
+            const bool last = first + k + 1 == segments.size();
+            Context::Impl::SubmitBatch::Entry entry;
+            entry.signals[0] = *queue.timeline;
+            entry.signal_values[0] = segment.signal_value;
+            u32 signal_count = 1;
+            if (last) {
+                for (const VkSemaphore semaphore : binary_signals) {
+                    if (semaphore != VK_NULL_HANDLE) {
+                        entry.signals[signal_count] = semaphore;
+                        entry.signal_values[signal_count] = 0;
+                        ++signal_count;
+                    }
+                }
+            }
+            entry.signal_count = signal_count;
+            entry.wait_semaphores = segment.wait_semaphores;
+            entry.wait_values = segment.wait_values;
+            entry.wait_stages.assign(segment.wait_semaphores.size(), ALL_STAGES);
+            entry.cmd = segment.raw;
+            entry.flight_seq = flight.seq;
+            entry.flight = &flight;
+            entry.queue_timeline = *queue.timeline;
+            entry.queue_signal_value = segment.signal_value;
+            impl.submit_batch.entries.push_back(std::move(entry));
+        }
+        submitted_segments = segments.size();
+        if (flight.gpu_prof && Debug::Timeline()) {
+            flight.gpu_prof->NoteSubmitted(
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count()),
+                queue_index);
+        }
+        if (!binary_signals.empty() || impl.submit_batch.entries.size() >= 64) {
+            impl.FlushSubmitBatch();
+        }
+        return;
+    }
+    impl.FlushSubmitBatch();
     struct Info {
         VkTimelineSemaphoreSubmitInfo timeline;
         std::array<VkSemaphore, MaxSignals> signals;
         std::array<u64, MaxSignals> signal_values;
         std::vector<VkPipelineStageFlags> wait_stages;
     };
-    const size_t first = submitted_segments;
-    const size_t count = segments.size() - first;
     std::vector<Info> infos(count);
     std::vector<VkSubmitInfo> submits(count);
     for (size_t k = 0; k < count; ++k) {
@@ -6329,6 +6453,10 @@ void Recorder::SubmitSegments(std::span<const VkSemaphore> binary_signals) {
         }
         vk::Check(result);
     }
+    if (count != 0) {
+        flight.gpu_submitted_value =
+            (std::max)(flight.gpu_submitted_value, segments.back().signal_value);
+    }
     if (impl.mario_kart_world && count != 0) {
         impl.mkw_last_submit_semaphore = *queue.timeline;
         impl.mkw_last_submit_value = segments.back().signal_value;
@@ -6351,6 +6479,7 @@ void Recorder::SubmitSegments(std::span<const VkSemaphore> binary_signals) {
 void Recorder::FlushAndWait() {
     EndSegment();
     SubmitSegments({});
+    impl.FlushSubmitBatch();
     const VkSemaphore semaphore = *queue.timeline;
     const u64 value = segments.back().signal_value;
     const VkSemaphoreWaitInfo wait_info{
@@ -6373,6 +6502,9 @@ void Recorder::FlushAndWait() {
 }
 
 void Recorder::MaybeSubmitEarly() {
+    if (impl.submit_batch.batching && !Debug::Get().upload_log) {
+        return;
+    }
     const Debug::Config& config = Debug::Get();
     if (config.early_interval_us == 0 || !impl.options.early_submit || finished || condition_open ||
         (!draw.PassOpen() && draw.HasInlineUpdates())) {
@@ -6398,7 +6530,7 @@ void Recorder::MaybeSubmitEarly() {
             return; // a natural pass end comes soon: do not split the pass
         }
     }
-    SubmitPiece();
+    SubmitPiece(false);
     ++early_pieces;
     impl.stats.early_submits.fetch_add(1, std::memory_order_relaxed);
     if (Debug::Timeline()) {
@@ -6406,10 +6538,11 @@ void Recorder::MaybeSubmitEarly() {
     }
 }
 
-void Recorder::SubmitPiece() {
-    EndSegment();
+void Recorder::SubmitPiece(bool flush_shadows) {
+    const bool flush = flush_shadows || segment_signaled;
+    EndSegment(flush);
     SubmitSegments({});
-    BeginSegment();
+    BeginSegment(!flush);
     records_at_piece = records_replayed;
     piece_start = std::chrono::steady_clock::now();
 }
@@ -6463,6 +6596,13 @@ VC::StreamItem::Step SubmissionItem::Advance(bool release) {
         // included), so no guest wait hangs.
         recorder.reset();
         impl.stats.dropped_after_device_loss.fetch_add(1, std::memory_order_relaxed);
+        impl.FailFlight(*flight);
+        return {.done = true, .progressed = true};
+    }
+    if (flight->failed) {
+        // An earlier batched piece of this parked submission failed to submit: abort rather than
+        // resuming past GPU commands that never ran.
+        recorder.reset();
         impl.FailFlight(*flight);
         return {.done = true, .progressed = true};
     }
@@ -6579,6 +6719,118 @@ private:
 
 } // Anonymous namespace
 
+void Context::Impl::FlushSubmitBatch() {
+    if (submit_batch.entries.empty() && submit_batch.marks.empty()) {
+        return;
+    }
+    auto entries = std::move(submit_batch.entries);
+    auto marks = std::move(submit_batch.marks);
+    submit_batch.entries.clear();
+    submit_batch.marks.clear();
+    try {
+        if (!entries.empty()) {
+            std::vector<VkCommandBuffer> all_cmds;
+            all_cmds.reserve(entries.size());
+            std::vector<VkSubmitInfo> submits;
+            submits.reserve(entries.size());
+            u64 max_seq = 0;
+            size_t first = 0;
+            while (first < entries.size()) {
+                size_t last = first;
+                max_seq = (std::max)(max_seq, entries[first].flight_seq);
+                all_cmds.push_back(entries[first].cmd);
+                while (last + 1 < entries.size()) {
+                    const SubmitBatch::Entry& prev = entries[last];
+                    const SubmitBatch::Entry& next = entries[last + 1];
+                    if (prev.queue_timeline == next.queue_timeline && prev.signal_count == 1 &&
+                        next.wait_semaphores.empty() &&
+                        next.queue_signal_value >= prev.queue_signal_value) {
+                        ++last;
+                        max_seq = (std::max)(max_seq, next.flight_seq);
+                        all_cmds.push_back(next.cmd);
+                    } else {
+                        break;
+                    }
+                }
+                SubmitBatch::Entry& head = entries[first];
+                const SubmitBatch::Entry& tail = entries[last];
+                head.timeline = {
+                    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+                    .pNext = nullptr,
+                    .waitSemaphoreValueCount = static_cast<u32>(head.wait_values.size()),
+                    .pWaitSemaphoreValues = head.wait_values.data(),
+                    .signalSemaphoreValueCount = tail.signal_count,
+                    .pSignalSemaphoreValues = tail.signal_values.data(),
+                };
+                submits.push_back(VkSubmitInfo{
+                    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                    .pNext = &head.timeline,
+                    .waitSemaphoreCount = static_cast<u32>(head.wait_semaphores.size()),
+                    .pWaitSemaphores = head.wait_semaphores.data(),
+                    .pWaitDstStageMask = head.wait_stages.data(),
+                    .commandBufferCount = static_cast<u32>(last - first + 1),
+                    .pCommandBuffers = &all_cmds[first],
+                    .signalSemaphoreCount = tail.signal_count,
+                    .pSignalSemaphores = tail.signals.data(),
+                });
+                first = last + 1;
+            }
+            {
+                const Common::FrameStats::Scope submit_stall{
+                    Common::FrameStats::Cause::QueueSubmit};
+                std::scoped_lock lock{submit_mutex};
+                VkResult result = queue.Submit(submits);
+                if (const u64 from = options.simulate_device_loss_from_seq;
+                    from != 0 && max_seq >= from) {
+                    result = VK_ERROR_DEVICE_LOST;
+                }
+                if (result == VK_ERROR_DEVICE_LOST) {
+                    NoteDeviceLost("queue submit");
+                }
+                vk::Check(result);
+            }
+            for (const SubmitBatch::Entry& entry : entries) {
+                if (entry.flight) {
+                    entry.flight->gpu_submitted_value =
+                        (std::max)(entry.flight->gpu_submitted_value, entry.queue_signal_value);
+                }
+            }
+            if (mario_kart_world) {
+                mkw_last_submit_semaphore = entries.back().queue_timeline;
+                mkw_last_submit_value = entries.back().queue_signal_value;
+            }
+            if (options.on_queue_submit) {
+                options.on_queue_submit();
+            }
+        }
+    } catch (...) {
+        for (const SubmitBatch::Entry& entry : entries) {
+            if (entry.flight) {
+                entry.flight->failed = true;
+            }
+        }
+        for (const SubmitBatch::Mark& mark : marks) {
+            if (mark.flight) {
+                FailFlight(*mark.flight);
+            }
+        }
+        throw;
+    }
+    if (!marks.empty()) {
+        {
+            std::scoped_lock lock{state_mutex};
+            for (const SubmitBatch::Mark& mark : marks) {
+                if (mark.flight) {
+                    mark.flight->semaphore = mark.semaphore;
+                    mark.flight->value = mark.value;
+                    mark.flight->submitted = true;
+                }
+            }
+        }
+        complete_cv.notify_all();
+    }
+}
+
 bool Context::Impl::DependenciesKnown(const VC::Submission& submission, u64* missing) const {
     std::unordered_set<u64> local;
     for (const std::vector<u64>& list : submission.lists) {
@@ -6638,7 +6890,7 @@ void Context::Impl::ProcessPresent(CmdPresent&& present) {
         LogBcTimeWindow(presented);
     }
     // Textures die and storages age without a new image being made: the trim looks at them here.
-    TrimStorageCache(true);
+    TrimStorageCache(true, present.request.seq);
     NoteUse(present.request.texture_serial, present.request.seq);
     PumpStreams(true);
     // A present is ordered after everything its queue submitted before it.
@@ -6725,6 +6977,7 @@ void Context::Impl::ExecutePresent(const VC::PresentRequest& request, InFlight& 
             }
             recorder.Finish(std::span<const VkSemaphore>{signals.data(), signal_count});
         }
+        FlushSubmitBatch();
         work_submitted = true;
         replay_stage.store("present: hand over", std::memory_order_relaxed);
         if (frame) {

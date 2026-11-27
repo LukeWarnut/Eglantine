@@ -343,12 +343,14 @@ json CaptureFrame(ToolState& state, const json& params) {
     const bool sampled = params.value("sampled", false);
     const bool buffers = params.value("buffers", false);
     const u64 sampled_max_mib = Param<u64>(params, "sampled_max_mib", 0, 0, 1 << 16);
+    auto sampled_tics = params.value("sampled_tics", std::vector<u32>{});
     const int timeout = Param<int>(params, "timeout_s", 120, 1, 600);
     VideoCore::Nx2Debug::RequestCapture({.id = id,
                                          .directory = directory,
                                          .sampled = sampled,
                                          .buffers = buffers,
-                                         .sampled_max_bytes = sampled_max_mib << 20});
+                                         .sampled_max_bytes = sampled_max_mib << 20,
+                                         .sampled_tics = std::move(sampled_tics)});
     const auto finished = VideoCore::Nx2Debug::WaitCapture(id, std::chrono::seconds{timeout});
     if (!finished) {
         VideoCore::Nx2Debug::CancelCapture(id);
@@ -426,6 +428,27 @@ json RejectShaders(ToolState&, const json& params) {
         result["note"] = "no frame was presented yet; the change applies at the next frame end";
     }
     return result;
+}
+
+json AstcFusion(ToolState& state, const json& params) {
+    if (!IsVulkan() || NvnHle::HleRunning()) {
+        return {{"supported", false}};
+    }
+    std::optional<bool> enable;
+    if (const auto it = params.find("enable"); it != params.end()) {
+        enable = it->get<bool>();
+    }
+    auto future = VideoCore::Nx2Debug::RequestAstcFusion(enable);
+    const auto timeout = std::chrono::seconds{Param<int>(params, "timeout_s", 5, 1, 60)};
+    if (!WaitReady(state, future, timeout)) {
+        return {{"applied", false}, {"queued", true},
+                {"note", "waiting for the next presented frame"}};
+    }
+    const auto result = future.get();
+    return {{"supported", result.supported},
+            {"enabled", result.enabled},
+            {"applied", result.supported},
+            {"marked_for_refresh", result.marked_for_refresh}};
 }
 
 json SampleThreads(ToolState& state, const json& params) {
@@ -900,6 +923,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"log_filter", handler(LogFilter)},
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
+        {"astc_fusion", handler(AstcFusion)},
         {"sample", handler(SampleThreads)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},

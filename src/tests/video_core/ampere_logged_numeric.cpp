@@ -24,6 +24,7 @@
 namespace {
 using Shader::Ampere::Instruction;
 using Shader::Ampere::LowerToMaxwell;
+using Shader::Ampere::NativeRegisterRemap;
 namespace IR = Shader::IR;
 
 constexpr Instruction Exit{{0x0000794d, 0, 0x03800000, 0}};
@@ -33,13 +34,35 @@ constexpr std::array<Instruction, 2> LoggedShifts{{
     {{0xff0c7419, 0x000000ff, 0x0001060b, 0x080fe400}},
 }};
 
+// These fixtures were written for the register copy form (old caches still hold it); the remap
+// form is checked against it below.
+Shader::Ampere::LoweredProgram LowerCopies(std::span<const Instruction> code) {
+    return LowerToMaxwell(code, {.register_copies = true});
+}
+
+u32 Address(u32 index);
+
+// The remaps of `lowered`, in addresses of a fixture that puts `shift` instructions before it.
+std::vector<NativeRegisterRemap> RemapsAt(const Shader::Ampere::LoweredProgram& lowered,
+                                          u32 shift) {
+    std::vector<NativeRegisterRemap> remaps;
+    for (NativeRegisterRemap remap : lowered.register_remaps) {
+        remap.begin = Address(remap.begin + shift);
+        remap.end = Address(remap.end + shift);
+        remaps.push_back(remap);
+    }
+    return remaps;
+}
+
 u32 Address(u32 index) {
     return 0x50 + index * 8 + ((index + 1) / 3) * 8;
 }
 
 class LoggedEnvironment final : public Shader::Environment {
 public:
-    explicit LoggedEnvironment(std::span<const u64> code_) : code{code_} {
+    explicit LoggedEnvironment(std::span<const u64> code_,
+                               std::vector<NativeRegisterRemap> remaps_ = {})
+        : code{code_}, remaps{std::move(remaps_)} {
         stage = Shader::Stage::Compute;
     }
 
@@ -69,6 +92,7 @@ public:
     std::array<u32, 3> WorkgroupSize() const override { return {32, 1, 1}; }
     bool HasHLEMacroState() const override { return false; }
     bool IsNativeProgram() const override { return true; }
+    std::span<const NativeRegisterRemap> NativeRegisterRemaps() const override { return remaps; }
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
         return std::nullopt;
     }
@@ -76,6 +100,7 @@ public:
 
 private:
     std::span<const u64> code;
+    std::vector<NativeRegisterRemap> remaps;
 };
 
 u32 EvaluateShift(IR::Value value) {
@@ -115,8 +140,10 @@ u32 EvaluateShift(IR::Value value) {
     }
 }
 
-void TranslateAndEmit(std::span<const u64> code, std::optional<u32> expected = std::nullopt) {
-    LoggedEnvironment env{code};
+std::vector<u32> TranslateAndEmit(std::span<const u64> code,
+                                  std::optional<u32> expected = std::nullopt,
+                                  std::vector<NativeRegisterRemap> remaps = {}) {
+    LoggedEnvironment env{code, std::move(remaps)};
     Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
     Shader::Maxwell::Flow::CFG cfg{env, flow_pool, Shader::Maxwell::Location{0x50}};
     Shader::ObjectPool<IR::Inst> inst_pool;
@@ -141,6 +168,7 @@ void TranslateAndEmit(std::span<const u64> code, std::optional<u32> expected = s
     const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
     REQUIRE(spirv.size() > 5);
     CHECK(spirv.front() == 0x07230203);
+    return spirv;
 }
 
 u64 Store(u32 source) {
@@ -150,7 +178,7 @@ u64 Store(u32 source) {
 
 TEST_CASE("Logged Pokopia absolute constant F2I retains U16 rounding and reaches SPIRV",
           "[video_core][ampere][logged_numeric]") {
-    const auto lowered = LowerToMaxwell(std::array{LoggedF2I, Exit});
+    const auto lowered = LowerCopies(std::array{LoggedF2I, Exit});
     INFO(lowered.error);
     REQUIRE(lowered);
     const std::array<u64, 6> expected{
@@ -175,7 +203,7 @@ TEST_CASE("Logged Pokopia F2I preserves guards and rejects unrelated modifiers",
     for (const u32 guard : {0U, 6U, 7U, 8U, 14U}) {
         auto instruction = LoggedF2I;
         instruction.words[0] = (instruction.words[0] & ~0xf000U) | (guard << 12);
-        const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+        const auto lowered = LowerCopies(std::array{instruction, Exit});
         REQUIRE(lowered);
         for (size_t index = 0; index + 1 < lowered.instructions.size(); ++index)
             CHECK(((lowered.instructions[index] >> 16) & 15) == guard);
@@ -183,21 +211,21 @@ TEST_CASE("Logged Pokopia F2I preserves guards and rejects unrelated modifiers",
     for (const u32 source : {0x44c03400U, 0x40c03440U, 0x48c03400U, 0x50c03400U, 0x60c03400U}) {
         auto invalid = LoggedF2I;
         invalid.words[1] = source;
-        CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+        CHECK_FALSE(LowerCopies(std::array{invalid, Exit}));
     }
     for (const u32 bit : {0U, 8U, 30U, 31U}) {
         auto invalid = LoggedF2I;
         invalid.words[3] ^= 1U << bit;
-        CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+        CHECK_FALSE(LowerCopies(std::array{invalid, Exit}));
     }
     auto invalid = LoggedF2I;
     invalid.words[0] |= 1U << 24;
-    CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+    CHECK_FALSE(LowerCopies(std::array{invalid, Exit}));
     invalid = LoggedF2I;
     invalid.words[2] |= 1U << 27;
-    CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+    CHECK_FALSE(LowerCopies(std::array{invalid, Exit}));
     invalid.words = {0x00157b05, 0x00400440, 0x0021e100, 0x0001e400};
-    CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+    CHECK_FALSE(LowerCopies(std::array{invalid, Exit}));
 }
 
 TEST_CASE("Logged Pokopia SHF clamps instead of wrapping through production translation",
@@ -206,7 +234,7 @@ TEST_CASE("Logged Pokopia SHF clamps instead of wrapping through production tran
         for (const bool wrap : {false, true}) {
             auto variant = instruction;
             variant.words[2] |= u32{wrap} << 11;
-            const auto lowered = LowerToMaxwell(std::array{variant, Exit});
+            const auto lowered = LowerCopies(std::array{variant, Exit});
             INFO(lowered.error);
             REQUIRE(lowered);
             REQUIRE(lowered.instructions.size() == 3);
@@ -243,16 +271,16 @@ TEST_CASE("Logged Pokopia SHF register pressure identifies the register shift op
         CHECK(pressure.instruction.Bits(64, 8) == pressure.instruction.Bits(16, 8));
         CHECK(pressure.instruction.Bits(24, 8) == 255);
         CHECK(pressure.instruction.words[1] == 255);
-        REQUIRE(LowerToMaxwell(std::array{pressure.instruction, Exit}));
+        REQUIRE(LowerCopies(std::array{pressure.instruction, Exit}));
     }
     for (const u32 bit : {8U, 12U, 17U, 27U}) {
         auto invalid = LoggedShifts[0];
         invalid.words[2] ^= 1U << bit;
-        CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+        CHECK_FALSE(LowerCopies(std::array{invalid, Exit}));
     }
     auto invalid = LoggedShifts[0];
     invalid.words[0] &= ~0xff000000U;
-    CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+    CHECK_FALSE(LowerCopies(std::array{invalid, Exit}));
 }
 
 TEST_CASE("TXD register pressure covers the layer and a single destination",
@@ -279,7 +307,7 @@ TEST_CASE("TXD register pressure covers the layer and a single destination",
     // Two channels need an even destination: R247 stays odd once copied, so the lowering rejects it.
     pressure = Shader::Ampere::PrepareRegisterPressure(txd(247, 0, 1, 0x3), 216);
     CHECK(pressure.instruction.Bits(16, 8) % 2 == 1);
-    CHECK_FALSE(LowerToMaxwell(std::array{txd(247, 0, 1, 0x3), Exit}));
+    CHECK_FALSE(LowerCopies(std::array{txd(247, 0, 1, 0x3), Exit}));
 }
 
 TEST_CASE("Logged Kirby FMUL preserves high guest registers across uniform mirrors",
@@ -296,7 +324,7 @@ TEST_CASE("Logged Kirby FMUL preserves high guest registers across uniform mirro
     REQUIRE(pressure.suffix.size() == 8);
 
     const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
-    const auto lowered = LowerToMaxwell(std::array{uniform_marker, multiply, Exit});
+    const auto lowered = LowerCopies(std::array{uniform_marker, multiply, Exit});
     INFO(lowered.error);
     REQUIRE(lowered);
     REQUIRE(lowered.instructions.size() == 18);
@@ -309,7 +337,20 @@ TEST_CASE("Logged Kirby FMUL preserves high guest registers across uniform mirro
     code.insert(code.begin(), 0x0100000000070000ULL | 95 | (15ULL << 12) | (0x40000000ULL << 20));
     code.insert(code.end() - 1, NativeRegisterCopy(0, 0, 1, 220));
     code.insert(code.end() - 1, Store(0));
-    TranslateAndEmit(code, 0x40c00000);
+    const auto copied = TranslateAndEmit(code, 0x40c00000);
+
+    // The remap form: no copies, the multiply reads and writes the high registers directly.
+    const auto remapped = LowerToMaxwell(std::array{uniform_marker, multiply, Exit});
+    REQUIRE(remapped);
+    REQUIRE(remapped.instructions.size() == 2);
+    REQUIRE(remapped.register_remaps.size() == 1);
+    CHECK(remapped.instructions[0] == lowered.instructions[8]);
+    auto remap_code = remapped.instructions;
+    remap_code.insert(remap_code.begin(), code[1]);
+    remap_code.insert(remap_code.begin(), code[0]);
+    remap_code.insert(remap_code.end() - 1, NativeRegisterCopy(0, 0, 1, 220));
+    remap_code.insert(remap_code.end() - 1, Store(0));
+    CHECK(TranslateAndEmit(remap_code, 0x40c00000, RemapsAt(remapped, 2)) == copied);
 
     for (const u32 field : {16U, 24U, 32U}) {
         for (const u32 high : {216U, 217U, 240U, 246U, 254U}) {
@@ -317,10 +358,10 @@ TEST_CASE("Logged Kirby FMUL preserves high guest registers across uniform mirro
             const u32 word = field / 32, shift = field % 32;
             instruction.words[word] =
                 (instruction.words[word] & ~(255U << shift)) | (high << shift);
-            const auto remapped = Shader::Ampere::PrepareRegisterPressure(instruction, 216);
-            REQUIRE(remapped.valid);
-            CHECK(remapped.instruction.Bits(field, 8) < 216);
-            CHECK(LowerToMaxwell(std::array{uniform_marker, instruction, Exit}));
+            const auto prepared = Shader::Ampere::PrepareRegisterPressure(instruction, 216);
+            REQUIRE(prepared.valid);
+            CHECK(prepared.instruction.Bits(field, 8) < 216);
+            CHECK(LowerCopies(std::array{uniform_marker, instruction, Exit}));
         }
     }
 }
@@ -343,7 +384,7 @@ TEST_CASE("Logged Ocarina uniform IMAD preserves high destinations across unifor
         CHECK(pressure.instruction.words[2] == multiply.words[2]);
         REQUIRE(pressure.prefix.size() == 8);
         REQUIRE(pressure.suffix.size() == 8);
-        const auto lowered = LowerToMaxwell(std::array{uniform_marker, multiply, Exit});
+        const auto lowered = LowerCopies(std::array{uniform_marker, multiply, Exit});
         INFO(lowered.error);
         REQUIRE(lowered);
         CHECK(std::equal(pressure.prefix.begin(), pressure.prefix.end(),
@@ -368,7 +409,7 @@ TEST_CASE("Logged Kirby global loads preserve high destinations across uniform m
         REQUIRE(pressure.prefix.size() == 8);
         REQUIRE(pressure.suffix.size() == 8);
         const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
-        const auto lowered = LowerToMaxwell(std::array{uniform_marker, load, Exit});
+        const auto lowered = LowerCopies(std::array{uniform_marker, load, Exit});
         INFO(lowered.error);
         REQUIRE(lowered);
         REQUIRE(lowered.instructions.size() == 18);
@@ -425,7 +466,7 @@ TEST_CASE("Captured Kirby high-register ALU and memory operands preserve encodin
                   (instruction.words[word] & ~masks[word]));
         }
         const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
-        const auto lowered = LowerToMaxwell(std::array{uniform_marker, instruction, Exit});
+        const auto lowered = LowerCopies(std::array{uniform_marker, instruction, Exit});
         INFO(lowered.error);
         REQUIRE(lowered);
     }
@@ -447,20 +488,30 @@ TEST_CASE("Captured Kirby shadowed floating arithmetic preserves values",
                 2.0f * std::bit_cast<float>(0x3c8efa35U) + 2.0f},
     };
     for (const auto& fixture : fixtures) {
+        CAPTURE(fixture.instruction.words);
         const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
-        const auto lowered = LowerToMaxwell(std::array{uniform_marker, fixture.instruction, Exit});
-        REQUIRE(lowered);
-        std::vector<u64> code{0x0100000000070000ULL | (15ULL << 12) | (0x40000000ULL << 20)};
-        for (const u32 source : fixture.sources) {
-            code.push_back(Shader::Ampere::NativeRegisterCopy(source >= 216 ? 1 : 0, source, 0, 0));
+        std::vector<std::vector<u32>> spirv;
+        for (const bool copies : {true, false}) {
+            const auto lowered = LowerToMaxwell(std::array{uniform_marker, fixture.instruction, Exit},
+                                                {.register_copies = copies});
+            REQUIRE(lowered);
+            CHECK(lowered.register_remaps.empty() == copies);
+            std::vector<u64> code{0x0100000000070000ULL | (15ULL << 12) | (0x40000000ULL << 20)};
+            for (const u32 source : fixture.sources) {
+                code.push_back(
+                    Shader::Ampere::NativeRegisterCopy(source >= 216 ? 1 : 0, source, 0, 0));
+            }
+            const u32 shift = static_cast<u32>(code.size());
+            code.insert(code.end(), lowered.instructions.begin(), lowered.instructions.end() - 1);
+            const u32 destination = fixture.instruction.Bits(16, 8);
+            code.push_back(Shader::Ampere::NativeRegisterCopy(0, 0, destination >= 216 ? 1 : 0,
+                                                           destination));
+            code.push_back(Store(0));
+            code.push_back(lowered.instructions.back());
+            spirv.push_back(TranslateAndEmit(code, std::bit_cast<u32>(fixture.expected),
+                                             RemapsAt(lowered, shift)));
         }
-        code.insert(code.end(), lowered.instructions.begin(), lowered.instructions.end() - 1);
-        const u32 destination = fixture.instruction.Bits(16, 8);
-        code.push_back(Shader::Ampere::NativeRegisterCopy(0, 0, destination >= 216 ? 1 : 0,
-                                                       destination));
-        code.push_back(Store(0));
-        code.push_back(lowered.instructions.back());
-        TranslateAndEmit(code, std::bit_cast<u32>(fixture.expected));
+        CHECK(spirv[0] == spirv[1]);
     }
 }
 
@@ -470,12 +521,12 @@ TEST_CASE("Logged Pokopia masked dependency barrier fences shared memory and rej
     for (const u32 mask : {0x800eU, 0x8000U}) {
         auto supported = wait;
         supported.words[1] = mask;
-        const auto ordered = LowerToMaxwell(std::array{supported, Exit});
+        const auto ordered = LowerCopies(std::array{supported, Exit});
         REQUIRE(ordered);
         REQUIRE(ordered.instructions.size() == 1);
         CHECK(ordered.instructions.back() == 0xe30000000007000fULL);
         const Instruction copy{{0x02067fae, 0, 0x0f901c08, 0}};
-        const auto copying = LowerToMaxwell(std::array{copy, supported, Exit});
+        const auto copying = LowerCopies(std::array{copy, supported, Exit});
         REQUIRE(copying);
         CHECK(copying.instructions[copying.source_instruction_offsets[1]] ==
               0xef98000000070000ULL);
@@ -484,7 +535,7 @@ TEST_CASE("Logged Pokopia masked dependency barrier fences shared memory and rej
     for (u32 bit = 15; bit < 32; ++bit) {
         auto invalid = wait;
         invalid.words[1] ^= 1U << bit;
-        const auto rejected = LowerToMaxwell(std::array{invalid, Exit});
+        const auto rejected = LowerCopies(std::array{invalid, Exit});
         REQUIRE_FALSE(rejected);
         CHECK(rejected.error == "native dependency barrier mode");
         CHECK(rejected.instructions.empty());
@@ -492,7 +543,7 @@ TEST_CASE("Logged Pokopia masked dependency barrier fences shared memory and rej
     }
     auto invalid = wait;
     invalid.words[2] = 1;
-    const auto rejected = LowerToMaxwell(std::array{invalid, Exit});
+    const auto rejected = LowerCopies(std::array{invalid, Exit});
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error == "native dependency barrier mode");
 }
@@ -503,7 +554,7 @@ TEST_CASE("Ocarina mesh attribute stores read shadowed high registers",
     // UR22's mirror once the uniform bank is in use, so the data must come from the shadow bank.
     const Instruction uniform_marker{{0x0000fc02, 0, 0, 0}};
     const Instruction store{{0xc5007927, 0x000780f0, 0x0000f800, 0x000fe200}};
-    const auto lowered = LowerToMaxwell(std::array{uniform_marker, store, Exit});
+    const auto lowered = LowerCopies(std::array{uniform_marker, store, Exit});
     INFO(lowered.error);
     REQUIRE(lowered);
     const auto begin = lowered.instructions.begin() + lowered.source_instruction_offsets[1];
@@ -513,4 +564,26 @@ TEST_CASE("Ocarina mesh attribute stores read shadowed high registers",
     const u32 data = static_cast<u32>(*pseudo & 0xff);
     CHECK(data < 216);
     CHECK(std::find(begin, pseudo, Shader::Ampere::NativeRegisterCopy(0, data, 1, 240)) != pseudo);
+}
+
+TEST_CASE("Native register remaps survive the code layout", "[video_core][ampere][logged_numeric]") {
+    const std::vector<NativeRegisterRemap> remaps{{3, 5, 53, 57, 0xf}, {3, 5, 52, 60, 0x3},
+                                                  {70000, 70002, 1, 63, 0x8}};
+    std::vector<u64> code(10, 0);
+    Shader::Ampere::AppendNativeRegisterRemaps(code, remaps);
+    Shader::Ampere::AppendNativeAddressMap(code, std::array<u32, 2>{0, 1});
+    const auto parsed = Shader::Ampere::NativeRegisterRemaps(code);
+    REQUIRE(parsed.size() == remaps.size());
+    for (size_t index = 0; index < remaps.size(); ++index) {
+        CHECK(parsed[index].begin == Address(remaps[index].begin));
+        CHECK(parsed[index].end == Address(remaps[index].end));
+        CHECK(parsed[index].low_group == remaps[index].low_group);
+        CHECK(parsed[index].high_group == remaps[index].high_group);
+        CHECK(parsed[index].bank_mask == remaps[index].bank_mask);
+    }
+    CHECK(Shader::Ampere::NativeProgramAddress(code, 16) == Address(1));
+    // Code without a table (lowered before remaps, or without high registers) has none.
+    std::vector<u64> old_code(10, 0);
+    Shader::Ampere::AppendNativeAddressMap(old_code, std::array<u32, 2>{0, 1});
+    CHECK(Shader::Ampere::NativeRegisterRemaps(old_code).empty());
 }

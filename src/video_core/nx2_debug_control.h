@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <optional>
 #include <span>
 #include <string>
@@ -29,6 +30,7 @@ struct CaptureRequest {
     bool buffers;
     /// Sampled textures larger than this are listed but not read back; 0 reads back all.
     u64 sampled_max_bytes{};
+    std::vector<u32> sampled_tics;
 };
 
 struct CaptureResult {
@@ -54,12 +56,27 @@ struct RejectChange {
     bool unrejected;
 };
 
+struct AstcFusionResult {
+    bool supported;
+    bool enabled;
+    size_t marked_for_refresh;
+};
+
+struct AstcFusionRequest {
+    std::optional<bool> enable;
+    std::promise<AstcFusionResult> result;
+};
+
 /// Opens a debug server session (clears requests and rejections) or ends it (wakes waiters).
 void BeginSession();
 void EndSession();
 
-/// Rasterizer thread: whether a capture or a reject change is waiting.
+/// Rasterizer thread: whether a debug request is waiting.
 [[nodiscard]] bool HasRequests() noexcept;
+
+/// Query or change fusion on the rasterizer thread at a frame boundary.
+[[nodiscard]] std::future<AstcFusionResult> RequestAstcFusion(std::optional<bool> enable);
+[[nodiscard]] std::optional<AstcFusionRequest> TakeAstcFusion();
 
 /// Server thread: queues a frame capture; the rasterizer takes it at the next frame end.
 void RequestCapture(CaptureRequest request);

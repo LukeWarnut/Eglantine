@@ -161,6 +161,9 @@ void AssignPools(std::vector<Range>& ranges, const UniformSnapshotPools& pools) 
 u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
                    UniformSnapshotCpuPages& cpu, GuestMemory& memory,
                    std::vector<std::pair<u64, u64>>& runs) {
+    constexpr u64 RECENT_FRAMES = 16;
+    const u64 current_present = cpu.presents + 1;
+    const u64 recent = cpu.presents > RECENT_FRAMES ? cpu.presents - RECENT_FRAMES : 0;
     // One pass per run of touched pages of one pool: the tracker is asked once per run.
     size_t i = 0;
     while (i < ranges.size()) {
@@ -169,6 +172,11 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
         if (!pool.track_tried) {
             pool.track_tried = true;
             pool.track_id = memory.Track(pool_begin, pool.end - pool_begin);
+            if (pool.track_id != 0) {
+                pool.write_epoch = memory.WriteEpoch(pool.track_id);
+                pool.epoch_clean =
+                    pool.write_epoch ? pool.write_epoch->load(std::memory_order_acquire) : 0;
+            }
         }
         const u64 first = ranges[i].begin >> PAGE_BITS;
         u64 last = (ranges[i].end - 1) >> PAGE_BITS;
@@ -179,14 +187,6 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
             ++j;
         }
         if (pool.track_id != 0) {
-            runs.clear();
-            memory.TakeWritten(pool.track_id, first << PAGE_BITS, (last - first + 1) << PAGE_BITS,
-                               runs);
-            for (const auto& [begin, end] : runs) {
-                for (u64 page = begin >> PAGE_BITS; page < (end >> PAGE_BITS); ++page) {
-                    cpu.written[page] = cpu.presents + 1;
-                }
-            }
             u64 arm_from = 0;
             u64 arm_count = 0;
             const auto flush_arm = [&] {
@@ -196,7 +196,7 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
                 }
             };
             for (u64 page = first; page <= last; ++page) {
-                if (cpu.written.try_emplace(page, 0).second) {
+                if (cpu.written.try_emplace(page, UniformSnapshotPageState{}).second) {
                     if (arm_count == 0 || arm_from + arm_count != page) {
                         flush_arm();
                         arm_from = page;
@@ -205,19 +205,62 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
                 }
             }
             flush_arm();
+
+            const u64 cur_epoch =
+                pool.write_epoch ? pool.write_epoch->load(std::memory_order_acquire) : 0;
+            const bool epoch_unchanged = pool.write_epoch && cur_epoch == pool.epoch_clean;
+            if (!epoch_unchanged) {
+                u64 sub_first = 0;
+                bool in_sub = false;
+                const auto flush_sub = [&](u64 sub_end_exclusive) {
+                    runs.clear();
+                    memory.TakeWritten(pool.track_id, sub_first << PAGE_BITS,
+                                       (sub_end_exclusive - sub_first) << PAGE_BITS, runs);
+                    for (const auto& [begin, end] : runs) {
+                        for (u64 page = begin >> PAGE_BITS; page < (end >> PAGE_BITS); ++page) {
+                            cpu.written[page].written = current_present;
+                        }
+                    }
+                    in_sub = false;
+                };
+                for (u64 page = first; page <= last; ++page) {
+                    UniformSnapshotPageState& state = cpu.written[page];
+                    const bool stale = state.written == 0 || state.written < recent;
+                    const bool needs_check =
+                        stale && (!pool.write_epoch || state.checked != cur_epoch);
+                    if (needs_check) {
+                        state.checked = cur_epoch;
+                        if (!in_sub) {
+                            sub_first = page;
+                            in_sub = true;
+                        }
+                    } else if (in_sub) {
+                        flush_sub(page);
+                    }
+                }
+                if (in_sub) {
+                    flush_sub(last + 1);
+                }
+            }
         }
         i = j;
     }
-    // Written in this frame (presents + 1) or the previous one (presents).
-    const u64 recent = cpu.presents;
+    // Written within RECENT_FRAMES (or never yet checked cleanly for untracked pools).
     size_t kept = 0;
+    u64 last_pool_begin = ~u64{0};
+    bool last_tracked = false;
     for (const Range& range : ranges) {
-        if (pools.find(range.offset)->second.track_id != 0) {
+        if (range.offset != last_pool_begin) {
+            last_pool_begin = range.offset;
+            last_tracked = pools.find(last_pool_begin)->second.track_id != 0;
+        }
+        if (last_tracked) {
             bool written = true;
             for (u64 page = range.begin >> PAGE_BITS; page <= (range.end - 1) >> PAGE_BITS;
                  ++page) {
                 const auto it = cpu.written.find(page);
-                if (it == cpu.written.end() || it->second == 0 || it->second < recent) {
+                if (it == cpu.written.end() || it->second.written == 0 ||
+                    it->second.written < recent) {
                     written = false;
                     break;
                 }

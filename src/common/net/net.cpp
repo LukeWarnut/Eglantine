@@ -163,6 +163,18 @@ static inline u64 ParseIsoTimestamp(const std::string& iso) {
 #endif
 }
 
+// `text` lowercased when it is a 40-character commit hash, else empty.
+static std::string LowercaseSha(std::string text) {
+    if (text.size() != 40 ||
+        !std::ranges::all_of(text, [](unsigned char ch) { return std::isxdigit(ch); })) {
+        return {};
+    }
+    std::ranges::transform(text, text.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return text;
+}
+
 std::optional<Release> Release::FromJson(const nlohmann::json& json, const std::string& host,
                                          const std::string& repo) {
     Release rel;
@@ -197,6 +209,7 @@ std::optional<Release> Release::FromJson(const nlohmann::json& json, const std::
     rel.body = body;
 
     rel.host = host;
+    rel.target_commit = LowercaseSha(json.value("target_commitish", std::string{}));
 
     const auto release_base =
         fmt::format("{}/{}/releases", Common::g_build_auto_update_website, repo);
@@ -325,6 +338,29 @@ std::optional<std::string> MakeRequest(const std::string& url, const std::string
     return Fetch(url, path).body;
 }
 
+std::optional<Release> FindReleaseForCommit(const std::vector<Release>& releases,
+                                            std::string_view commit, std::string_view platform,
+                                            LinuxPackage package) {
+    if (commit.size() != 40) {
+        return std::nullopt;
+    }
+    const auto wanted = LowercaseSha(std::string{commit});
+    if (wanted.empty()) {
+        return std::nullopt;
+    }
+    std::optional<Release> best;
+    for (const auto& release : releases) {
+        if (release.target_commit != wanted || release.GetPlatformAssets(platform, package).empty()) {
+            continue;
+        }
+        if (!best || release.published > best->published) {
+            best = release;
+        }
+    }
+    return best;
+}
+
+
 namespace {
 
 struct ReleasesJson {
@@ -432,12 +468,301 @@ ReleaseResult GetRelease(std::string_view tag) {
     }
 }
 
+ReleaseList GetReleases() {
+    const auto json = FetchReleasesJson();
+    if (!json.ok) {
+        return {.status = json.status};
+    }
+    const auto url = fmt::format("https://{}", Common::g_build_auto_update_api);
+    try {
+        return {.releases =
+                    Release::ListFromJson(json.releases, url, Common::g_build_auto_update_repo),
+                .ok = true,
+                .status = json.status};
+    } catch (std::exception& e) {
+        LOG_WARNING(Common, "Failed to parse releases: {}", e.what());
+        return {.status = json.status};
+    }
+}
+
 std::optional<std::string> GetReleasesBody() {
     const auto json = FetchReleasesJson();
     if (!json.ok) {
         return std::nullopt;
     }
     return json.releases.dump();
+}
+
+static std::string StringAt(const nlohmann::json& json, const char* key) {
+    return json.contains(key) && json[key].is_string() ? json[key].get<std::string>()
+                                                       : std::string{};
+}
+
+// The commit hash in an object with a "sha" key, lowercased, when it is 40 hex characters.
+static std::optional<std::string> CommitSha(const nlohmann::json& commit) {
+    if (!commit.contains("sha") || !commit["sha"].is_string())
+        return std::nullopt;
+
+    auto sha = commit["sha"].get<std::string>();
+    if (sha.size() != 40 ||
+        !std::ranges::all_of(sha, [](unsigned char ch) { return std::isxdigit(ch); })) {
+        return std::nullopt;
+    }
+    std::ranges::transform(sha, sha.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return sha;
+}
+
+std::optional<RemoteHead> RemoteHead::FromBranchJson(const std::string_view& json) {
+    try {
+        const auto parsed = nlohmann::json::parse(json);
+        if (!parsed.contains("commit"))
+            return std::nullopt;
+
+        const auto sha = CommitSha(parsed["commit"]);
+        if (!sha)
+            return std::nullopt;
+
+        return RemoteHead{.sha = *sha};
+    } catch (std::exception& e) {
+        LOG_WARNING(Common, "Failed to parse JSON: {}", e.what());
+    }
+
+    return std::nullopt;
+}
+
+std::optional<RemoteHead> RemoteHead::FromPullJson(const std::string_view& json) {
+    try {
+        const auto parsed = nlohmann::json::parse(json);
+        if (!parsed.contains("head"))
+            return std::nullopt;
+
+        const auto sha = CommitSha(parsed["head"]);
+        if (!sha)
+            return std::nullopt;
+
+        RemoteHead head{.sha = *sha};
+        head.title = StringAt(parsed, "title");
+        head.author = parsed.contains("user") ? StringAt(parsed["user"], "login") : std::string{};
+        head.open = StringAt(parsed, "state") == "open";
+        head.merged = parsed.contains("merged") && parsed["merged"].is_boolean() &&
+                      parsed["merged"].get<bool>();
+        return head;
+    } catch (std::exception& e) {
+        LOG_WARNING(Common, "Failed to parse JSON: {}", e.what());
+    }
+
+    return std::nullopt;
+}
+
+static bool IsUnreserved(unsigned char ch) {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+           ch == '-' || ch == '_' || ch == '.' || ch == '~';
+}
+
+// Percent-encode a branch name for a URL path, keeping the slashes between its segments.
+static std::string EncodeBranch(const std::string& branch) {
+    std::string encoded;
+    for (const auto ch : branch) {
+        const auto uch = static_cast<unsigned char>(ch);
+        if (IsUnreserved(uch) || ch == '/') {
+            encoded.push_back(ch);
+        } else {
+            encoded += fmt::format("%{:02X}", uch);
+        }
+    }
+    return encoded;
+}
+
+RemoteHeadResult GetBranchHead(const std::string& branch) {
+    const auto url = fmt::format("https://{}", Common::g_build_auto_update_api);
+    const auto path = fmt::format("/repos/{}/branches/{}", Common::g_build_auto_update_repo,
+                                  EncodeBranch(branch));
+    const auto response = Fetch(url, path);
+
+    if (!response.body) {
+        return {.status = response.status};
+    }
+
+    return {.head = RemoteHead::FromBranchJson(std::string_view{*response.body}),
+            .status = response.status};
+}
+
+RemoteHeadResult GetPullRequestHead(u64 number) {
+    const auto url = fmt::format("https://{}", Common::g_build_auto_update_api);
+    const auto path =
+        fmt::format("/repos/{}/pulls/{}", Common::g_build_auto_update_repo, number);
+    const auto response = Fetch(url, path);
+
+    if (!response.body) {
+        return {.status = response.status};
+    }
+
+    return {.head = RemoteHead::FromPullJson(std::string_view{*response.body}),
+            .status = response.status};
+}
+
+std::vector<std::string> BranchNamesFromJson(const std::string_view& json) {
+    std::vector<std::string> names;
+    try {
+        const auto parsed = nlohmann::json::parse(json);
+        if (!parsed.is_array())
+            return {};
+
+        for (const auto& branch : parsed) {
+            if (branch.contains("name") && branch["name"].is_string()) {
+                names.push_back(branch["name"].get<std::string>());
+            }
+        }
+    } catch (std::exception& e) {
+        LOG_WARNING(Common, "Failed to parse JSON: {}", e.what());
+        return {};
+    }
+
+    return names;
+}
+
+std::vector<std::string> RecentBranchesFromActivityJson(const std::string_view& json,
+                                                        std::size_t limit) {
+    constexpr std::string_view prefix = "refs/heads/";
+    std::vector<std::string> names;
+    std::vector<std::string> seen;
+    try {
+        const auto parsed = nlohmann::json::parse(json);
+        if (!parsed.is_array())
+            return {};
+
+        // Newest first: a branch's first entry tells whether it still exists.
+        for (const auto& activity : parsed) {
+            if (names.size() >= limit)
+                break;
+            if (!activity.contains("ref") || !activity["ref"].is_string())
+                continue;
+            const auto ref = activity["ref"].get<std::string>();
+            if (!ref.starts_with(prefix))
+                continue;
+            auto name = ref.substr(prefix.size());
+            if (std::find(seen.begin(), seen.end(), name) != seen.end())
+                continue;
+            seen.push_back(name);
+            const bool deleted = activity.contains("activity_type") &&
+                                 activity["activity_type"] == "branch_deletion";
+            if (!deleted)
+                names.push_back(std::move(name));
+        }
+    } catch (std::exception& e) {
+        LOG_WARNING(Common, "Failed to parse JSON: {}", e.what());
+        return {};
+    }
+
+    return names;
+}
+
+BranchList GetBranches() {
+    constexpr std::size_t RecentBranchCount = 15;
+    const auto url = fmt::format("https://{}", Common::g_build_auto_update_api);
+    const auto activity = Fetch(
+        url, fmt::format("/repos/{}/activity?per_page=100", Common::g_build_auto_update_repo));
+    if (activity.body) {
+        auto names = RecentBranchesFromActivityJson(*activity.body, RecentBranchCount);
+        if (!names.empty()) {
+            return {.names = std::move(names), .ok = true, .status = activity.status};
+        }
+    }
+
+    const auto path =
+        fmt::format("/repos/{}/branches?per_page=100", Common::g_build_auto_update_repo);
+    const auto response = Fetch(url, path);
+
+    if (!response.body) {
+        LOG_WARNING(Common, "Failed to get branches");
+        return {.status = response.status};
+    }
+
+    return {.names = BranchNamesFromJson(std::string_view{*response.body}),
+            .ok = true,
+            .status = response.status};
+}
+
+BranchList GetAllBranches(std::size_t max_pages) {
+    const auto url = fmt::format("https://{}", Common::g_build_auto_update_api);
+    BranchList list;
+    for (std::size_t page = 1; page <= max_pages; ++page) {
+        const auto response = Fetch(url, fmt::format("/repos/{}/branches?per_page=100&page={}",
+                                                     Common::g_build_auto_update_repo, page));
+        list.status = response.status;
+        if (!response.body) {
+            // A later page failing still leaves the names read so far.
+            list.ok = page > 1;
+            return list;
+        }
+        auto names = BranchNamesFromJson(std::string_view{*response.body});
+        const bool last = names.size() < 100;
+        list.names.insert(list.names.end(), std::make_move_iterator(names.begin()),
+                          std::make_move_iterator(names.end()));
+        if (last)
+            break;
+    }
+    list.ok = true;
+    return list;
+}
+
+std::vector<Commit> CommitsFromJson(const std::string_view& json) {
+    std::vector<Commit> commits;
+    try {
+        const auto parsed = nlohmann::json::parse(json);
+        if (!parsed.is_array())
+            return {};
+
+        for (const auto& entry : parsed) {
+            if (!entry.is_object())
+                continue;
+            const auto sha = CommitSha(entry);
+            if (!sha || !entry.contains("commit") || !entry["commit"].is_object())
+                continue;
+            const auto& commit = entry["commit"];
+            Commit result{.sha = *sha, .message = StringAt(commit, "message")};
+            if (commit.contains("author") && commit["author"].is_object())
+                result.author = StringAt(commit["author"], "name");
+            if (commit.contains("committer") && commit["committer"].is_object())
+                result.time = ParseIsoTimestamp(StringAt(commit["committer"], "date"));
+            commits.push_back(std::move(result));
+        }
+    } catch (std::exception& e) {
+        LOG_WARNING(Common, "Failed to parse JSON: {}", e.what());
+        return {};
+    }
+
+    return commits;
+}
+
+CommitList GetBranchCommits(const std::string& branch, std::size_t limit) {
+    const auto url = fmt::format("https://{}", Common::g_build_auto_update_api);
+    const auto path = fmt::format("/repos/{}/commits?sha={}&per_page={}",
+                                  Common::g_build_auto_update_repo, EncodeBranch(branch),
+                                  std::clamp<std::size_t>(limit, 1, 100));
+    const auto response = Fetch(url, path);
+    if (!response.body)
+        return {.status = response.status};
+
+    return {.commits = CommitsFromJson(std::string_view{*response.body}),
+            .ok = true,
+            .status = response.status};
+}
+
+CommitList GetPullRequestCommits(u64 number) {
+    const auto url = fmt::format("https://{}", Common::g_build_auto_update_api);
+    const auto path = fmt::format("/repos/{}/pulls/{}/commits?per_page=100",
+                                  Common::g_build_auto_update_repo, number);
+    const auto response = Fetch(url, path);
+    if (!response.body)
+        return {.status = response.status};
+
+    // Listed oldest first.
+    auto commits = CommitsFromJson(std::string_view{*response.body});
+    std::ranges::reverse(commits);
+    return {.commits = std::move(commits), .ok = true, .status = response.status};
 }
 
 } // namespace Common::Net

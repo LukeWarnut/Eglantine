@@ -509,11 +509,16 @@ vk::Pipeline GraphicsPipelineLibraryCache::Link(const VkGraphicsPipelineCreateIn
                     }
                 });
             }
-            try {
-                (void)GetLibrary(parts[missing[0]].key, parts[missing[0]].ci, pipeline_cache,
-                                 shaders);
-            } catch (...) {
-                // As above: compiled again (and thrown) by the loop below.
+            // The caller compiles the first part, then the others no worker has started yet,
+            // from the back (workers take them from the front): with a busy pool this is the
+            // serial compile, with an idle one the parts compile side by side.
+            for (size_t i = missing.size(); i-- > 0;) {
+                const size_t index = missing[i == missing.size() - 1 ? 0 : i + 1];
+                try {
+                    (void)GetLibrary(parts[index].key, parts[index].ci, pipeline_cache, shaders);
+                } catch (...) {
+                    // As above: compiled again (and thrown) by the loop below.
+                }
             }
             std::unique_lock lock{join.mutex};
             join.cv.wait(lock, [&join] { return join.left == 0; });

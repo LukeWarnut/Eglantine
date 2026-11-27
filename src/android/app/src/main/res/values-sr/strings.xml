@@ -153,7 +153,7 @@
 
     <!-- Setup strings -->
     <string name="welcome">Добродошли!</string>
-    <string name="welcome_description">Научите како се подесити и &lt;b>Еден&lt;/b> скочи у емулацију.</string>
+    <string name="welcome_description">Научите како се подесити и &lt;b>Еглантин&lt;/b> скочи у емулацију.</string>
     <string name="get_started">Започните</string>
     <string name="keys">Тастери</string>
     <string name="keys_description">Изаберите свој и лт; &lt;b>prod.keys&lt;/b> датотека са дугметом испод.</string>
@@ -178,7 +178,7 @@
     <string name="home_settings">Подешавања</string>
     <string name="empty_gamelist">Није пронађена ниједна датотека или се још није одабрала директоријум игара.</string>
     <string name="manage_game_folders">Управљајте мапама игара</string>
-    <string name="select_games_folder_description">Омогућује ЕДЕН-у да попуни листу игара</string>
+    <string name="select_games_folder_description">Омогућује ЕГЛАНТИН-у да попуни листу игара</string>
     <string name="add_games_warning">Прескочите одабир мапе игре?</string>
     <string name="add_games_warning_description">Игре побеђују \"т приказују се на листи игара ако је изабрана мапа н \" т.</string>
     <string name="home_search_games">Претражите игре</string>
@@ -208,10 +208,10 @@
     <string name="settings_description">Конфигуришите подешавања емулатора</string>
     <string name="search_recently_played">Недавно одигран</string>
     <string name="search_recently_added">Недавно је додато</string>
-    <string name="open_user_folder">Отворите директоријум ЕДЕН</string>
-    <string name="open_user_folder_description">Управљајте унутрашњим датотекама ЕДЕН-а</string>
+    <string name="open_user_folder">Отворите директоријум ЕГЛАНТИН</string>
+    <string name="open_user_folder_description">Управљајте унутрашњим датотекама ЕГЛАНТИН-а</string>
     <string name="no_file_manager">Није пронађен ниједан управник датотека</string>
-    <string name="notification_no_directory_link">Није могуће отворити директоријум ЕДЕН-а</string>
+    <string name="notification_no_directory_link">Није могуће отворити директоријум ЕГЛАНТИН-а</string>
     <string name="notification_no_directory_link_description">Молимо пронађите корисничку мапу са бочним панелом датотека менаџера и ручно.</string>
     <string name="manage_save_data">Управљајте сачувајте податке</string>
     <string name="manage_save_data_description">Спреми податке. Изаберите опцију испод.</string>
@@ -229,7 +229,7 @@
     <string name="firmware_installed_failure_description">Проверите да ли су ФИРВВАРЕ НЦА датотеке у корену Зип и покушавају поново.</string>
     <string name="firmware_uninstalled_failure">Деинсталација фирмвера није успела</string>
     <string name="share_log">Дели се за уклањање погрешака</string>
-    <string name="share_log_description">Поделите ЕДЕН \ е-е датотеку дневника у проблематику за уклањање погрешака</string>
+    <string name="share_log_description">Поделите ЕГЛАНТИН \ е-е датотеку дневника у проблематику за уклањање погрешака</string>
     <string name="share_log_missing">Није пронађена датотека дневника</string>
     <string name="install_game_content">Инсталирајте садржај игре</string>
     <string name="install_game_content_description">Инсталирајте исправке игре или ДЛЦ</string>
@@ -242,7 +242,7 @@
     <string name="install_game_content_success_install">%1$d инсталирано успешно</string>
     <string name="install_game_content_success_overwrite">%1$d преписано успешно</string>
     <string name="custom_driver_not_supported">Прилагођени управљачки програми нису подржани</string>
-    <string name="manage_yuzu_data">Управљајте подацима ЕДЕН-а</string>
+    <string name="manage_yuzu_data">Управљајте подацима ЕГЛАНТИН-а</string>
     <string name="manage_yuzu_data_description">Увоз / извозни софтвер, кључеви, кориснички подаци и још много тога!</string>
     <string name="game_folders">Мапе игре</string>
     <string name="deep_scan">Дубоко скенирање</string>
@@ -296,16 +296,16 @@
     <string name="cabinet_formatter">Форматтер</string>
 
     <!-- About screen strings -->
-    <string name="gaia_is_not_real">Гаиа није стварно</string>
+    <string name="gaia_is_not_real">Љубавно писмо господици Несрин</string>
     <string name="copied_to_clipboard">Копирано у међуспремник</string>
     <string name="about_app_description">Емулатор прекидача отвореног кода</string>
     <string name="contributors">Сарадници</string>
-    <string name="licenses_description">Пројекти који омогућавају ЕДЕН за Андроид</string>
+    <string name="licenses_description">Пројекти који омогућавају ЕГЛАНТИН за Андроид</string>
     <string name="build">Градити</string>
     <string name="user_data">Кориснички подаци</string>
     <string name="exporting_user_data">Извоз података корисника ...</string>
     <string name="importing_user_data">Увоз података корисника ...</string>
-    <string name="invalid_yuzu_backup">Неважећа резервна копија ЕДЕН-а</string>
+    <string name="invalid_yuzu_backup">Неважећа резервна копија ЕГЛАНТИН-а</string>
     <string name="user_data_export_success">Кориснички подаци су успешно извезени</string>
     <string name="user_data_import_success">Корисничке податке увезене успешно</string>
     <string name="user_data_export_cancelled">Извоз је отказан</string>

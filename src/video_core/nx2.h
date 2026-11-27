@@ -13,6 +13,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -652,8 +653,28 @@ public:
                                    [owner](const Waiter& w) { return w.owner == owner && w.latched; });
     }
 
+    /// What happened to a semaphore release, for the report of an acquire waiting 2 s (#927).
+    enum class Event : u32 { Queued, Written, Dropped };
+
+    /// Records a release queued behind a fence, or one dropped before its write.
+    void Note(u64 device_address, u32 value, Event event) {
+        const u64 index = history_head.fetch_add(1, std::memory_order_relaxed) % history.size();
+        auto& slot = history[index];
+        slot.address.store(device_address, std::memory_order_relaxed);
+        slot.value.store(value, std::memory_order_relaxed);
+        slot.event.store(static_cast<u32>(event), std::memory_order_relaxed);
+        slot.ns.store(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now().time_since_epoch())
+                                           .count()),
+                      std::memory_order_relaxed);
+    }
+
+    /// The recent events on the 16 bytes around `device_address`, newest first.
+    [[nodiscard]] std::string Describe(u64 device_address) const;
+
     /// A GPU write of `value` to the u32 at `device_address`.
     void OnWrite(u64 device_address, u32 value) {
+        Note(device_address, value, Event::Written);
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -698,6 +719,15 @@ private:
     std::mutex mutex;
     std::vector<Waiter> waiters;
     std::atomic<size_t> count{};
+
+    struct HistorySlot {
+        std::atomic<u64> address{};
+        std::atomic<u64> ns{};
+        std::atomic<u32> value{};
+        std::atomic<u32> event{};
+    };
+    std::array<HistorySlot, 512> history{};
+    std::atomic<u64> history_head{};
 };
 
 } // namespace Tegra

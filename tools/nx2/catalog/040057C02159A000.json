@@ -1,0 +1,9 @@
+{
+ "title": "040057C02159A000",
+ "game": "",
+ "notes": "",
+ "programs": [
+  {"key": "b874873e2f6e9bc4", "object": "Culling vertex program writing the map's indirect draw records (instance counts) in pass 11", "how": "frame dump buffers: writable storage 0 covers the indirect record ranges of the map draws (vertex a6449c1d190f9b94)", "updated": "2026-11-23T02:13:38Z"},
+  {"key": "a6449c1d190f9b94", "hash": "72eb1924a0cb06b7", "object": "World map terrain/console mesh vertex program (13 draws in the 4K scene pass, fragment programs 9e58b065dc6dabee, 389e435936af6aaa, 65470db7216b754a, 0c83b8b6ce5498e7)", "how": "live reject: the whole map background (flat beige/blue/red triangles) disappears, HUD stays", "updated": "2026-11-23T01:41:41Z"}
+ ]
+}

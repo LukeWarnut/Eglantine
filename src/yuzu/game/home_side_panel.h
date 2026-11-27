@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <QAbstractButton>
 #include <QFrame>
 #include <QIcon>
 
@@ -16,19 +15,30 @@ QIcon Brush(const QColor& color, qreal dpr, int size = 20);
 } // namespace HomeGlyphs
 
 /// Base for the sidebars that slide in beside the home screen. GameList animates the maximum
-/// width between 0 and PanelWidth.
+/// width between 0 and PreferredWidth(), which the user sets by dragging the left edge.
 class HomeSidePanel : public QFrame {
     Q_OBJECT
 
 public:
     static constexpr int PanelWidth = 340;
+    static constexpr int MinPanelWidth = 280;
+    static constexpr int MaxPanelWidth = 800;
 
     explicit HomeSidePanel(QWidget* parent = nullptr);
 
     QSize sizeHint() const override;
 
+    int PreferredWidth() const {
+        return preferred_width;
+    }
+    void SetPreferredWidth(int width);
+
 signals:
     void CloseRequested();
+    /// The left edge is being dragged; PreferredWidth() already holds `width`.
+    void WidthDragged(int width);
+    /// The drag ended at PreferredWidth().
+    void WidthChosen(int width);
 
 protected:
     /// The scrolled widget derived panels build their layout on.
@@ -48,31 +58,18 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     void changeEvent(QEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
 
 private:
+    friend class HomeSidePanelGrip;
+
+    int ClampWidth(int width) const;
+
+    QWidget* grip = nullptr;
+    int preferred_width = PanelWidth;
     QScrollArea* scroll = nullptr;
     QWidget* content = nullptr;
     QWidget* footer = nullptr;
     bool palette_refresh_queued = false;
     bool language_refresh_queued = false;
-};
-
-/// Round accent-coloured button that floats over the home screen.
-class FloatingActionButton : public QAbstractButton {
-    Q_OBJECT
-
-public:
-    static constexpr int Diameter = 52;
-
-    explicit FloatingActionButton(QWidget* parent = nullptr);
-
-    QSize sizeHint() const override;
-
-protected:
-    void paintEvent(QPaintEvent* event) override;
-    void enterEvent(QEnterEvent* event) override;
-    void leaveEvent(QEvent* event) override;
-
-private:
-    bool hovered = false;
 };

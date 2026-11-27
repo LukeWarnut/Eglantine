@@ -4,10 +4,7 @@
 #include <cmath>
 #include <numbers>
 
-#include <QBuffer>
-#include <QCheckBox>
 #include <QDir>
-#include <QFileDialog>
 #include <QFileInfo>
 #include <QGridLayout>
 #include <QHBoxLayout>
@@ -17,7 +14,6 @@
 #include <QLinearGradient>
 #include <QLocale>
 #include <QMenu>
-#include <QMessageBox>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPushButton>
@@ -27,16 +23,15 @@
 
 #include "qt_common/config/uisettings.h"
 #include "qt_common/util/game_art.h"
+#include "yuzu/game/add_on_list.h"
+#include "yuzu/game/game_artwork.h"
 #include "yuzu/game/game_details_panel.h"
 #include "yuzu/game/home_background.h"
-#include "yuzu/util/icon_search.h"
 
 namespace {
 
 constexpr int IconSize = 84;
 constexpr int SideMargin = 16;
-constexpr int HeroMaxWidth = 1280;
-constexpr int StoredIconSize = 256;
 constexpr int OverlayButtonSize = 28;
 /// Height of the action bar buttons. Buttons in the panel body match it so the panel reads as
 /// one set of controls.
@@ -126,37 +121,6 @@ void ClearLayout(QLayout* layout) {
     }
 }
 
-QByteArray EncodeHeroImage(QImage image) {
-    if (image.isNull()) {
-        return {};
-    }
-    image = image.convertToFormat(QImage::Format_RGB888);
-    if (image.width() > HeroMaxWidth) {
-        image = image.scaledToWidth(HeroMaxWidth, Qt::SmoothTransformation);
-    }
-    QByteArray out;
-    QBuffer buffer(&out);
-    buffer.open(QIODevice::WriteOnly);
-    image.save(&buffer, "JPEG", 90);
-    return out;
-}
-
-QByteArray EncodeIconImage(const QImage& image) {
-    if (image.isNull()) {
-        return {};
-    }
-    const int side = std::min(image.width(), image.height());
-    const QImage square =
-        image.copy((image.width() - side) / 2, (image.height() - side) / 2, side, side)
-            .scaled(StoredIconSize, StoredIconSize, Qt::IgnoreAspectRatio,
-                    Qt::SmoothTransformation);
-    QByteArray out;
-    QBuffer buffer(&out);
-    buffer.open(QIODevice::WriteOnly);
-    square.save(&buffer, "PNG");
-    return out;
-}
-
 /// Lays chips out left to right and wraps them onto further lines when they don't fit.
 class FlowLayout : public QLayout {
 public:
@@ -231,56 +195,14 @@ private:
 };
 
 /// Check box that elides its label to the width it gets instead of demanding the full width.
-class ElidedCheckBox : public QCheckBox {
-public:
-    ElidedCheckBox(const QString& text, QWidget* parent) : QCheckBox{parent}, full_text{text} {
-        // QCheckBox never shrinks below its full label by default.
-        setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
-        setToolTip(text);
-        setText(text);
-    }
-
-    QSize sizeHint() const override {
-        return {fontMetrics().horizontalAdvance(full_text) + LabelOffset(),
-                QCheckBox::sizeHint().height()};
-    }
-    QSize minimumSizeHint() const override {
-        return {LabelOffset() + fontMetrics().horizontalAdvance(QStringLiteral("M...")),
-                QCheckBox::minimumSizeHint().height()};
-    }
-
-protected:
-    void resizeEvent(QResizeEvent* event) override {
-        QCheckBox::resizeEvent(event);
-        setText(fontMetrics().elidedText(full_text, Qt::ElideRight,
-                                         std::max(0, width() - LabelOffset())));
-    }
-
-private:
-    int LabelOffset() const {
-        return style()->pixelMetric(QStyle::PM_IndicatorWidth, nullptr, this) +
-               style()->pixelMetric(QStyle::PM_CheckBoxLabelSpacing, nullptr, this) + 4;
-    }
-
-    QString full_text;
-};
-
-/// Icon-only button that paints its pill and glyph itself. A styled QToolButton has its frame
+/// Icon-only button over the artwork that paints its pill and glyph itself. A styled QToolButton has its frame
 /// and icon laid out by the platform style, which draws the surface smaller than the widget and
 /// scales the glyph down to fit: at 28 px the icon came out at roughly half its size, which read
 /// as broken artwork buttons. Painting both keeps the geometry exact on every style and theme,
 /// and lets the panel own the surface instead of a translucent scrim over the artwork.
 class IconButton : public QToolButton {
 public:
-    enum class Kind {
-        /// Sits on the banner and the game icon.
-        Overlay,
-        /// Secondary control in the action bar.
-        Outline,
-    };
-
-    IconButton(Kind kind_, int size, int icon_size, QWidget* parent)
-        : QToolButton{parent}, kind{kind_} {
+    IconButton(int size, int icon_size, QWidget* parent) : QToolButton{parent} {
         setFixedSize(size, size);
         setIconSize(QSize(icon_size, icon_size));
         setCursor(Qt::PointingHandCursor);
@@ -301,21 +223,14 @@ protected:
         const bool pressed = isDown();
 
         QColor fill;
-        QColor border;
-        if (kind == Kind::Overlay) {
-            if (pressed) {
-                fill = WithAlpha(Emphasized(surface, 115), 245);
-            } else if (hovered) {
-                fill = WithAlpha(Emphasized(surface, 135), 245);
-            } else {
-                fill = WithAlpha(surface, 235);
-            }
-            border = WithAlpha(text, hovered ? 110 : 55);
+        if (pressed) {
+            fill = WithAlpha(Emphasized(surface, 115), 245);
+        } else if (hovered) {
+            fill = WithAlpha(Emphasized(surface, 135), 245);
         } else {
-            fill = pressed ? WithAlpha(text, 45)
-                           : (hovered ? WithAlpha(text, 25) : QColor(Qt::transparent));
-            border = WithAlpha(text, 60);
+            fill = WithAlpha(surface, 235);
         }
+        const QColor border = WithAlpha(text, hovered ? 110 : 55);
 
         const QRectF box = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
         p.setPen(Qt::NoPen);
@@ -342,48 +257,11 @@ protected:
         update();
         QToolButton::leaveEvent(event);
     }
-
-private:
-    Kind kind;
 };
 
 IconButton* MakeOverlayButton(QWidget* parent) {
     // At 16 px the brush's handle and bristles collapse into one diagonal stroke.
-    return new IconButton(IconButton::Kind::Overlay, OverlayButtonSize, 20, parent);
-}
-
-/// Secondary button in the panel body. Outlined like the action bar's tool buttons and derived
-/// from the palette, so every control on the panel reads as one family and stays legible on
-/// light and dark themes alike. The height is stated in the style sheet as well because QSS,
-/// not the widget, decides the size of a styled button.
-QString BodyButtonStyle(const QPalette& pal) {
-    const QColor text = pal.color(QPalette::ButtonText);
-    const QColor accent = pal.color(QPalette::Highlight);
-    return QStringLiteral(
-        "QPushButton { border: 1px solid %1; border-radius: 8px; padding: 0 12px; "
-        "min-height: %2px; max-height: %2px; background: transparent; "
-        "color: %3; } "
-        "QPushButton:hover { background: %4; border-color: %5; } "
-        "QPushButton:pressed { background: %6; } "
-        "QPushButton:disabled { border-color: %7; color: %8; }")
-        // The 1 px border is part of the box, so the content height is the bar height minus it.
-        .arg(Rgba(WithAlpha(text, 60)), QString::number(ActionButtonHeight - 2),
-             Rgba(text), Rgba(WithAlpha(accent, 45)), Rgba(WithAlpha(accent, 120)),
-             Rgba(WithAlpha(accent, 75)), Rgba(WithAlpha(text, 35)), Rgba(WithAlpha(text, 90)));
-}
-
-/// Collapsible section header. A full-width row with a faint surface of its own: it says
-/// "click me to unfold" instead of looking like the plain headings around it.
-QString SectionToggleStyle(const QPalette& pal) {
-    const QColor text = pal.color(QPalette::ButtonText);
-    return QStringLiteral(
-        "QToolButton { border: 1px solid transparent; border-radius: 8px; padding: 0 8px; "
-        "min-height: %1px; max-height: %1px; background: %2; text-align: left; color: %3; } "
-        "QToolButton:hover { background: %4; border-color: %5; } "
-        "QToolButton:pressed { background: %6; }")
-        .arg(QString::number(ActionButtonHeight - 2), Rgba(WithAlpha(text, 14)), Rgba(text),
-             Rgba(WithAlpha(text, 28)), Rgba(WithAlpha(text, 55)),
-             Rgba(WithAlpha(text, 20)));
+    return new IconButton(OverlayButtonSize, 20, parent);
 }
 
 } // namespace
@@ -658,11 +536,12 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     // Updates and DLC
     add_ons_heading = MakeHeading(scroll_content);
     body->addWidget(add_ons_heading);
-    add_ons_box = new QWidget(scroll_content);
-    add_ons_layout = new QVBoxLayout(add_ons_box);
-    add_ons_layout->setContentsMargins(0, 0, 0, 0);
-    add_ons_layout->setSpacing(4);
-    body->addWidget(add_ons_box);
+    add_on_list = new AddOnList(scroll_content);
+    connect(add_on_list, &AddOnList::DisabledChanged, this, [this](const QStringList& disabled) {
+        extras.add_ons = add_on_list->AddOns();
+        emit DisabledAddOnsChanged(disabled);
+    });
+    body->addWidget(add_on_list);
     body->addSpacing(10);
 
     // Shaders
@@ -726,17 +605,17 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     actions->setContentsMargins(SideMargin, 10, SideMargin, 12);
     actions->setSpacing(8);
     play_button = new QPushButton(action_bar);
-    play_button->setFixedHeight(ActionButtonHeight);
-    play_button->setIconSize(QSize(18, 18));
+    play_button->setMinimumHeight(ActionButtonHeight);
+    play_button->setDefault(true);
     play_button->setCursor(Qt::PointingHandCursor);
-    QFont play_font = play_button->font();
-    play_font.setBold(true);
-    play_button->setFont(play_font);
     connect(play_button, &QPushButton::clicked, this, &GameDetailsPanel::PlayRequested);
     actions->addWidget(play_button, 1);
 
     const auto make_action = [&] {
-        auto* button = new IconButton(IconButton::Kind::Outline, ActionButtonHeight, 18, action_bar);
+        auto* button = new QToolButton(action_bar);
+        button->setIconSize(QSize(18, 18));
+        button->setMinimumSize(ActionButtonHeight, ActionButtonHeight);
+        button->setCursor(Qt::PointingHandCursor);
         actions->addWidget(button);
         return button;
     };
@@ -751,37 +630,26 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     SetFooter(action_bar);
 
     // Artwork menus on the header's edit buttons
+    artwork = new GameArtwork(this);
+    connect(artwork, &GameArtwork::BusyChanged, header, &GameDetailsHeader::SetBusy);
+    connect(artwork, &GameArtwork::IconChanged, this, &GameDetailsPanel::IconChanged);
+    connect(artwork, &GameArtwork::HeroChanged, this, [this](u64 program_id) {
+        hero_cache.remove(program_id);
+        if (program_id == game.program_id) {
+            ReloadHero();
+        }
+        emit HeroChanged(program_id);
+    });
     banner_menu = new QMenu(this);
     icon_menu = new QMenu(this);
     for (QMenu* menu : {banner_menu, icon_menu}) {
         const bool hero = menu == banner_menu;
-        menu->setToolTipsVisible(true);
         connect(menu, &QMenu::aboutToShow, this, [this, menu, hero] {
-            menu->clear();
-            QAction* find = menu->addAction(tr("Find on SteamGridDB..."));
-            if (UISettings::values.steamgriddb_api_key.GetValue().empty()) {
-                find->setToolTip(tr("Needs a free SteamGridDB API key. You will be asked for it, "
-                                    "or set it in Settings > General > Web."));
-            }
-            connect(find, &QAction::triggered, this, [this, hero] { FindArt(hero); });
-            connect(menu->addAction(tr("Choose File...")), &QAction::triggered, this,
-                    [this, hero] { ChooseArtFile(hero); });
-            const QString path = hero ? QtCommon::GameArt::HeroPath(game.program_id)
-                                      : QtCommon::GameArt::IconPath(game.program_id);
-            QAction* reset = menu->addAction(hero ? tr("Remove Banner") : tr("Reset Icon"));
-            reset->setEnabled(QFileInfo::exists(path));
-            connect(reset, &QAction::triggered, this, [this, hero] { ResetArt(hero); });
+            artwork->FillMenu(menu, hero, game.program_id, game.title);
         });
     }
     header->BannerEditButton()->setMenu(banner_menu);
     header->IconEditButton()->setMenu(icon_menu);
-
-    icon_search = new IconSearch(this);
-    connect(icon_search, &IconSearch::RunningChanged, header, &GameDetailsHeader::SetBusy);
-    connect(icon_search, &IconSearch::IconSelected, this,
-            [this](const QByteArray& png, const QString&) { SaveIcon(search_program_id, png); });
-    connect(icon_search, &IconSearch::HeroSelected, this,
-            [this](const QByteArray& image) { SaveHero(search_program_id, image); });
 
     RetranslateUI();
     RefreshGlyphs();
@@ -798,7 +666,7 @@ void GameDetailsPanel::SetGame(const GameDetailsInfo& info) {
     const bool has_id = game.program_id != 0;
     header->SetEditable(has_id);
     add_ons_heading->setVisible(has_id);
-    add_ons_box->setVisible(has_id);
+    add_on_list->setVisible(has_id);
     shaders_heading->setVisible(has_id);
     shaders_box->setVisible(has_id);
 
@@ -845,7 +713,7 @@ QImage GameDetailsPanel::LoadHero(u64 program_id) {
         // Decode at the size the banner is shown at, not the stored size.
         QImageReader reader(path);
         const QSize full = reader.size();
-        const int target = static_cast<int>(PanelWidth * devicePixelRatioF() * 1.25);
+        const int target = static_cast<int>(MaxPanelWidth * devicePixelRatioF());
         if (full.isValid() && full.width() > target) {
             reader.setScaledSize(QSize(target, full.height() * target / full.width()));
         }
@@ -924,74 +792,7 @@ void GameDetailsPanel::RefreshInfo() {
 }
 
 void GameDetailsPanel::RefreshAddOns() {
-    ClearLayout(add_ons_layout);
-    add_on_checks.clear();
-
-    const auto add_note = [&](const QString& text) {
-        auto* note = new QLabel(text, add_ons_box);
-        note->setWordWrap(true);
-        SetMuted(note);
-        add_ons_layout->addWidget(note);
-    };
-    if (!extras_loaded) {
-        add_note(tr("Loading..."));
-        return;
-    }
-    if (extras.add_ons.empty()) {
-        add_note(tr("No updates, DLC or mods installed."));
-        return;
-    }
-
-    for (size_t i = 0; i < extras.add_ons.size(); ++i) {
-        const GameAddOn& add_on = extras.add_ons[i];
-        auto* row = new QWidget(add_ons_box);
-        auto* row_layout = new QHBoxLayout(row);
-        row_layout->setContentsMargins(0, 0, 0, 0);
-        row_layout->setSpacing(8);
-
-        auto* version = new QLabel(row);
-        version->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        version->setText(version->fontMetrics().elidedText(add_on.version, Qt::ElideRight,
-                                                           (PanelWidth - 2 * SideMargin) * 2 / 5));
-        version->setToolTip(add_on.version);
-        SetMuted(version);
-
-        auto* check = new ElidedCheckBox(add_on.name, row);
-        check->setChecked(add_on.enabled);
-        check->setCursor(Qt::PointingHandCursor);
-        connect(check, &QCheckBox::toggled, this,
-                [this, i](bool enabled) { OnAddOnToggled(i, enabled); });
-        add_on_checks.push_back(check);
-
-        row_layout->addWidget(check, 1);
-        row_layout->addWidget(version);
-        add_ons_layout->addWidget(row);
-    }
-}
-
-void GameDetailsPanel::OnAddOnToggled(size_t index, bool enabled) {
-    if (index >= extras.add_ons.size()) {
-        return;
-    }
-    extras.add_ons[index].enabled = enabled;
-    // Only one update can be active at a time.
-    if (enabled && extras.add_ons[index].is_update) {
-        for (size_t i = 0; i < extras.add_ons.size(); ++i) {
-            if (i != index && extras.add_ons[i].is_update && extras.add_ons[i].enabled) {
-                extras.add_ons[i].enabled = false;
-                const QSignalBlocker blocker(add_on_checks[i]);
-                add_on_checks[i]->setChecked(false);
-            }
-        }
-    }
-
-    QStringList disabled;
-    for (const GameAddOn& add_on : extras.add_ons) {
-        if (!add_on.enabled) {
-            disabled << add_on.key;
-        }
-    }
-    emit DisabledAddOnsChanged(disabled);
+    add_on_list->SetAddOns(extras.add_ons, extras_loaded);
 }
 
 void GameDetailsPanel::RefreshShaders() {
@@ -1010,86 +811,13 @@ void GameDetailsPanel::RefreshShaders() {
                                                           : tr("Pre-compile Shaders"));
 }
 
-void GameDetailsPanel::FindArt(bool hero) {
-    if (icon_search->IsRunning()) {
-        return;
-    }
-    searching_hero = hero;
-    search_program_id = game.program_id;
-    icon_search->StartSteamGridDb(game.title, game.program_id,
-                                  hero ? SgdbArtKind::Hero : SgdbArtKind::Icon);
-}
-
-void GameDetailsPanel::ChooseArtFile(bool hero) {
-    const QString path =
-        QFileDialog::getOpenFileName(this, hero ? tr("Choose Banner") : tr("Choose Icon"), {},
-                                     tr("Images (*.png *.jpg *.jpeg *.webp *.bmp)"));
-    if (path.isEmpty()) {
-        return;
-    }
-    const QImage image(path);
-    if (image.isNull()) {
-        QMessageBox::warning(
-            this, tr("Artwork"),
-            tr("\"%1\" could not be loaded as an image.").arg(QFileInfo(path).fileName()));
-        return;
-    }
-    if (hero) {
-        SaveHero(game.program_id, EncodeHeroImage(image));
-    } else {
-        SaveIcon(game.program_id, EncodeIconImage(image));
-    }
-}
-
-void GameDetailsPanel::ResetArt(bool hero) {
-    if (hero) {
-        QtCommon::GameArt::RemoveHero(game.program_id);
-        hero_cache.remove(game.program_id);
-        ReloadHero();
-        emit HeroChanged(game.program_id);
-    } else {
-        QtCommon::GameArt::RemoveIcon(game.program_id);
-        emit IconChanged(game.program_id);
-    }
-}
-
-void GameDetailsPanel::SaveHero(u64 program_id, const QByteArray& image) {
-    if (!QtCommon::GameArt::SaveHero(program_id, image)) {
-        QMessageBox::warning(this, tr("Artwork"), tr("The banner could not be saved."));
-        return;
-    }
-    hero_cache.remove(program_id);
-    if (program_id == game.program_id) {
-        ReloadHero();
-    }
-    emit HeroChanged(program_id);
-}
-
-void GameDetailsPanel::SaveIcon(u64 program_id, const QByteArray& png) {
-    if (!QtCommon::GameArt::SaveIcon(program_id, png)) {
-        QMessageBox::warning(this, tr("Artwork"), tr("The icon could not be saved."));
-        return;
-    }
-    emit IconChanged(program_id);
-}
-
 void GameDetailsPanel::RefreshGlyphs() {
     const QPalette& pal = palette();
     const qreal dpr = devicePixelRatioF();
     const QColor text = pal.color(QPalette::ButtonText);
     const QColor accent = pal.color(QPalette::Highlight);
 
-    // The style sheet, not the widget, decides the height of a styled button, so the action bar
-    // height has to be stated here as well or Play shrinks to its text.
-    play_button->setIcon(MakeGlyph(Glyph::Play, pal.color(QPalette::HighlightedText), dpr));
-    play_button->setStyleSheet(
-        QStringLiteral("QPushButton { border: none; border-radius: 8px; padding: 0 14px; "
-                       "min-height: %1px; max-height: %1px; background: palette(highlight); "
-                       "color: palette(highlighted-text); } "
-                       "QPushButton:hover { background: %2; } "
-                       "QPushButton:pressed { background: %3; }")
-            .arg(QString::number(ActionButtonHeight), Rgba(accent.lighter(112)),
-                 Rgba(accent.darker(112))));
+    play_button->setIcon(style()->standardIcon(QStyle::SP_MediaPlay, nullptr, play_button));
 
     configure_button->setIcon(MakeGlyph(Glyph::Configure, text, dpr));
     favorite_button->setIcon(game.favorite ? MakeGlyph(Glyph::StarFilled, accent, dpr)
@@ -1099,11 +827,6 @@ void GameDetailsPanel::RefreshGlyphs() {
     for (QLabel* key : {pipeline_cache_key, precompiled_key}) {
         SetMuted(key);
     }
-
-    // Like the action bar, the styles are palette-derived and re-applied here so a theme switch
-    // repaints them instead of leaving colours from the previous palette behind.
-    precompile_button->setStyleSheet(BodyButtonStyle(pal));
-    technical_toggle->setStyleSheet(SectionToggleStyle(pal));
 }
 
 void GameDetailsPanel::RetranslateUI() {

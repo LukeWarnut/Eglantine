@@ -136,7 +136,30 @@ std::optional<Common::Net::Release> SelectUpdate(std::span<const Common::Net::Re
     return std::nullopt;
 }
 
-CheckResult Check(Channel channel) {
+std::string DownloadPlatform(Settings::UpdateVariant variant, std::string_view build_platform) {
+    if (build_platform.empty() || variant == Settings::UpdateVariant::Auto) {
+        return std::string{build_platform};
+    }
+    if (build_platform.ends_with("-pgo")) {
+        build_platform.remove_suffix(4);
+    }
+    std::string platform{build_platform};
+    if (variant == Settings::UpdateVariant::Pgo) {
+        platform += "-pgo";
+    }
+    return platform;
+}
+
+Channel ChannelOfSetting(Settings::UpdateChannel setting) {
+    return setting == Settings::UpdateChannel::Daily ? Channel::Daily : Channel::ReleaseCandidate;
+}
+
+Settings::UpdateVariant ThisBuildVariant(std::string_view build_platform) {
+    return build_platform.ends_with("-pgo") ? Settings::UpdateVariant::Pgo
+                                            : Settings::UpdateVariant::Standard;
+}
+
+CheckResult Check(Channel channel, std::string_view platform) {
     const auto current_tag = BuildTag();
     if (current_tag.empty()) {
         return {.failure = Failure::NotReleaseBuild};
@@ -161,7 +184,7 @@ CheckResult Check(Channel channel) {
             LOG_WARNING(Frontend, "Update check failed with status {}", result.status);
             return {.failure = ClassifyFailure(result.status), .status = result.status};
         }
-        if (result.release && HasAsset(*result.release, Common::g_build_release_platform,
+        if (result.release && HasAsset(*result.release, platform,
                                        Common::Net::CurrentLinuxPackage())) {
             LOG_INFO(Frontend, "Received update {}", result.release->title);
             return {.update = result.release};

@@ -177,6 +177,10 @@ void GameListSearchField::clear() {
     edit_filter->clear();
 }
 
+void GameListSearchField::AddTrailingWidget(QWidget* widget) {
+    layout_filter->insertWidget(layout_filter->indexOf(button_filter_close), widget);
+}
+
 void GameListSearchField::setFocus() {
     if (edit_filter->isVisible()) {
         edit_filter->setFocus();

@@ -51,7 +51,7 @@ constexpr auto VK_CACHE_MAGIC = VideoCommon::NVN_DRIVER_CACHE_MAGIC;
 constexpr size_t MAX_CACHE_FILES = 6;
 /// Shader sets of the disk cache whose library parts are compiled in the background after the
 /// preload (GPL path): the newest ones, so a long-lived cache file cannot queue minutes of work.
-constexpr size_t MAX_WARMED_SHADER_SETS = 256;
+constexpr size_t MAX_WARMED_SHADER_SETS = 1024;
 constexpr const char* VK_CACHE_FILE_NAME = VideoCommon::NVN_DRIVER_CACHE_FILE_NAME.data();
 
 /// Graphics stages in pipeline order as NVNshaderStage indices (task, mesh, VS, TCS, TES, GS,

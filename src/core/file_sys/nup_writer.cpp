@@ -28,6 +28,7 @@
 
 #include "common/fs/file.h"
 #include "common/fs/path_util.h"
+#include "core/file_sys/common_funcs.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/vfs/vfs_real.h"
@@ -55,6 +56,7 @@ constexpr u8 KindBase = 0;
 constexpr u8 KindUpdate = 1;
 constexpr u8 KindAddon = 2;
 constexpr u8 FlagStandaloneUpdate = 0x01;
+constexpr u8 FlagLaunchProgram = 0x04;
 constexpr u8 CodecRaw = 0;
 constexpr u8 CodecZstd = 1;
 
@@ -557,28 +559,40 @@ public:
         if (!base.empty() && HasContent(base)) {
             base_title_id = AddPackage(KindBase, base, 0, {});
         } else if (updates.empty() && HasContent(dump_root)) {
-            base_title_id = AddPackage(KindBase, dump_root, 0, {"base", "updates", "dlc"});
+            base_title_id =
+                AddPackage(KindBase, dump_root, 0, {"base", "updates", "dlc", "programs"});
         }
 
-        std::vector<std::pair<u64, fs::path>> versions;
         std::error_code ec;
-        if (!updates.empty()) {
-            for (const auto& entry : fs::directory_iterator(updates, ec)) {
-                const auto version = ParseDecimal(ToUtf8(entry.path().filename()));
-                if (version && entry.is_directory(ec) && HasContent(entry.path())) {
-                    if (*version > std::numeric_limits<u32>::max()) {
+        const u8 update_flags = base_title_id ? 0 : FlagStandaloneUpdate;
+        AddUpdates(updates, update_flags, base_title_id.value_or(0));
+
+        // Further programs of a multi-program application (SPEC §3.1.3):
+        // programs/<program ID>/ holds that program's exefs/romfs and its updates/<version>/.
+        // base/ stays the program that starts.
+        const auto programs = FindDirectory(dump_root, "programs");
+        if (!programs.empty() && base_title_id) {
+            std::vector<std::pair<u64, fs::path>> extra;
+            for (const auto& entry : fs::directory_iterator(programs, ec)) {
+                const auto id = ParseTitleId(ToUtf8(entry.path().filename()));
+                if (id && entry.is_directory(ec) && HasContent(entry.path())) {
+                    if (GetBaseTitleID(*id) != GetBaseTitleID(*base_title_id) ||
+                        *id == *base_title_id) {
                         throw PackError(PackResult::InvalidSource,
-                                        "update version out of range: " + ToUtf8(entry.path()));
+                                        "program is not another program of the application: " +
+                                            ToUtf8(entry.path()));
                     }
-                    versions.emplace_back(*version, entry.path());
+                    extra.emplace_back(*id, entry.path());
                 }
             }
-        }
-        std::ranges::sort(versions);
-        const u8 update_flags = base_title_id ? 0 : FlagStandaloneUpdate;
-        for (const auto& [version, path] : versions) {
-            AddPackage(KindUpdate, path, static_cast<u32>(version), {}, update_flags,
-                       base_title_id.value_or(0));
+            std::ranges::sort(extra);
+            if (!extra.empty()) {
+                plan.packages[0].flags |= FlagLaunchProgram;
+            }
+            for (const auto& [id, path] : extra) {
+                AddPackage(KindBase, path, 0, {"updates"}, 0, id);
+                AddUpdates(FindDirectory(path, "updates"), 0, id);
+            }
         }
 
         if (!dlc.empty()) {
@@ -597,7 +611,12 @@ public:
             }
             std::ranges::sort(addons);
             for (const auto& [name, path] : addons) {
-                AddPackage(KindAddon, path, 0, {}, 0, *ParseTitleId(name.substr(0, 16)));
+                const auto version = ParseDecimal(ToUtf8(path.filename())).value_or(0);
+                if (version > std::numeric_limits<u32>::max()) {
+                    throw PackError(PackResult::InvalidSource, "add-on content version exceeds u32");
+                }
+                AddPackage(KindAddon, path, static_cast<u32>(version), {}, 0,
+                           *ParseTitleId(name.substr(0, 16)));
             }
         }
 
@@ -614,6 +633,29 @@ public:
     }
 
 private:
+    // Adds updates/<version>/ folders as update packages, oldest first.
+    void AddUpdates(const fs::path& updates, u8 flags, u64 title_id) {
+        if (updates.empty()) {
+            return;
+        }
+        std::vector<std::pair<u64, fs::path>> versions;
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(updates, ec)) {
+            const auto version = ParseDecimal(ToUtf8(entry.path().filename()));
+            if (version && entry.is_directory(ec) && HasContent(entry.path())) {
+                if (*version > std::numeric_limits<u32>::max()) {
+                    throw PackError(PackResult::InvalidSource,
+                                    "update version out of range: " + ToUtf8(entry.path()));
+                }
+                versions.emplace_back(*version, entry.path());
+            }
+        }
+        std::ranges::sort(versions);
+        for (const auto& [version, path] : versions) {
+            AddPackage(KindUpdate, path, static_cast<u32>(version), {}, flags, title_id);
+        }
+    }
+
     static bool HasContent(const fs::path& dir) {
         return DirHasFiles(FindDirectory(dir, "exefs")) ||
                DirHasFiles(FindDirectory(dir, "romfs"));
@@ -1785,23 +1827,31 @@ ExtractResult ExtractNup(const std::filesystem::path& archive, const std::filesy
 
         const bool bare =
             packages.size() == 1 && packages[0].kind == FileSys::NupContainer::PackageKind::Base;
+        // Programs other than the one that starts go to programs/<program ID>/ (SPEC §3.1.3).
+        const bool multi_program = nup.GetProgramIds().size() > 1;
+        const auto launch = nup.FindLaunchProgram();
+        const auto program_dir = [&](u64 title_id) {
+            return multi_program && title_id != launch
+                       ? out_dir / "programs" / fmt::format("{:016X}", title_id)
+                       : out_dir;
+        };
 
         PackProgress progress{};
         std::vector<std::pair<size_t, fs::path>> targets;
-        std::unordered_map<u64, size_t> addon_index;
         for (size_t i = 0; i < packages.size(); ++i) {
             const auto& package = packages[i];
             fs::path dest;
             if (bare) {
                 dest = out_dir;
             } else if (package.kind == FileSys::NupContainer::PackageKind::Base) {
-                dest = out_dir / "base";
+                const auto root = program_dir(package.title_id);
+                dest = root == out_dir ? out_dir / "base" : root;
             } else if (package.kind == FileSys::NupContainer::PackageKind::Update) {
-                dest = out_dir / "updates" / std::to_string(package.version);
+                dest = program_dir(package.title_id) / "updates" / std::to_string(package.version);
             } else {
-                const size_t idx = addon_index[package.title_id]++;
+                // Named by version, which packing reads back from the folder name.
                 dest = out_dir / "dlc" / fmt::format("{:016X}", package.title_id) /
-                       std::to_string(idx);
+                       std::to_string(package.version);
             }
             targets.emplace_back(i, dest);
             u64 files = 0, bytes = 0;

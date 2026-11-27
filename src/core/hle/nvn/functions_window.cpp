@@ -656,7 +656,17 @@ void WaitPresentDepth(Call& c, u64 seq) {
                 // Compatibility with the candidate switch; the new name wins when both are set.
                 value = std::getenv("EDEN_NX2_TRY_MAX_FRAMES_IN_FLIGHT");
             }
-            if (const auto n = ParseMaxFramesInFlight(value)) {
+            const Kernel::KProcess* const process =
+                c.system ? c.system->ApplicationProcess() : nullptr;
+            const bool is_mkw =
+                process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId;
+            if (value == nullptr && is_mkw) {
+                c.runtime.present_depth.emplace(2);
+                LOG_INFO(Core,
+                         "[nvn] MAX_FRAMES_IN_FLIGHT: a present waits until at most 2 "
+                         "earlier present(s) are unfinished on the GPU "
+                         "(source: Mario Kart World default)");
+            } else if (const auto n = ParseMaxFramesInFlight(value)) {
                 c.runtime.present_depth.emplace(*n);
                 LOG_INFO(Core, "[nvn] MAX_FRAMES_IN_FLIGHT: a present waits until at most {} "
                                "earlier present(s) are unfinished on the GPU (source: {})",

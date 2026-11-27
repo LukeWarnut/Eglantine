@@ -33,6 +33,23 @@ constexpr u64 BASE_TITLE_ID_MASK = 0xFFFFFFFFFFFFE000;
 }
 
 /**
+ * Gets the Switch 1 application ID that a Switch 2 title ID belongs with (the platform byte
+ * 0x04 becomes 0x01, as for Switch 2 Editions). Other title IDs are returned unchanged.
+ *
+ * @param title_id The title ID.
+ * @returns The Switch 1 application ID.
+ */
+[[nodiscard]] constexpr u64 GetSwitch1ApplicationID(u64 title_id) {
+    constexpr u64 platform_mask = 0xFF00000000000000;
+    constexpr u64 switch2_platform = 0x0400000000000000;
+    constexpr u64 switch1_platform = 0x0100000000000000;
+    if ((title_id & platform_mask) != switch2_platform) {
+        return title_id;
+    }
+    return (title_id & ~platform_mask) | switch1_platform;
+}
+
+/**
  * Gets the AOC (Add-On Content) base title ID from a given title ID.
  *
  * @param title_id The title ID.

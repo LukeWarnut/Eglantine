@@ -88,7 +88,8 @@ AppLoader_NCA::LoadResult AppLoader_NCA::Load(Kernel::KProcess& process, Core::S
         }
     }
 
-    directory_loader = std::make_unique<AppLoader_DeconstructedRomDirectory>(exefs, true);
+    directory_loader = std::make_unique<AppLoader_DeconstructedRomDirectory>(
+            exefs, AppLoader_DeconstructedRomDirectory::ExeFSPatching::UpdatesAndMods);
 
     // Read heap size from main.npdm in ExeFS
     u64 heap_size = 0;

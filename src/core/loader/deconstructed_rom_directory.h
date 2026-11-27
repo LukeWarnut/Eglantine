@@ -30,9 +30,13 @@ namespace Loader {
  */
 class AppLoader_DeconstructedRomDirectory final : public AppLoader {
 public:
-    explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile main_file, bool override_update_ = false);
+    enum class ExeFSPatching { None, ModsOnly, UpdatesAndMods };
+
+    explicit AppLoader_DeconstructedRomDirectory(
+        FileSys::VirtualFile main_file, ExeFSPatching patching_ = ExeFSPatching::None);
     // Overload to accept exefs directory. Must contain 'main' and 'main.npdm'
-    explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualDir directory, bool override_update_ = false);
+    explicit AppLoader_DeconstructedRomDirectory(
+        FileSys::VirtualDir directory, ExeFSPatching patching_ = ExeFSPatching::None);
 
     /**
      * Identifies whether or not the given file is a deconstructed ROM directory.
@@ -75,7 +79,7 @@ private:
     std::optional<FileSys::NACP> control; ///< control.nacp next to the dump, if it has one
     std::string romfs_version;            ///< "1.8.0" from the RomFS's Product.180 tables, if any
     u64 title_id{};
-    bool override_update;
+    ExeFSPatching patching;
 
     Modules modules;
 };

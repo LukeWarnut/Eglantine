@@ -23,6 +23,7 @@ struct State {
     std::unordered_map<u64, CaptureResult> finished;
     std::deque<GpuReadRequest> gpu_reads;
     std::unordered_map<u64, GpuReadResult> gpu_read_results;
+    std::deque<AstcFusionRequest> astc_fusion;
     std::vector<u64> rejected;
     u64 reject_generation{};
     u64 applied_generation{};
@@ -37,7 +38,8 @@ std::atomic<bool> any_rejected{};
 std::atomic<u64> unreject_epoch{};
 
 void UpdatePending() {
-    pending.store(!state.captures.empty() || !state.gpu_reads.empty() || state.reject_pending,
+    pending.store(!state.captures.empty() || !state.gpu_reads.empty() || state.reject_pending ||
+                      !state.astc_fusion.empty(),
                   std::memory_order_relaxed);
 }
 
@@ -49,6 +51,7 @@ void BeginSession() {
     state.finished.clear();
     state.gpu_reads.clear();
     state.gpu_read_results.clear();
+    state.astc_fusion.clear();
     state.rejected.clear();
     state.reject_pending = false;
     state.unrejected = false;
@@ -64,6 +67,7 @@ void EndSession() {
         state.open = false;
         state.captures.clear();
         state.gpu_reads.clear();
+        state.astc_fusion.clear();
         UpdatePending();
     }
     state.changed.notify_all();
@@ -71,6 +75,28 @@ void EndSession() {
 
 bool HasRequests() noexcept {
     return pending.load(std::memory_order_relaxed);
+}
+
+std::future<AstcFusionResult> RequestAstcFusion(std::optional<bool> enable) {
+    std::scoped_lock lock{state.mutex};
+    AstcFusionRequest request{enable, {}};
+    auto result = request.result.get_future();
+    if (state.open) {
+        state.astc_fusion.push_back(std::move(request));
+        UpdatePending();
+    }
+    return result;
+}
+
+std::optional<AstcFusionRequest> TakeAstcFusion() {
+    std::scoped_lock lock{state.mutex};
+    if (state.astc_fusion.empty()) {
+        return std::nullopt;
+    }
+    auto request = std::move(state.astc_fusion.front());
+    state.astc_fusion.pop_front();
+    UpdatePending();
+    return request;
 }
 
 void RequestCapture(CaptureRequest request) {

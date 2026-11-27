@@ -67,6 +67,11 @@ public:
 
     void Finish();
 
+    [[nodiscard]] bool CanFuseAstc(const Image& image) const;
+    [[nodiscard]] bool SupportsAstcFusion() const;
+    [[nodiscard]] bool AstcFusionEnabled() const;
+    void SetAstcFusion(bool enable);
+
     StagingBufferRef UploadStagingBuffer(size_t size, bool deferred = false);
 
     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
@@ -274,11 +279,19 @@ public:
 
     std::optional<ASTCDecoderPass> astc_decoder_pass;
     std::optional<BcEncoderPass> bc_encoder_pass;
+    std::optional<AstcBcPass> astc_bc_pass;
+    bool astc_fusion_enabled{};
 
     /// ASTC decoded on the GPU and re-compressed to BC1/BC3 there (accelerate_astc=Gpu with
     /// astc_recompression=Bc1/Bc3): decode into a temporary RGBA8 image, encode, copy.
     void TranscodeAstcToBcn(Image& image, const StagingBufferRef& map,
                             std::span<const VideoCommon::SwizzleParameters> swizzles);
+
+    /// The same transcode without the intermediate: astc_bc.comp decodes and encodes in one
+    /// dispatch, writing the BC blocks straight into a buffer (EDEN_NX2_ASTC_FUSED=0 keeps the
+    /// two-pass path, for A/B).
+    void TranscodeAstcToBcnFused(Image& image, const StagingBufferRef& map,
+                                 std::span<const VideoCommon::SwizzleParameters> swizzles);
 
     /// Temporary decode images, reusable once the GPU is past `tick`.
     struct PendingTranscode {
@@ -490,6 +503,8 @@ public:
     [[nodiscard]] VkImage Handle() const noexcept {
         return *(this->*current_image);
     }
+
+    [[nodiscard]] VkFormat HostFormat() const;
 
     [[nodiscard]] VkImageAspectFlags AspectMask() const noexcept {
         return aspect_mask;

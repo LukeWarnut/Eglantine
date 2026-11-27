@@ -197,6 +197,7 @@ jobs:
         env:
           WEBHOOK: ${{ secrets.DISCORD_FORUM_WEBHOOK_URL }}
           BRANCH: ${{ inputs.branch }}
+          PREV_TAG: ${{ inputs.prev_tag }}
         run: |
           set -euo pipefail
           if [ -z "$WEBHOOK" ]; then
@@ -219,9 +220,29 @@ jobs:
           fi
 
           release_url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          donate_url="https://opencollective.com/eglantine-community"
           thread_name="${TITLE} (${SHA::7})"
-          content=$(printf 'Automatic daily build of `%s` at `%s`.\n\nFull notes and downloads: %s' \
-            "$BRANCH" "${SHA::7}" "$release_url")
+
+          # Same commit range as the release notes, kept short enough for a Discord message.
+          if [ -n "${PREV_TAG:-}" ]; then
+            changes=$(git log --no-merges --pretty='- %s (`%h`)' "$PREV_TAG..$SHA" 2>/dev/null || true)
+          else
+            changes=$(git log --no-merges --pretty='- %s (`%h`)' -n 30 "$SHA" 2>/dev/null || true)
+          fi
+          [ -n "$changes" ] || changes='- No commits found.'
+          header=$(printf 'Automatic daily build of `%s` at `%s`.\n\n**Changes since the previous daily build**\n' \
+            "$BRANCH" "${SHA::7}")
+          footer=$(printf '\n\n**Release:** %s\n**Support Eglantine:** %s\n' "$release_url" "$donate_url")
+          # Discord caps a message at 2000 characters; trim the commit list, never the links.
+          budget=$((2000 - ${#header} - ${#footer} - 3))
+          if (( budget < 0 )); then budget=0; fi
+          if (( ${#changes} > budget )); then
+            # jq slices by codepoint, so a commit subject cannot be split mid-character.
+            changes=$(jq -rn --arg text "$changes" --argjson limit "$budget" '$text[0:$limit]')
+            # Drop the half-written last line, then mark the list as cut.
+            changes="${changes%$'\n'*}"$'\n…'
+          fi
+          content="${header}"$'\n'"${changes}${footer}"
           # thread_name creates the post; the returned message's channel_id is the post's thread id.
           if ! jq -n --arg content "$content" --arg thread_name "$thread_name" \
               '{content: $content, thread_name: $thread_name, allowed_mentions: {parse: []}}' \
@@ -248,14 +269,17 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$WEBHOOK" ]; then echo "No DISCORD_WEBHOOK_URL secret, skipping."; exit 0; fi
-          # Daily builds point at their forum post when one was created; stable/RC builds, and
-          # dailies without a forum webhook, keep pointing at the GitHub release.
+          # Always link the GitHub release; daily builds also link their forum post when one was
+          # created, so the discussion stays easy to find.
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          DONATE_URL="https://opencollective.com/eglantine-community"
           if [ -n "$POST_URL" ]; then
-            URL="$POST_URL"
+            MSG=$(printf '## <@&1566184315178713190> %s (%s)\n**Release:** %s\n**Discuss:** %s\n**Support Eglantine:** %s' \
+              "$TITLE" "${SHA::7}" "$RELEASE_URL" "$POST_URL" "$DONATE_URL")
           else
-            URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+            MSG=$(printf '## <@&1566184315178713190> %s (%s)\n**Release:** %s\n**Support Eglantine:** %s' \
+              "$TITLE" "${SHA::7}" "$RELEASE_URL" "$DONATE_URL")
           fi
-          MSG=$(printf '## <@&1566184315178713190> %s (%s)\n%s' "$TITLE" "${SHA::7}" "$URL")
           jq -n --arg content "$MSG" \
             '{content: $content, allowed_mentions: {roles: ["1566184315178713190"]}}' |
             curl -fsS -H "Content-Type: application/json" -d @- "$WEBHOOK"

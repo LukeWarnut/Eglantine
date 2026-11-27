@@ -95,6 +95,7 @@ constexpr u64 SHADOW_CHUNK_SIZE = u64{8} << 20;
 /// created and destroyed a chunk every third frame (F:/eg/results/vertex-stage2, L-new1-b).
 constexpr u32 MAX_FREE_SHADOWS = 32;
 constexpr u64 SHADOW_KEEP_MAX = u64{32} << 20;
+constexpr u64 MAX_FREE_SHADOW_BYTES = u64{256} << 20;
 
 /// What a shadow of a storage range is bound as, and copied from and to the pool buffer; staged
 /// vertex and index ranges (nvn_vertex_stage.h) are carved from the same chunks.
@@ -864,10 +865,16 @@ std::shared_ptr<ShadowChunk> DrawResources::AcquireShadow(u64 min_size) {
 
 void DrawResources::ReleaseShadows(std::vector<std::shared_ptr<ShadowChunk>>& chunks) {
     std::scoped_lock lock{shadow_mutex};
+    u64 free_bytes = 0;
+    for (const auto& existing : free_shadows) {
+        free_bytes += existing->size;
+    }
     for (auto& chunk : chunks) {
         // Chunks up to SHADOW_KEEP_MAX stay: the alias transfer's scratch buffer is a chunk sized
         // to the shared bytes of two textures, asked for many times a second.
-        if (chunk->size <= SHADOW_KEEP_MAX && free_shadows.size() < MAX_FREE_SHADOWS) {
+        if (chunk->size <= SHADOW_KEEP_MAX && free_shadows.size() < MAX_FREE_SHADOWS &&
+            free_bytes + chunk->size <= MAX_FREE_SHADOW_BYTES) {
+            free_bytes += chunk->size;
             free_shadows.push_back(std::move(chunk));
         } else {
             counters.shadow_chunks_destroyed.fetch_add(1, std::memory_order_relaxed);

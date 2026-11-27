@@ -37,8 +37,24 @@ enum class GameListItemType;
 
 namespace FileSys {
 class NCA;
+class PatchManager;
 class VfsFilesystem;
 } // namespace FileSys
+
+namespace Loader {
+class AppLoader;
+} // namespace Loader
+
+/// What the game list shows for a game's add-ons: the Add-ons column text (one entry per line)
+/// and the version the enabled update gives it.
+struct GameListPatchInfo {
+    QString add_ons;
+    QString version;
+};
+
+/// Reads a game's add-ons as the game list shows them, through the game list cache.
+GameListPatchInfo ReadGameListPatchInfo(Loader::AppLoader& loader,
+                                        const FileSys::PatchManager& patch);
 
 /**
  * Asynchronous worker object for populating the game list.

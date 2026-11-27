@@ -172,7 +172,8 @@ public:
     /// there now): as HostNotePoolWrite, but the mirror's pages stay valid.
     virtual void HostNoteMirrorWriteBack(Pool& pool, u64 offset, u64 size) = 0;
     /// A draw or dispatch stores through raw global memory (it may write any pool).
-    virtual void HostNoteRawGlobalWrite() = 0;
+    /// `written_through`: every raw store/atomic in the draw also writes through the alias table.
+    virtual void HostNoteRawGlobalWrite(bool written_through = false) = 0;
     /// A draw or dispatch stores into a storage range served from a live shadow (the pool bytes
     /// take the stores when the shadow is copied back).
     virtual void HostNoteShadowedWrite(const Pool& pool, u64 offset, u64 size) = 0;
@@ -286,7 +287,7 @@ public:
     void EndSubmission();
 
     /// The recorder starts / ends a command buffer.
-    void OnSegmentBegin();
+    void OnSegmentBegin(bool keep_shadows = false);
     void OnSegmentEnd();
     /// The recorder recorded a GPU write of [offset, offset + size) of `pool`: staged vertex
     /// copies of those bytes (nvn_vertex_stage.h) are not current any more.
@@ -485,8 +486,9 @@ private:
     static constexpr size_t MAX_LIVE_SHADOWS = 128;
     struct ShadowDecision {
         std::bitset<MAX_LIVE_SHADOWS> flush_mask{}; ///< live shadows (by index) a use conflicts with
-        bool flush_needed{false}; ///< flush_mask is not empty
-        bool any{false};          ///< the plan touches shadows or can create one
+        bool flush_needed{false};      ///< flush_mask is not empty
+        bool need_outside_pass{false}; ///< a read-only mirror binding needs stale non-shadow pages copied in outside a pass
+        bool any{false};               ///< the plan touches shadows or can create one
     };
     /// Looks at the ranges the plan uses against the live shadows; records nothing.
     [[nodiscard]] ShadowDecision ClassifyShadows(const DrawPlan& plan);
@@ -738,11 +740,33 @@ private:
         vk::DescriptorPool pool;
         VkDescriptorSet set{VK_NULL_HANDLE};
         /// The stand-in of each texture array and what each entry holds now.
+        struct WrittenEntry {
+            VkImageView view{VK_NULL_HANDLE};
+            VkImageLayout layout{VK_IMAGE_LAYOUT_UNDEFINED};
+            bool operator==(const WrittenEntry&) const = default;
+        };
         std::array<VkImageView, Shader::BINDLESS_BINDING_COUNT> dummy{};
-        std::array<std::vector<VkImageView>, Shader::BINDLESS_BINDING_COUNT> written;
+        std::array<std::vector<WrittenEntry>, Shader::BINDLESS_BINDING_COUNT> written;
         std::vector<VkSampler> written_samplers;
         /// The storages of the entries that hold an image (their layouts are checked per draw).
         std::vector<std::shared_ptr<Storage>> storages;
+        u64 storages_gen{0};
+        /// Fast-path state for BindlessPrepare: while inside the same open render pass with no
+        /// intervening GPU writes, pass breaks, or table updates, all table storages are already
+        /// in their read layout (or bound as targets).
+        u64 prepared_seq{~u64{0}};
+        u64 prepared_write_clock{~u64{0}};
+        u64 prepared_pass_breaks{~u64{0}};
+        u64 prepared_pass_begins{~u64{0}};
+        u64 prepared_storages_gen{~u64{0}};
+        /// Last descriptor set bind recorded by BindlessBind, to elide redundant binds on
+        /// consecutive bindless draws in the same open render pass with the same pipeline layout.
+        VkCommandBuffer bound_cmd{VK_NULL_HANDLE};
+        VkPipelineLayout bound_layout{VK_NULL_HANDLE};
+        VkPipelineBindPoint bound_point{VK_PIPELINE_BIND_POINT_GRAPHICS};
+        u64 bound_seq{~u64{0}};
+        u64 bound_pass_begins{~u64{0}};
+        u64 bound_draw{0};
         /// What entry `id` was last written from. While the registration, the texture, its
         /// storage and that storage's image are the same, the entry holds what it should and the
         /// sync leaves it (the pool has tens of thousands of registrations; walking each one's
@@ -817,10 +841,10 @@ private:
     struct TextureSlot {
         u32 id{~0u};
         u64 serial{};
-        u64 epoch{};
-        const std::shared_ptr<Texture>* texture{};
+        std::shared_ptr<Texture> texture;
     };
-    mutable std::array<TextureSlot, 1024> texture_slots{};
+    mutable std::array<TextureSlot, 4096> texture_slots{};
+    u64 texture_slots_cleaned_epoch{0};
     [[nodiscard]] u64 SamplerSerialOfId(u32 id) const;
     void NoteFallback(bool graphics, DescReason reason, const std::string& detail = {});
     /// Describes (once per program, slot and source) a storage buffer binding the game left empty.
@@ -849,6 +873,19 @@ private:
     u32 viewports_set{};  ///< bit k: viewport k was set
     u32 scissors_set{};   ///< bit k: scissor k was set
     std::array<StageBindings, BIND_STAGES> stages{};
+    /// Per-slot resolved buffer cache for `stages[stage].uniform` / `storage` (parallel to
+    /// `stages` so PrefetchUpcomingGraphics does not copy it). Validated by address, binding size,
+    /// pool/mapping/alias generations, and pool backing state before use.
+    struct CachedBuffer {
+        BufferRef ref;
+        u64 pool_gen{~u64{0}};
+        u64 mapping_gen{~u64{0}};
+        u64 alias_gen{~u64{0}};
+        u64 address{};
+        u64 binding_size{};
+    };
+    std::array<std::array<CachedBuffer, 32>, BIND_STAGES> uniform_cache{};
+    std::array<std::array<CachedBuffer, 32>, BIND_STAGES> storage_cache{};
     /// Base of the texture / sampler pool bound last in the global id space (SetTexturePool /
     /// SetSamplerPool): the numbering of the ids a game stores in memory.
     u32 texture_pool_base{};
@@ -1034,9 +1071,19 @@ private:
         GraphicsFixedState state{};
         RenderPassKey targets{};
         std::shared_ptr<GraphicsPipeline> pipeline;
+        std::array<u64, BIND_STAGES> query_handle_gen{};
+        u64 query_sub_seq{~u64{0}};
+        u64 query_tex_epoch{~u64{0}};
     };
-    std::array<PipelineMemo, 8> pipeline_memo;
-    u32 pipeline_memo_next{0};
+    std::vector<PipelineMemo> pipeline_memo;
+    struct QueryCache {
+        u64 sub_seq{~u64{0}};
+        u64 tex_epoch{~u64{0}};
+        std::array<u64, BIND_STAGES> handle_gen{};
+    } query_cache;
+    [[nodiscard]] bool QueriesValidFor(const GraphicsPipeline& candidate,
+                                       const std::array<u64, BIND_STAGES>& cached_gen,
+                                       u64 cached_sub_seq, u64 cached_tex_epoch) const noexcept;
     u64 shader_generation{};
     /// The driver (c0) and handle (c2) banks of the graphics stages are rebuilt only when what
     /// they are made of changed (storage buffer table, push constants, handle tables, raw global
@@ -1094,6 +1141,18 @@ private:
                                                             bool is_image, bool written);
     std::shared_ptr<vk::DescriptorPool> set_pool;
     u32 set_pool_used{};
+    /// Per-submission cache of allocated descriptor sets for pipelines without push descriptors,
+    /// keyed by set layout + exact descriptor writes/buffers/images (valid for `seq`).
+    struct DescSetSlot {
+        u64 seq{~u64{0}};
+        u64 hash{};
+        VkDescriptorSetLayout set_layout{VK_NULL_HANDLE};
+        VkDescriptorSet set{VK_NULL_HANDLE};
+        std::vector<PassBoundState::WriteSig> writes;
+        std::vector<VkDescriptorBufferInfo> buffers;
+        std::vector<PassBoundState::ImageSig> images;
+    };
+    std::vector<DescSetSlot> desc_set_cache;
     const GraphicsPipeline* last_kept{nullptr};
     const ComputePipeline* last_compute_kept{nullptr};
     /// The submission and raw global table generation whose pools were last noted as used.

@@ -160,7 +160,7 @@ void InvalidateMappedRange(Call& c, u64 address, u64 size);
 /// of its function; without one (unit tests) they are only collected and can be invoked by name.
 class Registry {
 public:
-    explicit Registry(Bridge* bridge) : bridge{bridge} {}
+    explicit Registry(Bridge* nvn_bridge) : bridge{nvn_bridge} {}
 
     /// Registers `H` as the body of the NVN function `name` (must be in nvn_functions.inc).
     template <Handler H>

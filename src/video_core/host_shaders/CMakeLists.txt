@@ -14,12 +14,15 @@ set(FIDELITYFX_FILES
 set(GLSL_INCLUDES
     fidelityfx_fsr.frag
     ${FIDELITYFX_FILES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/astc_decode.glsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/bcn_encode.glsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/astc_bc.glsl
 )
 
 set(SHADER_FILES
-    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_vertex_repack.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/astc_decoder.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/bc_encoder.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/astc_bc.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_bc_copy.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/bc7_encoder.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_float.frag
@@ -104,6 +107,7 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_quad_indexed.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_turbo_mode.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_uint8.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_vertex_repack.comp
 
     # Snapdragon Game Super Resolution
     ${CMAKE_CURRENT_SOURCE_DIR}/sgsr1_shader.vert
@@ -176,6 +180,12 @@ foreach(SOURCE_FILE IN ITEMS ${SHADER_FILES})
     endif()
     # Skip compiling to SPIR-V OpenGL exclusive files
     if (NOT ${FILENAME} MATCHES "opengl.*")
+        set(SPIRV_DEPENDS)
+        if (FILENAME STREQUAL "astc_bc.comp")
+            set(SPIRV_DEPENDS astc_decode.glsl astc_bc.glsl bcn_encode.glsl)
+        elseif (FILENAME STREQUAL "bc_encoder.comp")
+            set(SPIRV_DEPENDS bcn_encode.glsl)
+        endif()
         string(TOUPPER ${SHADER_NAME}_SPV SPIRV_VARIABLE_NAME)
         set(SPIRV_HEADER_FILE ${SHADER_DIR}/${SHADER_NAME}_spv.h)
         add_custom_command(
@@ -185,6 +195,8 @@ foreach(SOURCE_FILE IN ITEMS ${SHADER_FILES})
                 ${GLSLANGVALIDATOR} -V ${QUIET_FLAG} -I"${FIDELITYFX_INCLUDE_DIR}" ${GLSL_FLAGS} --variable-name ${SPIRV_VARIABLE_NAME} -o ${SPIRV_HEADER_FILE} ${SOURCE_FILE} --target-env ${SPIR_V_VERSION}
             MAIN_DEPENDENCY
                 ${SOURCE_FILE}
+            DEPENDS
+                ${SPIRV_DEPENDS}
         )
         set(SHADER_HEADERS ${SHADER_HEADERS} ${SPIRV_HEADER_FILE})
     endif()

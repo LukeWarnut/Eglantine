@@ -74,6 +74,8 @@ public:
 private:
     void ChooseIcon();
     void SetIconFromFile(const QString& path);
+    void FindIcon();
+    void OnIconFound(const QByteArray& png, const QString& resolved_title);
     void ResetIcon();
     void UpdateIconPreview();
     void UpdateVersionEnabled();
@@ -84,7 +86,9 @@ private:
 
     IconDropZone* icon_preview;
     QLabel* icon_hint;
+    QPushButton* find_icon;
     QPushButton* reset_icon;
+    IconSearch* icon_search;
     QLineEdit* name_edit;
     QLineEdit* publisher_edit;
     QRadioButton* version_auto;
@@ -139,6 +143,7 @@ public:
                       QWidget* parent = nullptr);
 
     void SetProgress(const FileSys::Nup::PackProgress& progress);
+    void SetByteProgress(u64 done, u64 total, const QString& timing);
     void SetCancelling();
     // Closes the dialog without treating it as a cancel request.
     void Finish();
