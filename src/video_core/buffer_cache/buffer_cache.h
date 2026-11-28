@@ -751,23 +751,54 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
     }
 
     const auto& cbufs = maxwell3d->state.shader_stages[stage];
-    GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
-    if (indirect_offset != ~0U) {
-        // The pointer is an entry of a table the constant buffer points to.
-        const GPUVAddr holder = gpu_memory->Read<u64>(ssbo_addr);
-        if (holder == 0) {
-            channel_state->storage_buffers[stage][ssbo_index] = NULL_BINDING;
-            return false;
-        }
-        ssbo_addr = holder + indirect_offset;
-    }
     // NVN graphics descriptors carry a size; bare native pointers and tables do not.
     const bool native_pointer = maxwell3d->GetNativeMacroEngine().native_turing &&
                                 !IsNvnGraphicsStorageDescriptor(stage, cbuf_index, cbuf_offset,
                                                                indirect_offset);
+    std::optional<u64> root_ptr;
+    u64 root_size_word = 0;
+    if (!cbufs.const_buffers[cbuf_index].enabled || cbufs.const_buffers[cbuf_index].size == 0) {
+        const u32 table = Tegra::Engines::Maxwell3D::RootTables::TableForBank(cbuf_index);
+        const auto& root = maxwell3d->root_tables;
+        if (table != ~0U && ((root.loaded_mask >> table) & 1) && (cbuf_offset % 4) == 0 &&
+            cbuf_offset + sizeof(u64) <= sizeof(root.tables[table])) {
+            const auto& words = root.tables[table];
+            root_ptr = u64{words[cbuf_offset / 4]} | (u64{words[cbuf_offset / 4 + 1]} << 32);
+            if (!native_pointer && indirect_offset == ~0U &&
+                cbuf_offset + 2 * sizeof(u64) <= sizeof(root.tables[table])) {
+                root_size_word =
+                    u64{words[cbuf_offset / 4 + 2]} | (u64{words[cbuf_offset / 4 + 3]} << 32);
+            }
+        }
+    }
+    Binding next{};
+    if (root_ptr.has_value()) {
+        if (indirect_offset != ~0U) {
+            if (*root_ptr == 0) {
+                channel_state->storage_buffers[stage][ssbo_index] = NULL_BINDING;
+                return false;
+            }
+            next = StorageBufferBinding(*root_ptr + indirect_offset, cbuf_index, is_written,
+                                        native_pointer, true);
+        } else {
+            next = StorageBufferBindingFromAddress(*root_ptr, root_size_word, cbuf_index,
+                                                   is_written, native_pointer, false);
+        }
+    } else {
+        GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
+        if (indirect_offset != ~0U) {
+            // The pointer is an entry of a table the constant buffer points to.
+            const GPUVAddr holder = gpu_memory->Read<u64>(ssbo_addr);
+            if (holder == 0) {
+                channel_state->storage_buffers[stage][ssbo_index] = NULL_BINDING;
+                return false;
+            }
+            ssbo_addr = holder + indirect_offset;
+        }
+        next = StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer,
+                                    indirect_offset != ~0U);
+    }
     Binding& slot = channel_state->storage_buffers[stage][ssbo_index];
-    Binding next = StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native_pointer,
-                                        indirect_offset != ~0U);
     if (slot.buffer_id && slot.buffer_id != NULL_BUFFER_ID &&
         slot.device_addr == next.device_addr && slot.gpu_addr == next.gpu_addr &&
         slot.size == next.size) {
@@ -1612,10 +1643,9 @@ template <class P>
 void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index,
                                                    bool needs_bind) {
     ++channel_state->uniform_cache_shots[0];
-    // Bank 24 (root table 0, NVN2's push constants) is read from bank 17, which such games do not
-    // bind, and bank 31 (root table 7, NVK's per-draw constants) from bank 16: stream the table's
+    // Unbound banks 10-17 map to root tables 1-7 (10-16) and 0 (17): stream the table's
     // current words as that buffer.
-    const u32 root_table = index == 17 ? 0U : index == 16 ? 7U : ~0U;
+    const u32 root_table = Tegra::Engines::Maxwell3D::RootTables::TableForBank(index);
     if (root_table != ~0U && (maxwell3d->root_tables.loaded_mask >> root_table) & 1 &&
         channel_state->uniform_buffers[stage][index].size == 0) {
         const auto& words = maxwell3d->root_tables.tables[root_table];
@@ -3840,7 +3870,20 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                              bool native_pointer, bool table_pointer) const {
-    GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+    const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+    const u64 size_word =
+        (native_pointer || table_pointer || (gpu_addr >> 45))
+            ? 0
+            : gpu_memory->Read<u64>(ssbo_addr + 8);
+    return StorageBufferBindingFromAddress(gpu_addr, size_word, cbuf_index, is_written,
+                                           native_pointer, table_pointer);
+}
+
+template <class P>
+Binding BufferCache<P>::StorageBufferBindingFromAddress(GPUVAddr gpu_addr, u64 size_word,
+                                                        u32 cbuf_index, bool is_written,
+                                                        bool native_pointer,
+                                                        bool table_pointer) const {
     // Mesa NVK's bindless constant buffer handle (struct nvk_bindless_cbuf), which homebrew on NVK
     // reads uniform buffers through: the address >> 4 in bits 0-44, the size >> 4 in bits 45-63.
     // Guest GPU addresses have 40 bits, so a plain pointer never sets bit 45.
@@ -3901,7 +3944,6 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         // one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
         // Only DLSS passes size from the mapping: doing it for every native dispatch binds up to
         // 8 MiB per buffer and slows Hyrule Warriors' fights to a few fps, then hangs them.
-        const u64 size_word = native_pointer ? 0 : gpu_memory->Read<u64>(ssbo_addr + 8);
         return StorageBufferSize(memory_layout_size, size_word, native_pointer, table_pointer,
                                  is_written);
     }();

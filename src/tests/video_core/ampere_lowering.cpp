@@ -948,4 +948,70 @@ TEST_CASE("Ampere programs ending in a loop's back edge end there", "[video_core
     REQUIRE(static_cast<bool>(lowered));
     CHECK(lowered.source_size == 3 * sizeof(Instruction));
 }
+
+TEST_CASE("Ampere ULDC maps all root table banks 24-31", "[video_core][ampere]") {
+    // UZDoom NX2 (Mesa NVK): ULDC UR0, c[0x1c][0x8] (bank 28) and ULDC UR1, c[0x1b][0x8] (bank 27).
+    const auto lower = [&](Instruction word) {
+        const std::array<Instruction, 2> code{{word, EXIT}};
+        return LowerToMaxwell(code);
+    };
+    const std::array<std::pair<u32, u32>, 8> expected_banks{{
+        {24, 17},
+        {25, 10},
+        {26, 11},
+        {27, 12},
+        {28, 13},
+        {29, 14},
+        {30, 15},
+        {31, 16},
+    }};
+    for (const auto& [ampere_bank, maxwell_bank] : expected_banks) {
+        // ULDC UR0, c[ampere_bank][0x8] (based on logged word 00007ab9 07000200 00000800 000e4200)
+        const u32 w1 = (0x8U << 6) | (ampere_bank << 22);
+        const auto lowered = lower({{0x00007ab9, w1, 0x00000800, 0x000e4200}});
+        INFO("ampere_bank=" << ampere_bank);
+        REQUIRE(static_cast<bool>(lowered));
+        const u64 ldc = FindMaxwell(lowered, 0x4c98 >> 2, 50);
+        REQUIRE(ldc != 0);
+        CHECK(((ldc >> 34) & 0x1f) == maxwell_bank);
+    }
+    // Exact logged word 2 at 0x13c0: ULDC UR1, c[0x1b][0x8]
+    const auto bank27 = lower({{0x00017ab9, 0x06c00200, 0x00000800, 0x000e8400}});
+    REQUIRE(static_cast<bool>(bank27));
+    const u64 ldc27 = FindMaxwell(bank27, 0x4c98 >> 2, 50);
+    REQUIRE(ldc27 != 0);
+    CHECK(((ldc27 >> 34) & 0x1f) == 12);
+}
+
+TEST_CASE("Ampere bindless LDC (0x582) decodes handle and adds GPR offset", "[video_core][ampere]") {
+    // UZDoom NX2 (Mesa NAK):
+    // 0x1790: LDC R25, cx[UR0][R0 + 0x10c]     (00197582 00004300 08000800 000e4400)
+    // 0x2090: LDC.64 R36, cx[UR0][R0 + 0x118]  (00247582 00004600 08000a00 000e0200)
+    const auto lower = [](Instruction word) {
+        const std::array<Instruction, 2> code{{word, EXIT}};
+        return LowerToMaxwell(code);
+    };
+    const auto w32 = lower({{0x00197582, 0x00004300, 0x08000800, 0x000e4400}});
+    REQUIRE(static_cast<bool>(w32));
+    // Decodes UR0 (R216) << 4 into R250, adds R0 with carry into R251:R250, then LDG.E R25, [R250 + 268].
+    const u64 ldg32 = FindMaxwell(w32, 0xeed, 52);
+    REQUIRE(ldg32 != 0);
+    CHECK((ldg32 & 0xff) == 25);
+    CHECK(((ldg32 >> 8) & 0xff) == 250);
+    CHECK(((ldg32 >> 20) & 0xffffff) == 268);
+    CHECK(((ldg32 >> 48) & 7) == 4);
+    const bool has_add_r0 = std::ranges::any_of(w32.instructions, [](u64 insn) {
+        return (insn >> 52) == 0x5c1 && (insn & 0xff) == 250 && ((insn >> 8) & 0xff) == 250 &&
+               ((insn >> 20) & 0xff) == 0;
+    });
+    CHECK(has_add_r0);
+
+    const auto w64 = lower({{0x00247582, 0x00004600, 0x08000a00, 0x000e0200}});
+    REQUIRE(static_cast<bool>(w64));
+    const u64 ldg64 = FindMaxwell(w64, 0xeed, 52);
+    REQUIRE(ldg64 != 0);
+    CHECK((ldg64 & 0xff) == 36);
+    CHECK(((ldg64 >> 20) & 0xffffff) == 280);
+    CHECK(((ldg64 >> 48) & 7) == 5);
+}
 } // namespace

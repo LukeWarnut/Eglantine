@@ -196,6 +196,10 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
         operand(16, count); operand(24, 2); break;
     }
+    case 0x582: { // Bindless LDC cx[URh][Ra + imm]
+        const u32 width = input.Bits(73, 3), count = width == 5 ? 2 : 1;
+        operand(16, count); operand(64); break;
+    }
     default:
         result.valid = false; return result;
     }
@@ -307,7 +311,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         uses_uniform_bank |= op == 0x3c4 || op == 0x2bd || op == 0x896 || op == 0xf60 || op == 0xc11 || op == 0xd08 || op == 0xc0c || op == 0x986 || op == 0x9a8 || op == 0xc12 || op == 0xc17 || op == 0xe24 || op == 0xc24 || op == 0xd00 || op == 0xd09 || op == 0x9c3 || op == 0xc45 || op == 0x2a4 || op == 0x891 || op == 0x890 || op == 0x290 || op == 0x28c || op == 0x88c || op == 0x287 || op == 0x887 || op == 0x958 || op == 0xab9 || op == 0xabb || op == 0x899 || op == 0xc20 || op == 0xe21 || op == 0xe23 || op == 0xc02 ||
                              op == 0x886 || op == 0x3c2 || op == 0xc82 || op == 0x882 || op == 0x292 || op == 0x892 || op == 0x291 || op == 0x981 || op == 0xc13 || op == 0xc10 || op == 0xc23 || op == 0x526 || op == 0x2be || op == 0x8a4 || op == 0xd05 || (op == 0x984 && instruction.Bits(91, 1)) || (op == 0x988 && instruction.Bits(91, 1)) || op == 0x89c || op == 0x883 || op == 0x2a5 || op == 0xd06 || op == 0xf63 || op == 0xf66 || op == 0xf69 || op == 0xc0b || op == 0x8a5 || op == 0x299 || op == 0xc09 || op == 0xc07 || op == 0xf6c || (op == 0x81c && instruction.Bits(67, 1)) || op == 0xc0a ||
                              (op == 0x83b && instruction.Bits(91, 1)) ||
-                             (op == 0x98e && instruction.Bits(91, 1));
+                             (op == 0x98e && instruction.Bits(91, 1)) || op == 0x582;
     }
     const auto address_of = [](u32 index) { return 0x50U + index * 8 + ((index + 1) / 3) * 8; };
     const auto fail = [&](u32 index, std::string_view reason) {
@@ -470,12 +474,17 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         const auto base = [&](u64 opcode_bits) { return opcode_bits | predicate | dest; };
         // NVN2 fullscreen vertex shaders read bank 24, which the game never binds (the console reads
         // zeros from an unbound bank); Maxwell has 18, so read it from bank 17, also never bound.
-        // Banks 24-31 are the root tables. NVK (homebrew Vulkan) keeps its per-draw constants in
-        // table 7 (bank 31): read it from bank 16, past NVK's 16 constant buffers. The buffer
-        // cache streams table 0 into bank 17 and table 7 into bank 16 when they are unbound.
+        // Banks 24-31 are the 8 root tables (tables 0-7): map table 0 (bank 24) to bank 17 and
+        // tables 1-7 (banks 25-31) to banks 10-16. The buffer cache streams them when unbound.
         const auto bank = [&]() -> u32 {
             const u32 value = insn.Bits(54, 5);
-            return value == 24 ? 17U : value == 31 ? 16U : value;
+            if (value == 24) {
+                return 17U;
+            }
+            if (value >= 25 && value <= 31) {
+                return value - 15U;
+            }
+            return value;
         };
         const auto cbuf = [&]() -> u64 {
             return (u64{insn.Bits(38, 16) / 4} << 20) | (u64{bank()} << 34);
@@ -652,13 +661,20 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         // address >> 4 in bits 0-44 and the size >> 4 above. Read as a global load from the address
         // (low word URh << 4), which the storage buffer pass binds from the constant buffer word
         // the handle came from (the buffer cache decodes the handle there).
-        const auto bindless_cbuf_load = [&](u32 target, u32 handle, u32 offset, u32 width) {
+        const auto bindless_cbuf_load = [&](u32 target, u32 handle, u32 offset, u32 width,
+                                            u32 reg_offset = 255) {
             emit(0x3848000000000000ULL | predicate | 250 | (u64{handle} << 8) | (u64{4} << 20));
             emit(0x3828000000000000ULL | predicate | 251 | (u64{handle} << 8) | (u64{28} << 20));
             emit(0x0400000000000000ULL | predicate | 252 | (u64{handle + 1} << 8) | (u64{0x1fff} << 20));
             emit(0x3848000000000000ULL | predicate | 252 | (u64{252} << 8) | (u64{4} << 20));
             emit(0x5c40000000000000ULL | predicate | 251 | (u64{251} << 8) | (u64{252} << 20) |
                  (u64{1} << 41) | (u64{7} << 48));
+            if (reg_offset != 255) {
+                emit(0x5c10000000000000ULL | predicate | 250 | (u64{250} << 8) |
+                     (u64{reg_offset} << 20) | (u64{1} << 47));
+                emit(0x5c10000000000000ULL | predicate | 251 | (u64{251} << 8) |
+                     (u64{255} << 20) | (u64{1} << 43));
+            }
             emit(0xeed0000000000000ULL | predicate | target | (u64{250} << 8) | (u64{offset} << 20) |
                  (u64{1} << 45) | (u64{width} << 48));
         };
@@ -1305,6 +1321,21 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 return fail(index, "native uniform shift mode");
             emit(0x3848000000000000ULL | predicate | dst_reg |
                  (u64{high_result ? high_reg : low_reg} << 8) | (u64{insn.words[1]} << 20));
+            break;
+        }
+        case 0x582: { // Bindless LDC indexed byte offset: Rd, cx[URh][Ra + imm] (Mesa NAK)
+            const u32 width = insn.Bits(73, 3), mode = insn.Bits(78, 2);
+            const u32 handle = uniform_register(insn.Bits(24, 6));
+            const u32 reg_offset = insn.Bits(64, 8);
+            const u32 offset = insn.Bits(38, 16);
+            if (width > 5 || mode != 0 || !insn.Bits(91, 1) ||
+                handle == ~0U || handle == 255 || (handle & 1) ||
+                (width == 5 && ((dest & 1) || dest >= 246)) ||
+                (width != 5 && dest != 255 && dest >= 246) ||
+                (reg_offset != 255 && reg_offset >= 246) ||
+                (insn.words[2] & ~0x00000effU) != 0x08000000U)
+                return fail(index, "native bindless constant load mode");
+            bindless_cbuf_load(static_cast<u32>(dest), handle, offset, width, reg_offset);
             break;
         }
         case 0xb82: { // LDC indexed byte offset; bits 78-79 the mode as Maxwell's (2 = IS)

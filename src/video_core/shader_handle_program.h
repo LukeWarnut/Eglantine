@@ -23,7 +23,7 @@ namespace VideoCommon {
 /// buffer offset alignment: storage offsets in the program are relative to the buffer address
 /// aligned down to it (StorageOffset), which is also where the buffer cache binds the buffer.
 /// root_word(index, offset) serves an unbound bank the buffer cache streams from a root table
-/// (banks 16 and 17, see BindHostGraphicsUniformBuffer), std::nullopt otherwise.
+/// (banks 10-17, see BindHostGraphicsUniformBuffer), std::nullopt otherwise.
 struct NoRootWord {
     std::optional<u32> operator()(u32, u32) const {
         return std::nullopt;
@@ -50,10 +50,17 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Memory& gpu_mem
                    }
                    const auto& descriptor{info.storage_buffers_descriptors[binding]};
                    const GPUVAddr cbuf{cbuf_address(descriptor.cbuf_index)};
+                   GPUVAddr base{};
                    if (cbuf == 0) {
-                       return 0U;
+                       const auto low{root_word(descriptor.cbuf_index, descriptor.cbuf_offset)};
+                       const auto high{root_word(descriptor.cbuf_index, descriptor.cbuf_offset + 4)};
+                       if (!low || !high) {
+                           return 0U;
+                       }
+                       base = GPUVAddr{*low} | (GPUVAddr{*high} << 32);
+                   } else {
+                       base = gpu_memory.template Read<u64>(cbuf + descriptor.cbuf_offset);
                    }
-                   GPUVAddr base{gpu_memory.template Read<u64>(cbuf + descriptor.cbuf_offset)};
                    if (base >> 45) {
                        // A Mesa NVK bindless cbuf handle (StorageBufferBinding): address >> 4.
                        base = (base & ((GPUVAddr{1} << 45) - 1)) << 4;

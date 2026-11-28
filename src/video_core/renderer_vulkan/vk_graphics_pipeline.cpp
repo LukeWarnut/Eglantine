@@ -701,22 +701,22 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             return value;
         }};
         const auto read_handle{[&](const auto& desc, u32 index) {
+            // Unbound banks 10-17 map to root tables 1-7 (10-16) and 0 (17), as the buffer
+            // cache streams them (NVK's push/root constants live in root tables 24-31).
+            const auto root_word = [&](u32 cbuf, u32 offset) -> std::optional<u32> {
+                const auto& root{maxwell3d->root_tables};
+                const u32 table = Tegra::Engines::Maxwell3D::RootTables::TableForBank(cbuf);
+                if (table == ~0U || !((root.loaded_mask >> table) & 1) ||
+                    offset / 4 >= root.tables[table].size()) {
+                    return std::nullopt;
+                }
+                return root.tables[table][offset / 4];
+            };
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw.
                 const auto cbuf_address = [&](u32 cbuf) -> GPUVAddr {
                     return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
                                                                   : GPUVAddr{};
-                };
-                // Banks 17 and 16 unbound: root tables 0 and 7, as the buffer cache streams them
-                // (NVK's push constants, which pick a material record, are in table 7).
-                const auto root_word = [&](u32 cbuf, u32 offset) -> std::optional<u32> {
-                    const auto& root{maxwell3d->root_tables};
-                    const u32 table = cbuf == 17 ? 0U : cbuf == 16 ? 7U : ~0U;
-                    if (table == ~0U || !((root.loaded_mask >> table) & 1) ||
-                        offset / 4 >= root.tables[table].size()) {
-                        return std::nullopt;
-                    }
-                    return root.tables[table][offset / 4];
                 };
                 const u32 raw = VideoCommon::TextureHandleCache::Enabled()
                                     ? handle_caches[stage][desc.handle_program].Evaluate(
@@ -727,25 +727,29 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                           device.GetStorageBufferAlignment(), root_word);
                 return TexturePair(raw, via_header_index);
             }
-            ASSERT(cbufs[desc.cbuf_index].enabled);
             const u32 index_offset{Shader::DescriptorElementOffset(desc, index)};
             const u32 offset{desc.cbuf_offset + index_offset};
-            const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
+            const auto read_cbuf_word = [&](u32 cbuf_index) -> u32 {
+                if (cbufs[cbuf_index].enabled) {
+                    return read_word(cbufs[cbuf_index].address + offset);
+                }
+                if (const auto word = root_word(cbuf_index, offset)) {
+                    return *word;
+                }
+                ASSERT(cbufs[cbuf_index].enabled);
+                return 0U;
+            };
             if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
                           std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
                 if (desc.has_secondary) {
-                    ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
-                    const u32 second_offset{desc.secondary_cbuf_offset + index_offset};
-                    const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
-                                                 second_offset};
-                    const u32 lhs_raw{read_word(addr) << desc.shift_left};
-                    const u32 rhs_raw{read_word(separate_addr)
+                    const u32 lhs_raw{read_cbuf_word(desc.cbuf_index) << desc.shift_left};
+                    const u32 rhs_raw{read_cbuf_word(desc.secondary_cbuf_index)
                                       << desc.secondary_shift_left};
                     const u32 raw{lhs_raw | rhs_raw};
                     return TexturePair(raw, via_header_index);
                 }
             }
-            return TexturePair(read_word(addr), via_header_index);
+            return TexturePair(read_cbuf_word(desc.cbuf_index), via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {

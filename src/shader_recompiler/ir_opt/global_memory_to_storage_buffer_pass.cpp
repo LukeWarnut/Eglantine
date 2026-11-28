@@ -502,20 +502,29 @@ std::optional<StorageBufferAddr> CbufWord(const IR::Inst* inst) {
 
 /// The constant buffer word holding a Mesa NVK bindless cbuf handle (address >> 4 in its low
 /// bits) when `low_addr` is that handle's address, as the Ampere lowering builds it for cx[] reads
-std::optional<StorageBufferAddr> NvkCbufHandleWord(const IR::Value& low_addr) {
-    if (low_addr.IsImmediate()) {
+std::optional<StorageBufferAddr> NvkCbufHandleWord(const IR::Value& low_addr, u32 depth = 0) {
+    if (low_addr.IsImmediate() || depth > 8) {
         return std::nullopt;
     }
-    const IR::Inst* const shift{low_addr.InstRecursive()};
-    if (shift->GetOpcode() != IR::Opcode::ShiftLeftLogical32 || shift->Arg(0).IsImmediate() ||
-        !shift->Arg(1).IsImmediate() || shift->Arg(1).U32() != 4) {
-        return std::nullopt;
+    const IR::Inst* const inst{low_addr.InstRecursive()};
+    if (inst->GetOpcode() == IR::Opcode::ShiftLeftLogical32) {
+        if (inst->Arg(0).IsImmediate() || !inst->Arg(1).IsImmediate() ||
+            inst->Arg(1).U32() != 4) {
+            return std::nullopt;
+        }
+        const std::optional<StorageBufferAddr> word{CbufWord(inst->Arg(0).InstRecursive())};
+        if (!word || !Common::IsAligned(word->offset, 8)) {
+            return std::nullopt;
+        }
+        return word;
     }
-    const std::optional<StorageBufferAddr> word{CbufWord(shift->Arg(0).InstRecursive())};
-    if (!word || !Common::IsAligned(word->offset, 8)) {
-        return std::nullopt;
+    if (inst->GetOpcode() == IR::Opcode::IAdd32) {
+        if (const auto word = NvkCbufHandleWord(inst->Arg(0), depth + 1)) {
+            return word;
+        }
+        return NvkCbufHandleWord(inst->Arg(1), depth + 1);
     }
-    return word;
+    return std::nullopt;
 }
 
 struct TrackingConditions {

@@ -3214,10 +3214,20 @@ public:
 
     /// Root tables: eight 256-byte tables written inline (method 0x504 selects a table, bits 0-2,
     /// and a byte offset, bits 8-15; each 0x508 writes the next word) that shaders read as constant
-    /// banks 24-31. NVN2 keeps push constants in bank 24, which the Ampere lowering reads as bank 17.
+    /// banks 24-31. Ampere lowering maps table 0 (bank 24) to bank 17 and tables 1-7 (banks
+    /// 25-31) to banks 10-16.
     struct RootTables {
         static constexpr u32 SelectMethod = 0x504 / 4;
         static constexpr u32 LoadMethod = 0x508 / 4;
+        static constexpr u32 TableForBank(u32 cbuf_index) noexcept {
+            if (cbuf_index == 17) {
+                return 0U;
+            }
+            if (cbuf_index >= 10 && cbuf_index <= 16) {
+                return cbuf_index - 9U;
+            }
+            return ~0U;
+        }
         std::array<std::array<u32, 64>, 8> tables{};
         u32 selected{};
         u32 offset{};

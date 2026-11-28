@@ -80,11 +80,11 @@ std::vector<u64> LayOutLoweredNativeCode(std::span<const u64> header,
     return code;
 }
 
-/// The root table an unbound bank 17 or 16 reads (tables 0 and 7, as the buffer cache streams
-/// them in BindHostGraphicsUniformBuffer), when it has been written.
+/// The root table an unbound bank 10-17 reads (tables 1-7 in 10-16, table 0 in 17, as the
+/// buffer cache streams them in BindHostGraphicsUniformBuffer), when it has been written.
 static const std::array<u32, 64>* RootTableBank(const Tegra::Engines::Maxwell3D& maxwell3d,
                                                 u32 cbuf_index) {
-    const u32 table = cbuf_index == 17 ? 0U : cbuf_index == 16 ? 7U : ~0U;
+    const u32 table = Tegra::Engines::Maxwell3D::RootTables::TableForBank(cbuf_index);
     if (table == ~0U || !((maxwell3d.root_tables.loaded_mask >> table) & 1)) {
         return nullptr;
     }

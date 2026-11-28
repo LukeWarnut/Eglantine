@@ -879,6 +879,11 @@ private:
                                                bool native_pointer = false,
                                                bool table_pointer = false) const;
 
+    [[nodiscard]] Binding StorageBufferBindingFromAddress(GPUVAddr gpu_addr, u64 size_word,
+                                                          u32 cbuf_index, bool is_written,
+                                                          bool native_pointer = false,
+                                                          bool table_pointer = false) const;
+
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
 
