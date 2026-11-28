@@ -41,12 +41,17 @@ enum class Type {
     Hot,   ///< Pages the CPU rewrites again and again: kept modified, never write-protected
     Flip,  ///< Pages the CPU modified once, while tracked, since the last reset
     NoHot, ///< Pages the GPU modified: never hot
-    HotClean, ///< Hot pages already uploaded this frame
+    HotClean, ///< Hot pages already uploaded in this guest command list
     Max
 };
 
 /// Frames since start, moved by BufferCache::TickFrame. Hot page state is dropped every 128.
 inline std::atomic<u32> g_hot_page_epoch{0};
+
+/// Guest command lists ended, moved by GPU::OnCommandListEnd. Hot pages are not write-protected,
+/// so nothing notices the CPU rewriting one: between two command lists it may have (a streaming
+/// buffer that wrapped, or one recycled after a fence), and each list uploads them again.
+inline std::atomic<u32> g_hot_clean_epoch{0};
 
 /// EDEN_NX2_HOT_PAGES=0 turns the hot page handling off.
 [[nodiscard]] inline bool HotPagesEnabled() {
@@ -147,12 +152,12 @@ struct WordManager {
     /// Forgets which pages are hot every 128 frames, so a page that stopped being rewritten gets
     /// tracked again at its next upload.
     void RefreshHotEpoch() noexcept {
-        const u32 frame = g_hot_page_epoch.load(std::memory_order_relaxed);
-        if (frame != hot_frame) {
-            hot_frame = frame;
+        const u32 list = g_hot_clean_epoch.load(std::memory_order_relaxed);
+        if (list != hot_list) {
+            hot_list = list;
             std::fill_n(heap.data() + size_t(Type::HotClean) * num_words, num_words, u64{0});
         }
-        const u32 now = frame >> 7;
+        const u32 now = g_hot_page_epoch.load(std::memory_order_relaxed) >> 7;
         if (now != hot_epoch) {
             hot_epoch = now;
             std::fill_n(heap.data() + size_t(Type::Hot) * num_words, num_words, u64{0});
@@ -250,7 +255,7 @@ struct WordManager {
         IterateWords(offset, size, [&](size_t index, u64 mask) {
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
-            // Hot pages uploaded since the frame began are not modified again until the next frame.
+            // Hot pages uploaded since this command list began are taken as unchanged until it ends.
             const u64 hot_clean = hot_pages ? hot_words[index] & hot_clean_words[index] & mask : 0;
             const u64 word = state_words[index] & mask & ~hot_clean;
             // Only hot pages retain CPU/Untracked bits after a CPU upload walk.
@@ -482,7 +487,7 @@ struct WordManager {
     DeviceTracker* tracker = nullptr;
     VAddr cpu_addr = 0;
     u32 hot_epoch = 0;
-    u32 hot_frame = 0;
+    u32 hot_list = 0;
 };
 
 } // namespace VideoCommon

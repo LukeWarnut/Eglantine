@@ -29,6 +29,7 @@
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/perf_stats.h"
+#include "video_core/buffer_cache/word_manager.h"
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
@@ -132,6 +133,7 @@ struct GPU::Impl {
 
     /// Signal the ending of command list.
     void OnCommandListEnd() {
+        VideoCommon::g_hot_clean_epoch.fetch_add(1, std::memory_order_relaxed);
         renderer->ReadRasterizer()->ReleaseFences(false);
         Settings::UpdateGPUAccuracy();
     }
