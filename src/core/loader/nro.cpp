@@ -344,11 +344,17 @@ std::string QuoteArgument(const std::string& argument) {
 
 // The host file for "sdmc:/switch/app.nro", or empty when it is not on the SD card.
 std::string HostPathOfSdmc(std::string_view path) {
+    // hbloader opens the path through libnx, whose default device is sdmc: RetroArch passes its
+    // cores as "/retroarch/cores/...".
     constexpr std::string_view prefix = "sdmc:/";
-    if (!path.starts_with(prefix)) {
+    if (path.starts_with(prefix)) {
+        path.remove_prefix(prefix.size());
+    } else if (path.starts_with('/')) {
+        path.remove_prefix(1);
+    } else {
         return {};
     }
-    const std::filesystem::path relative{Common::FS::ToU8String(path.substr(prefix.size()))};
+    const std::filesystem::path relative{Common::FS::ToU8String(path)};
     for (const auto& part : relative) {
         if (part == "..") {
             return {};
