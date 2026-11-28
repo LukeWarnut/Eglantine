@@ -7,8 +7,12 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <filesystem>
 #include <memory>
+#include <optional>
 #include "common/alignment.h"
+#include "common/fs/fs.h"
+#include "common/fs/fs_util.h"
 #include "common/literals.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/sdmc_factory.h"
@@ -16,6 +20,20 @@
 #include "core/file_sys/xts_archive.h"
 
 namespace FileSys {
+namespace {
+
+std::optional<std::filesystem::path> HostDirectoryPath(const VirtualDir& dir) {
+    if (dir == nullptr) {
+        return std::nullopt;
+    }
+    std::filesystem::path host_path{Common::FS::ToU8String(dir->GetFullPath())};
+    if (!Common::FS::IsDir(host_path)) {
+        return std::nullopt;
+    }
+    return host_path;
+}
+
+} // namespace
 
 SDMCFactory::SDMCFactory(VirtualDir sd_dir_, VirtualDir sd_mod_dir_)
     : sd_dir(std::move(sd_dir_)), sd_mod_dir(std::move(sd_mod_dir_)),
@@ -61,10 +79,24 @@ VirtualDir SDMCFactory::GetImageDirectory() const {
 }
 
 u64 SDMCFactory::GetSDMCFreeSpace() const {
+    if (sd_dir == nullptr) {
+        return 0;
+    }
+    // Query host filesystem capacity/free space directly instead of recursively walking sd_dir,
+    // which otherwise stalls callers that poll statvfs / GetFreeSpaceSize every frame.
+    if (const auto host_path = HostDirectoryPath(sd_dir)) {
+        return Common::FS::GetFreeSpaceSize(*host_path);
+    }
     return GetSDMCTotalSpace() - sd_dir->GetSize();
 }
 
 u64 SDMCFactory::GetSDMCTotalSpace() const {
+    if (sd_dir == nullptr) {
+        return 0;
+    }
+    if (const auto host_path = HostDirectoryPath(sd_dir)) {
+        return Common::FS::GetTotalSpaceSize(*host_path);
+    }
     // Resize the SD space automatically, always leaving around 4GiB last from next chunk block
     using namespace Common::Literals;
     auto const bytes_per_sector = 512;

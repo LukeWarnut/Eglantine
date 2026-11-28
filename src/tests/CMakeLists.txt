@@ -67,6 +67,7 @@ add_executable(tests
     core/nx2_gpu_memory_registry.cpp
     core/page_tracker.cpp
     core/priority_queue.cpp
+    core/sdmc_factory.cpp
     core/internal_network/network.cpp
     video_core/frame_dump_schedule.cpp
     video_core/framebuffer_limits.cpp
