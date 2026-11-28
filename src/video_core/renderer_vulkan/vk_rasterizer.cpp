@@ -1706,6 +1706,28 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     }
 
     std::scoped_lock lock{texture_cache.mutex};
+    // CLEAR_SURFACE names its render target directly, active or not: Mesa NVK clears each
+    // attachment of a render pass with one colour target active (FindColorBuffer binds it for the
+    // clear). Bound for this clear only, so the next draw's render targets are found again.
+    const u32 cleared_rt = regs.clear_surface.RT;
+    const bool clears_inactive_rt = use_color && cleared_rt >= regs.rt_control.count;
+    auto& dirty = maxwell3d->dirty.flags;
+    const auto mark_cleared_rt_dirty = [&dirty, cleared_rt] {
+        dirty[VideoCommon::Dirty::RenderTargets] = true;
+        dirty[VideoCommon::Dirty::ColorBuffer0 + cleared_rt] = true;
+    };
+    if (clears_inactive_rt) {
+        mark_cleared_rt_dirty();
+    }
+    struct InactiveRtScope {
+        bool active;
+        decltype(mark_cleared_rt_dirty)& mark;
+        ~InactiveRtScope() {
+            if (active) {
+                mark();
+            }
+        }
+    } inactive_rt_scope{clears_inactive_rt, mark_cleared_rt_dirty};
     texture_cache.UpdateRenderTargets(true);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     if (frame_dump.Capturing()) {

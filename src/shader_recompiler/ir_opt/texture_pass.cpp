@@ -214,8 +214,9 @@ u32 DynamicDescriptorSizeShift(const IR::U32& dynamic_offset) {
     const IR::Value shift = inst->Arg(1);
     if (!shift.IsImmediate())
         return DESCRIPTOR_SIZE_SHIFT;
+    // 4-byte elements too: Mesa NVK's combined image/sampler handles are one word each.
     const u32 size_shift = shift.U32();
-    return size_shift >= DESCRIPTOR_SIZE_SHIFT && size_shift < 31 ? size_shift : DESCRIPTOR_SIZE_SHIFT;
+    return size_shift >= 2 && size_shift < 31 ? size_shift : DESCRIPTOR_SIZE_SHIFT;
 }
 
 u32 DynamicDescriptorCount(u32 base_offset, u32 size_shift, u32 max_descriptors) {
@@ -1092,6 +1093,55 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
     };
 }
 
+/// A handle read from a constant buffer array at an offset known only per pixel or per loop
+/// iteration (Mesa NVK reads its combined image/sampler descriptors as c[set][index * 4], from
+/// offset 0 of the set's bank, which Track does not take). Sampled through a descriptor array
+/// whose elements the host reads from that bank for each draw, as Track's dynamic arrays.
+std::optional<ConstBufferAddr> TrackRuntimeArray(IR::Value handle, const HostTranslateInfo& host_info) {
+    for (int depth = 0; depth < 8 && !handle.IsImmediate(); ++depth) {
+        const IR::Inst* const inst{handle.InstRecursive()};
+        const IR::Opcode opcode{inst->GetOpcode()};
+        if (opcode == IR::Opcode::Identity || opcode == IR::Opcode::ShuffleIndex ||
+            opcode == IR::Opcode::BitCastU32F32 || opcode == IR::Opcode::BitCastF32U32) {
+            handle = inst->Arg(0);
+            continue;
+        }
+        if (opcode != IR::Opcode::GetCbufU32 || !inst->Arg(0).IsImmediate() ||
+            inst->Arg(1).IsImmediate()) {
+            return std::nullopt;
+        }
+        u32 base_offset{};
+        IR::U32 dynamic_offset{inst->Arg(1)};
+        const IR::Inst* const offset_inst{inst->Arg(1).InstRecursive()};
+        if (offset_inst->GetOpcode() == IR::Opcode::IAdd32) {
+            for (size_t arg = 0; arg < 2; ++arg) {
+                if (offset_inst->Arg(arg).IsImmediate() && !offset_inst->Arg(arg ^ 1).IsImmediate()) {
+                    base_offset = offset_inst->Arg(arg).U32();
+                    dynamic_offset = IR::U32{offset_inst->Arg(arg ^ 1)};
+                }
+            }
+        }
+        const u32 size_shift{DynamicDescriptorSizeShift(dynamic_offset)};
+        const u32 sampled_limit{(std::max)(1U, (std::min)(host_info.max_per_stage_descriptor_sampled_images,
+                                                          host_info.max_descriptor_set_sampled_images))};
+        const u32 resource_limit{(std::max)(1U, host_info.max_per_stage_resources)};
+        return ConstBufferAddr{
+            .index = inst->Arg(0).U32(),
+            .offset = base_offset,
+            .shift_left = 0,
+            .secondary_index = 0,
+            .secondary_offset = 0,
+            .secondary_shift_left = 0,
+            .dynamic_offset = dynamic_offset,
+            .count = DynamicDescriptorCount(base_offset, size_shift,
+                                            (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit, resource_limit})),
+            .has_secondary = false,
+            .element_offset = base_offset,
+        };
+    }
+    return std::nullopt;
+}
+
 TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const HostTranslateInfo& host_info) {
     ConstBufferAddr addr;
     if (IsBindless(inst)) {
@@ -1105,6 +1155,12 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
             int budget = 4096;
             g_handle_failure = IR::Opcode::Void;
             if (!g_handle_programs || !BuildHandleProgram(inst.Arg(0), code, budget, block)) {
+                if (!IsStorageImageOpcode(IndexedInstruction(inst)) && env.IsNativeProgram() &&
+                    !env.IsNvnHleProgram()) {
+                    if (const std::optional<ConstBufferAddr> array{TrackRuntimeArray(inst.Arg(0), host_info)}) {
+                        return TextureInst{.cbuf = *array, .inst = &inst, .block = block};
+                    }
+                }
                 if (g_bindless_allowed && !IsStorageImageOpcode(IndexedInstruction(inst))) {
                     // The handle depends on more than one draw can name (a light or material
                     // record read per pixel): the host's bindless table is indexed with it.

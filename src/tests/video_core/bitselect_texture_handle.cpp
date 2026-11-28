@@ -18,8 +18,12 @@ namespace IR = Shader::IR;
 
 class HandleEnvironment final : public Shader::Environment {
 public:
-    HandleEnvironment() {
+    explicit HandleEnvironment(bool native_ = false) : native{native_} {
         stage = Shader::Stage::Fragment;
+    }
+
+    bool IsNativeProgram() const override {
+        return native;
     }
 
     u64 ReadInstruction(u32) override {
@@ -60,6 +64,9 @@ public:
         return std::nullopt;
     }
     void Dump(u64, u64) override {}
+
+private:
+    bool native;
 };
 
 } // namespace
@@ -108,4 +115,40 @@ TEST_CASE("A bit select of two constant buffer words becomes a handle program",
     };
     CHECK(reads(0));
     CHECK(reads(4));
+}
+
+TEST_CASE("A handle read from a constant buffer array at a per-pixel offset becomes an array",
+          "[video_core][shader][texture_pass]") {
+    // Mesa NVK: textures[nonuniformEXT(index)] reads the combined image/sampler word at
+    // c[set][index * 4], the index computed per pixel (here from an attribute).
+    HandleEnvironment env{true};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::Program program;
+    program.stage = Shader::Stage::Fragment;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
+                           {{}, IR::AbstractSyntaxNode::Type::Return}};
+    IR::IREmitter ir{block};
+    const IR::F32 attribute{ir.GetAttribute(IR::Attribute::Generic0X)};
+    const IR::U32 index{ir.ConvertFToU(32, ir.FPMul(attribute, ir.Imm32(4.0f)))};
+    const IR::U32 handle{ir.GetCbuf(ir.Imm32(2), ir.ShiftLeftLogical(index, ir.Imm32(2)))};
+    IR::TextureInstInfo flags{};
+    flags.type.Assign(Shader::TextureType::Color2D);
+    const auto coords = ir.CompositeConstruct(ir.Imm32(0.5f), ir.Imm32(0.5f));
+    (void)ir.ImageSampleExplicitLod(handle, coords, ir.Imm32(0.0f), {}, flags);
+
+    Shader::HostTranslateInfo host;
+    host.ApplyDescriptorLimitPolicy();
+    Shader::Optimization::TexturePass(env, program, host);
+
+    REQUIRE(program.info.texture_descriptors.size() == 1);
+    const auto& desc = program.info.texture_descriptors[0];
+    CHECK(desc.handle_program == ~0U);
+    CHECK(!desc.bindless);
+    CHECK(desc.cbuf_index == 2);
+    CHECK(desc.cbuf_offset == 0);
+    CHECK(desc.size_shift == 2);
+    CHECK(desc.count > 1);
 }

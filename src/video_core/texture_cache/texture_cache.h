@@ -3898,7 +3898,10 @@ SamplerId TextureCache<P>::FindSampler(const TSCEntry& config, bool compute) {
 template <class P>
 ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
     const auto& regs = maxwell3d->regs;
-    if (index >= regs.rt_control.count) {
+    // CLEAR_SURFACE selects its render target directly, active or not: Mesa NVK clears each
+    // attachment of a render pass with one colour target active and the attachment in RT.
+    const bool cleared = clearing_render_targets && index == regs.clear_surface.RT;
+    if (index >= regs.rt_control.count && !cleared) {
         return ImageViewId{};
     }
     const auto& rt = regs.rt[index];

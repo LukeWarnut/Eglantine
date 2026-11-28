@@ -415,6 +415,10 @@ public:
     }
 
     [[nodiscard]] bool HasAspectColorBit(size_t index) const noexcept {
+        // A slot without a colour buffer has no rt_map entry (it would read attachment 0's).
+        if (render_pass_key.color_formats[index] == VideoCore::Surface::PixelFormat::Invalid) {
+            return false;
+        }
         return (image_ranges.at(rt_map[index]).aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
     }
 
